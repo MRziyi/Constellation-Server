@@ -1,0 +1,58 @@
+# Tool Agent adapter registry.
+# Listed adapters are presented to Cortex Router as AVAILABLE TOOLS.
+# Disabled adapters are skipped (kept here for reference).
+# See TOOL-ADAPTERS.md for the per-adapter action catalogs.
+
+adapters:
+  - name: echo
+    class: tool_agent.adapters.echo.EchoAdapter
+    enabled: true   # Phase 1 debug; leave enabled while spine evolves
+
+  - name: applescript_reminders
+    class: tool_agent.adapters.applescript_reminders.RemindersAdapter
+    enabled: true   # Phase 2 Slice A — first real Mac-native adapter
+
+  - name: applescript_calendar
+    class: tool_agent.adapters.applescript_calendar.CalendarAdapter
+    enabled: true   # Phase 2 Slice C — mirrors reminders pattern
+
+  - name: applescript_mail
+    class: tool_agent.adapters.applescript_mail.MailAdapter
+    enabled: true   # Phase 2 Slice C — Mail.app via osascript; send is preview-always
+
+  - name: fs
+    class: tool_agent.adapters.fs.FsAdapter
+    enabled: true   # Phase 2 Slice C (T1) — read/write/append/grep/list/delete; whitelisted write roots
+
+  - name: apple_notes
+    class: tool_agent.adapters.apple_notes.AppleNotesAdapter
+    enabled: true   # Phase 2 Slice C (T2) — Notes.app via osascript
+
+  - name: system_status
+    class: tool_agent.adapters.system_status.SystemStatusAdapter
+    enabled: true   # T6 — battery/focus/app/network/time snapshot
+
+  - name: apple_shortcuts
+    class: tool_agent.adapters.apple_shortcuts.AppleShortcutsAdapter
+    enabled: true   # T7 — invoke any user-defined Apple Shortcut
+
+  - name: twin_query
+    class: tool_agent.adapters.twin_query.TwinQueryAdapter
+    enabled: true   # T8 — semantic Q&A over Twin (grep + GPT synthesis); requires OPENAI_API_KEY
+
+  - name: imessage
+    class: tool_agent.adapters.imessage.IMessageAdapter
+    enabled: true   # T9 — send via AppleScript; list_recent via chat.db (needs FDA TCC)
+
+  - name: safari_state
+    class: tool_agent.adapters.safari_state.SafariStateAdapter
+    enabled: true   # T10 — current tab / all tabs / recent history (history needs FDA TCC)
+
+  - name: claude_code
+    class: tool_agent.adapters.claude_code.ClaudeCodeAdapter
+    enabled: true   # Slice C — uses `claude -p` (no tmux); draft/run/continue/list_sessions
+
+  # Phase 6:
+  # - name: local_face_recognition
+  #   class: tool_agent.adapters.face.LocalFaceRecognitionAdapter
+  #   enabled: false

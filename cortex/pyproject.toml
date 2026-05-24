@@ -1,0 +1,28 @@
+[project]
+name = "constellation-cortex"
+version = "0.1.0"
+description = "Cortex Agent — the brain of Constellation. Routes events, dispatches to Tool Agent, writes receipts to the Digital Twin."
+requires-python = ">=3.11"
+dependencies = [
+    "websockets>=12.0",
+    "aiohttp>=3.9",        # for outbound HTTP (push notification, GPT API)
+    "pyyaml>=6.0",
+    "openai>=1.30",        # GPT API
+    "pydantic>=2.0",       # event / command schema validation
+    "click>=8.1",          # CLI entry point
+    "structlog>=24.1",     # structured logging
+    "python-dotenv>=1.0",  # load .env (OPENAI_API_KEY etc.)
+    "diskcache>=5.6",      # persistent LLM response cache
+    "json-repair>=0.30",   # tolerant JSON parsing from LLM outputs
+]
+
+[project.scripts]
+cortex = "cortex.main:cli"
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cortex*"]

@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local env (secrets — never commit)
+.env
+.env.local
+.env.*.local
+
+# Logs
+logs/
+*.log
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Twin runtime (lives in ~/constellation/twin, not in repo)
+# twin-seed/ IS committed (it's the seed); user's live twin is not

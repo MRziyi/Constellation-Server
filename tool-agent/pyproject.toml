@@ -1,0 +1,27 @@
+[project]
+name = "constellation-tool-agent"
+version = "0.1.0"
+description = "Tool Agent — the hands of Constellation. Invokes Mac local tools on Cortex's behalf."
+requires-python = ">=3.11"
+dependencies = [
+    "websockets>=12.0",
+    "pyyaml>=6.0",
+    "pydantic>=2.0",
+    "click>=8.1",
+    "structlog>=24.1",
+    "openai>=1.30",        # for twin_query adapter (GPT synthesis)
+    "python-dotenv>=1.0",  # load OPENAI_API_KEY from project-root .env
+    "diskcache>=5.6",      # shared LLM response cache (via cortex.llm_cache)
+    "json-repair>=0.30",   # tolerant JSON parsing
+]
+
+[project.scripts]
+tool-agent = "tool_agent.main:cli"
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tool_agent*"]

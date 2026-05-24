@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.constellation.cortex</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__CORTEX_DIR__/.venv/bin/python</string>
+        <string>-m</string>
+        <string>cortex.main</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__CORTEX_DIR__</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__CORTEX_DIR__/logs/cortex.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__CORTEX_DIR__/logs/cortex.err.log</string>
+</dict>
+</plist>
