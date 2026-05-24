@@ -12,6 +12,9 @@ import click
 import structlog
 from dotenv import load_dotenv
 
+from .control_plane import get_plane
+from .http import serve_http
+from .llm_cache import set_call_observer
 from .server import serve
 from .twin import Twin
 
@@ -51,6 +54,8 @@ def _load_env() -> Path | None:
 @click.command()
 @click.option("--host", default="127.0.0.1", help="Bind address for Glass WSS endpoint")
 @click.option("--port", default=8888, type=int, help="Port for Glass WSS endpoint")
+@click.option("--http-host", default=None, help="Bind address for management HTTP surface (defaults to --host)")
+@click.option("--http-port", default=8890, type=int, help="Port for management HTTP surface (Phase 3a.1)")
 @click.option(
     "--tool-agent-url",
     default="ws://localhost:8889",
@@ -78,6 +83,8 @@ def _load_env() -> Path | None:
 def cli(
     host: str,
     port: int,
+    http_host: str | None,
+    http_port: int,
     tool_agent_url: str,
     twin_root: str | None,
     router_model: str,
@@ -103,16 +110,29 @@ def cli(
     )
 
     twin = Twin(Path(twin_root) if twin_root else None)
-    asyncio.run(
-        serve(
-            host=host,
-            port=port,
-            twin=twin,
-            tool_agent_url=tool_agent_url,
-            router_model=router_model,
-            use_stub_router=use_stub,
+
+    # Control plane wiring (Phase 3a.1): single in-memory state mirror, populated
+    # by server + llm_cache observer, read by the HTTP management surface.
+    plane = get_plane()
+    set_call_observer(plane.record_llm_call)
+
+    http_bind = http_host or host
+
+    async def main() -> None:
+        await asyncio.gather(
+            serve(
+                host=host,
+                port=port,
+                twin=twin,
+                tool_agent_url=tool_agent_url,
+                router_model=router_model,
+                use_stub_router=use_stub,
+                plane=plane,
+            ),
+            serve_http(host=http_bind, port=http_port, plane=plane),
         )
-    )
+
+    asyncio.run(main())
 
 
 if __name__ == "__main__":

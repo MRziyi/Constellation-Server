@@ -9,6 +9,8 @@
         <string>__CORTEX_DIR__/.venv/bin/python</string>
         <string>-m</string>
         <string>cortex.main</string>
+        <string>--host</string>
+        <string><mac-host></string>
     </array>
     <key>WorkingDirectory</key>
     <string>__CORTEX_DIR__</string>

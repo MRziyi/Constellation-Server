@@ -17,6 +17,7 @@ import websockets
 from websockets.asyncio.server import ServerConnection
 
 from . import ids
+from .control_plane import ControlPlane
 from .schema import Command, Event, RPCDispatch, RPCResult
 from .router import available_tools_block, route, route_stub
 from .twin import Twin
@@ -99,11 +100,13 @@ class CortexServer:
         tool_agent_url: str = "ws://localhost:8889",
         router_model: str = "gpt-5.2",
         use_stub_router: bool = True,
+        plane: ControlPlane | None = None,
     ):
         self.twin = twin
         self.tool_agent_url = tool_agent_url
         self.router_model = router_model
         self.use_stub_router = use_stub_router
+        self.plane = plane
         self._glass_conn: ServerConnection | None = None
         self._tool_conn: Any = None  # websockets client
         self._tool_reader_task: asyncio.Task | None = None
@@ -156,6 +159,13 @@ class CortexServer:
             self._glass_conn = None
 
     async def _process_event(self, event: Event) -> None:
+        if self.plane:
+            self.plane.record_event(
+                event_id=event.id,
+                kind=event.kind,
+                payload=event.payload or {},
+                source="tool_reverse_wake" if event.kind == "tool_reverse_wake" else "glass",
+            )
         if event.kind == "user_invoke":
             await self._handle_user_invoke(event)
         elif event.kind == "user_decision":
@@ -750,14 +760,35 @@ class CortexServer:
             context_pack=subtask.get("context_pack", []),
             result_format=subtask["result_format"],
         )
+        if self.plane:
+            self.plane.record_dispatch_start(
+                rpc_id=dispatch.id, tool=dispatch.tool, action=dispatch.action,
+                args=dispatch.args, result_format=dispatch.result_format,
+            )
         loop = asyncio.get_event_loop()
         fut: asyncio.Future = loop.create_future()
         self._pending_rpcs[dispatch.id] = fut
+        import time as _time
+        t0 = _time.monotonic()
         try:
             await self._tool_conn.send(dispatch.model_dump_json())
-            return await asyncio.wait_for(fut, timeout=120.0)
+            result = await asyncio.wait_for(fut, timeout=120.0)
+            if self.plane:
+                self.plane.record_dispatch_end(
+                    rpc_id=dispatch.id,
+                    status=result.status,  # "success" | "failure" | "needs_confirm" | "tool_paused"
+                    result=result.result,
+                    latency_ms=int((_time.monotonic() - t0) * 1000),
+                )
+            return result
         except asyncio.TimeoutError:
             self._pending_rpcs.pop(dispatch.id, None)
+            if self.plane:
+                self.plane.record_dispatch_end(
+                    rpc_id=dispatch.id, status="error",
+                    result={"error": "timeout after 120s"},
+                    latency_ms=int((_time.monotonic() - t0) * 1000),
+                )
             raise RuntimeError(f"RPC {dispatch.id} timed out after 120 s")
 
 
@@ -768,13 +799,17 @@ async def serve(
     tool_agent_url: str,
     router_model: str = "gpt-5.2",
     use_stub_router: bool = True,
+    plane: ControlPlane | None = None,
 ) -> None:
     server = CortexServer(
         twin=twin,
         tool_agent_url=tool_agent_url,
         router_model=router_model,
         use_stub_router=use_stub_router,
+        plane=plane,
     )
+    if plane is not None:
+        plane.bind(server=server, twin=twin)
     log.info("cortex.listening", host=host, port=port)
     async with websockets.serve(server.handle_glass, host, port):
         await asyncio.Future()  # run forever

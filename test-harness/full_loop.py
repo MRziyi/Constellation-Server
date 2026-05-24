@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,7 +34,7 @@ from pathlib import Path
 import websockets
 
 
-CORTEX_URL = "ws://127.0.0.1:8888"
+CORTEX_URL = os.environ.get("CORTEX_URL", "ws://127.0.0.1:8888")
 TWIN_ROOT = Path.home() / "constellation" / "twin"
 
 

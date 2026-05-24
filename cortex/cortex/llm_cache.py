@@ -146,7 +146,8 @@ async def cached_chat_create(
                  prompt_chars=prompt_chars, completion_chars=len(cached_res or ""))
         _emit(model=model, provider=provider, purpose=purpose, cache_hit=True,
               latency_ms=0, prompt_chars=prompt_chars,
-              completion_chars=len(cached_res or ""))
+              completion_chars=len(cached_res or ""),
+              messages=messages, response=cached_res, cache_key=cache_key)
         return cached_res
 
     # 2. live call with retry
@@ -175,7 +176,8 @@ async def cached_chat_create(
                      prompt_chars=prompt_chars, completion_chars=len(content))
             _emit(model=model, provider=provider, purpose=purpose, cache_hit=False,
                   latency_ms=latency_ms, prompt_chars=prompt_chars,
-                  completion_chars=len(content), attempt=attempt + 1)
+                  completion_chars=len(content), attempt=attempt + 1,
+                  messages=messages, response=content, cache_key=cache_key)
             # store in cache
             cache[cache_key] = content
             return content
@@ -187,7 +189,8 @@ async def cached_chat_create(
                 _emit(model=model, provider=provider, purpose=purpose, cache_hit=False,
                       latency_ms=int(round((time.monotonic() - t0) * 1000)),
                       prompt_chars=prompt_chars, completion_chars=0,
-                      attempt=attempt + 1, error=str(e))
+                      attempt=attempt + 1, error=str(e),
+                      messages=messages, response=None, cache_key=cache_key)
                 raise
             sleep_s = backoff_base_s * (2 ** attempt)
             log.warning("llm.retry", key=cache_key[:10], model=model, purpose=purpose,
