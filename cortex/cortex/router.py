@@ -1,26 +1,27 @@
 """Cortex Router — turns an event into a dispatch plan.
 
-Two entry points:
-- `route_stub(event)`: hard-coded echo plan (Phase 1 fallback when no API key)
-- `route(event, ...)`: real GPT call per CORTEX-ROUTER-PROMPT.md, via `llm_cache.cached_chat_create`
+Two-pass architecture (v0.5, per PROMPT-DESIGN-V2.md):
 
-Prompt shape (v0.3, per Zack's "don't dump raw JSON to GPT, organize for readability"):
-- System prompt is the directives + schema + multi-step / feedback / HUD body design (terse)
-- User prompt is a natural-language brief composed by `_build_user_prompt`:
-    THE ASK        — what the user said + when
-    [WHAT HAPPENED ALREADY]  (only on multi-step continuation; compact)
-    [ZACK'S WORDS ON THE PRIOR CARD]  (only when user spoke freely)
-    ZACK'S DIGITAL TWIN — identity + skills + people/core inline
-    YOUR TOOLS     — adapter list
-    YOUR JOB       — output instructions (think then JSON in fence)
+  pass 1 ── select_twin_paths(event, twin, history?)
+            small selector call (~1.5K tokens):  ASK + TOC table
+            → {"paths": ["identity.md", "skills/X.md", ...]}
 
-Token discipline: no event IDs / timestamps / opaque hashes that don't help the model.
+  pass 2 ── route(event, context_pack, ...)
+            planner call (~4–7K tokens):  ASK + ONLY selected twin slices
+                                            + AVAILABLE TOOLS
+            → dispatch plan JSON
 
-Multi-call paradigm: this entry currently does ONE call per Router invocation. The
-multi-step task paradigm (R-3) is at task level — each round of a multi-step task is
-a fresh `route()` call with `task_history` accumulated. If a single round ever needs
-multiple internal LLM calls (e.g., "first decide what to load, then plan"), wire that
-here via `cached_chat_create` again; the cache layer dedups identical sub-calls.
+Why two-pass: eager-loading the whole Twin (v0.4) was wasting ~5K tokens of
+unrelated policy text on every call, and the Twin only grows. The selector
+picks 1–3 paths a median ask actually needs.
+
+Three entry points:
+- `select_twin_paths(...)`: pass-1 selector (NEW in v0.5)
+- `route(...)`: pass-2 planner (callers pass the path-filtered context_pack)
+- `route_stub(...)`: hard-coded echo plan (still used when --use-stub-router)
+
+Telemetry: each pass goes through `cached_chat_create` with distinct `purpose`
+tags ("selector" / "router") so the Console's prompt-inspector lists both.
 """
 
 from __future__ import annotations
@@ -268,6 +269,127 @@ def _validate_plan(plan: dict[str, Any], allowed_tools: set[str]) -> None:
     plan.setdefault("next_step_hint", None)
     if not isinstance(plan["task_continues"], bool):
         raise ValueError(f"task_continues must be bool, got {type(plan['task_continues'])}")
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Selector pass (pass 1) — pick which Twin slices the planner needs
+# ────────────────────────────────────────────────────────────────────────
+
+SELECTOR_SYSTEM_PROMPT = """\
+You are Cortex's Twin selector. Zack just spoke; pick which Twin files the
+planner needs to plan the next action — and ONLY those.
+
+Output JSON, nothing else: {"paths": ["identity.md", "skills/X.md", ...]}
+
+Rules:
+- Include identity.md ONLY if the ask is about Zack himself, his preferences,
+  his style, or naming/addressing him. Mechanical asks (status, time, "open
+  X") don't need it.
+- Include people/core/<slug>.md ONLY when Zack names that person (by name or
+  one of their aliases listed in the TOC).
+- Include skills/X.md ONLY when X is directly relevant to the immediate ask.
+  Don't pre-emptively grab adjacent skills "just in case".
+- Maximum 5 paths. Median good answer is 1–3. ALL paths must be from the TOC.
+- When unsure between two skills, pick the more specific one.
+- Empty list is valid. Don't pad. Empty is better than wrong.
+
+JSON only. No prose. No markdown fences.
+"""
+
+
+MAX_SELECTOR_PATHS = 5
+SELECTOR_FALLBACK_PATHS = ["identity.md"]
+
+
+def _build_selector_prompt(
+    event: Event,
+    twin_toc_table: str,
+    task_history: list[dict[str, Any]] | None = None,
+) -> str:
+    """Compose the user prompt for the selector pass. Tiny on purpose."""
+    blocks: list[str] = []
+    payload = event.payload or {}
+
+    blocks.append("THE ASK")
+    text = payload.get("text") or ""
+    has_image = bool(payload.get("image"))
+    if event.kind == "user_invoke":
+        line = f'Zack said: "{text}"' if text else "Zack triggered without speaking."
+        if has_image:
+            line += " (photo attached)"
+        blocks.append(line)
+    else:
+        blocks.append(f"{event.kind}: {json.dumps(payload, ensure_ascii=False)[:200]}")
+    blocks.append("")
+
+    if task_history:
+        blocks.append(f"PRIOR ROUNDS (compact, round {len(task_history) + 1}/5)")
+        for i, step in enumerate(task_history, start=1):
+            blocks.append(f'R{i} — "{step.get("step_intent") or "?"}"')
+            results = step.get("subtask_results") or []
+            for sub, res in zip(step.get("subtasks", []), results):
+                blocks.append(f"  · {_summarise_subtask_for_history(sub, res)}")
+            if fb := step.get("user_feedback_text"):
+                blocks.append(f'  · Zack said: "{fb}"')
+        blocks.append("")
+
+    blocks.append("TWIN TOC")
+    blocks.append(twin_toc_table)
+    blocks.append("")
+
+    blocks.append("YOUR JOB")
+    blocks.append('Output JSON only: {"paths": [...]}')
+
+    return "\n".join(blocks)
+
+
+async def select_twin_paths(
+    event: Event,
+    twin_toc_table: str,
+    toc_paths: set[str],
+    model: str = DEFAULT_MODEL,
+    task_history: list[dict[str, Any]] | None = None,
+) -> list[str]:
+    """Pass 1: ask the LLM which Twin paths to load. Returns a validated list.
+
+    Defensive — failures (parse / API / unknown paths) fall back to
+    SELECTOR_FALLBACK_PATHS rather than raising; the planner still does
+    something sensible with just identity.md.
+    """
+    user_prompt = _build_selector_prompt(event, twin_toc_table, task_history=task_history)
+    try:
+        raw = await cached_chat_create(
+            model=model,
+            messages=[
+                {"role": "system", "content": SELECTOR_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            purpose="selector",
+        )
+        obj = parse_json_response(raw)
+        if not isinstance(obj, dict):
+            raise ValueError(f"selector output not a dict: {type(obj)}")
+        paths = obj.get("paths")
+        if not isinstance(paths, list):
+            raise ValueError(f"selector output 'paths' not a list: {type(paths)}")
+        # Filter: keep only paths present in the TOC; cap at MAX_SELECTOR_PATHS
+        validated = [p for p in paths if isinstance(p, str) and p in toc_paths][:MAX_SELECTOR_PATHS]
+        log.info(
+            "selector.picked",
+            n_in=len(paths) if isinstance(paths, list) else 0,
+            n_kept=len(validated),
+            paths=validated,
+        )
+        return validated
+    except Exception as e:
+        log.warning("selector.failed_fallback", error=str(e), error_type=type(e).__name__)
+        # Filter the fallback against the TOC just in case identity.md was renamed
+        return [p for p in SELECTOR_FALLBACK_PATHS if p in toc_paths]
+
+
+# ────────────────────────────────────────────────────────────────────────
+# Planner pass (pass 2) — emit the dispatch plan
+# ────────────────────────────────────────────────────────────────────────
 
 
 async def route(

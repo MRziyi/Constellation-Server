@@ -3,12 +3,22 @@
 Twin layout per DATA-MODEL.md §3. Write protocol per §10. CHANGELOG format per §12.
 
 v1 minimal: read-anything, write-with-mtime-check, append-only CHANGELOG.
-No git, no snapshots, no TOC auto-rebuild (Phase 7 adds those).
+v0.5 adds:
+  - build_toc()                : parse _system/TOC.md + auto-discover any twin
+                                 files not yet curated; returns the
+                                 (path, description) table the selector pass
+                                 of the Router shows to the LLM.
+  - assemble_context_pack(paths): now takes an explicit path list. Callers
+                                 must pass the paths the selector picked.
+                                 Default (no args) = identity.md only — a
+                                 safe minimal fallback if selector failed.
 """
 
 from __future__ import annotations
 
 import os
+import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -101,34 +111,156 @@ class Twin:
         with log_path.open("a", encoding="utf-8") as f:
             f.write("\n".join(entry_lines))
 
-    # ── Context pack assembly ──
+    # ── Context pack assembly (v0.5 — explicit paths) ──
 
-    def assemble_context_pack(self) -> dict[str, str]:
-        """Return {relpath: content} for Twin slices the Router should always see.
+    def assemble_context_pack(self, paths: list[str] | None = None) -> dict[str, str]:
+        """Return {relpath: content} for the Twin slices the planner needs.
 
-        Phase 2 Slice B/C version:
-          - identity.md (always)
-          - skills/*.md (all of them; small enough)
-          - people/core/*.md (all of them; one file per core contact, small + high value)
+        v0.5 behaviour:
+          - paths=None (default): identity.md only — safe minimal fallback
+                                  used when the selector pass returned nothing
+                                  parseable.
+          - paths=[...]:          read exactly those files (skip ones that
+                                  don't exist; never escapes Twin root).
 
-        Phase 7+ will switch to two-pass: GPT reads _system/TOC.md first and picks
-        which paths to load (per DATA-MODEL.md §11). Until then, eager-load.
+        v0.4 used to eager-load identity + all skills + all people/core; that
+        cost ~6.5K tokens per call regardless of relevance. The selector now
+        picks the relevant subset (see router.select_twin_paths).
         """
+        if paths is None:
+            paths = ["identity.md"]
         pack: dict[str, str] = {}
-        identity = self.root / "identity.md"
-        if identity.exists():
-            pack["identity.md"] = identity.read_text(encoding="utf-8")
-        skills_dir = self.root / "skills"
-        if skills_dir.is_dir():
-            for p in sorted(skills_dir.glob("*.md")):
-                if p.name == "README.md":
-                    continue
-                pack[f"skills/{p.name}"] = p.read_text(encoding="utf-8")
-        people_core_dir = self.root / "people" / "core"
-        if people_core_dir.is_dir():
-            for p in sorted(people_core_dir.glob("*.md")):
-                pack[f"people/core/{p.name}"] = p.read_text(encoding="utf-8")
+        root_resolved = self.root.resolve()
+        for rel in paths:
+            p = (self.root / rel).resolve()
+            try:
+                p.relative_to(root_resolved)  # path-escape guard
+            except ValueError:
+                continue
+            if p.is_file():
+                pack[rel] = p.read_text(encoding="utf-8")
         return pack
+
+    # ── TOC (the Anthropic-Skill-style hook the selector pass uses) ──
+
+    _toc_cache: tuple[float, list[tuple[str, str]]] | None = None
+
+    def build_toc(self) -> list[tuple[str, str]]:
+        """Return a flat list of (path, description) the selector pass shows.
+
+        Hot-reloads on _system/TOC.md mtime change. Merges:
+          1. Curated table rows in _system/TOC.md
+          2. Auto-discovered .md files in `skills/`, `people/core/`,
+             `people/encounters/`, `projects/`, `commitments/`, `interests/`
+             that don't already appear in (1).
+
+        Excludes (by design): receipts/*, CHANGELOG.md, README.md, _system/*
+        themselves. These are transient log / meta files, not policy context.
+        """
+        toc_path = self.root / "_system" / "TOC.md"
+        toc_mtime = toc_path.stat().st_mtime if toc_path.exists() else 0.0
+
+        # Cache invalidates if TOC mtime moves; auto-discovery is cheap (a few
+        # dozen file stats) so we just re-do it every call for now.
+        # (Could cache against root mtime too if profiling demands.)
+        if self._toc_cache and self._toc_cache[0] == toc_mtime:
+            curated = self._toc_cache[1]
+        else:
+            curated = self._parse_curated_toc(toc_path) if toc_path.exists() else []
+            self.__class__._toc_cache = (toc_mtime, curated)
+
+        curated_paths = {p for p, _ in curated}
+        extras = self._auto_discover(curated_paths)
+        return curated + extras
+
+    @staticmethod
+    def _parse_curated_toc(toc_path: Path) -> list[tuple[str, str]]:
+        """Extract (path, description) from the markdown tables in _system/TOC.md.
+
+        Accepts rows like `| skills/X.md | one-line desc | 2026-... |`.
+        Ignores header / separator / non-row text.
+        """
+        entries: list[tuple[str, str]] = []
+        for line in toc_path.read_text(encoding="utf-8").splitlines():
+            s = line.strip()
+            if not (s.startswith("|") and s.endswith("|")):
+                continue
+            parts = [c.strip() for c in s.strip("|").split("|")]
+            if len(parts) < 2:
+                continue
+            path, desc = parts[0], parts[1]
+            if not path or not desc:
+                continue
+            if path.lower() == "path" or set(path) <= {"-", ":"}:
+                continue  # header or separator
+            if path.startswith("receipts/") or path in ("CHANGELOG.md", "README.md"):
+                continue
+            entries.append((path, desc))
+        return entries
+
+    # Directories where files become eligible context for the planner.
+    _DISCOVER_DIRS = (
+        "skills", "people/core", "people/encounters",
+        "projects", "commitments", "interests",
+    )
+
+    def _auto_discover(self, already_curated: set[str]) -> list[tuple[str, str]]:
+        """Find .md files in twin dirs that aren't yet in the curated TOC."""
+        out: list[tuple[str, str]] = []
+        for sub in self._DISCOVER_DIRS:
+            d = self.root / sub
+            if not d.is_dir():
+                continue
+            for f in sorted(d.rglob("*.md")):
+                if f.name.lower() == "readme.md":
+                    continue
+                rel = str(f.relative_to(self.root))
+                if rel in already_curated:
+                    continue
+                desc = self._describe_from_frontmatter(f) or f.stem.replace("-", " ")
+                out.append((rel, desc))
+        return out
+
+    @staticmethod
+    def _describe_from_frontmatter(p: Path) -> str | None:
+        """Best-effort one-liner from a Twin file's frontmatter."""
+        try:
+            text = p.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        fm = re.match(r"^---\s*\n(.*?)\n---", text, re.DOTALL)
+        if not fm:
+            return None
+        meta: dict[str, str] = {}
+        for line in fm.group(1).splitlines():
+            m = re.match(r"^([\w_]+)\s*:\s*(.+?)\s*$", line)
+            if m:
+                meta[m.group(1)] = m.group(2).strip()
+        if "description" in meta:
+            return meta["description"].strip("'\"")
+        # People-style: synthesise from relation / affiliation / preferred_contact
+        if meta.get("type") == "person":
+            bits = []
+            if "relation" in meta:    bits.append(meta["relation"])
+            if "affiliation" in meta: bits.append(f"at {meta['affiliation']}")
+            if "preferred_contact" in meta:
+                bits.append(f"prefers {meta['preferred_contact']}")
+            if bits:
+                return ", ".join(bits)
+        return None
+
+    def toc_as_table(self) -> str:
+        """Render build_toc() output as a fixed-width table for the selector prompt."""
+        entries = self.build_toc()
+        if not entries:
+            return "(Twin is empty)"
+        path_w = max(len(p) for p, _ in entries)
+        path_w = min(path_w, 40)  # cap so a freak path doesn't blow out the column
+        lines = []
+        for p, d in entries:
+            p_disp = p if len(p) <= path_w else p[: path_w - 1] + "…"
+            lines.append(f"{p_disp:<{path_w}}  {d}")
+        return "\n".join(lines)
 
     # ── Receipts ──
 

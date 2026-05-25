@@ -19,7 +19,7 @@ from websockets.asyncio.server import ServerConnection
 from . import ids
 from .control_plane import ControlPlane
 from .schema import Command, Event, RPCDispatch, RPCResult
-from .router import available_tools_block, route, route_stub
+from .router import available_tools_block, route, route_stub, select_twin_paths
 from .twin import Twin
 
 
@@ -364,7 +364,18 @@ class CortexServer:
     ) -> dict[str, Any]:
         if self.use_stub_router:
             return route_stub(event)
-        context_pack = self.twin.assemble_context_pack()
+        # ── Two-pass (v0.5): selector picks Twin paths → planner sees only those ──
+        toc_entries = self.twin.build_toc()
+        toc_paths = {p for p, _ in toc_entries}
+        toc_table = self.twin.toc_as_table()
+        picked = await select_twin_paths(
+            event=event,
+            twin_toc_table=toc_table,
+            toc_paths=toc_paths,
+            model=self.router_model,
+            task_history=task_history,
+        )
+        context_pack = self.twin.assemble_context_pack(picked)
         return await route(
             event=event,
             available_tools_block=self._tools_block,
