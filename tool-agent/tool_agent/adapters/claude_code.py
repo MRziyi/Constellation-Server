@@ -850,12 +850,20 @@ class ClaudeCodeAdapter:
             # prompt is reachable. Detect the screen by pane capture; only
             # send keys if we actually see it (so other permission modes
             # don't get a spurious Down+Enter on their normal input prompt).
+            await _emit_progress({
+                "stage": "waiting_for_prompt", "icon": "⏳",
+                "detail": "waiting for CC TUI to render",
+            })
             await asyncio.sleep(2.0)
             if agent_permission_mode in ("bypassPermissions",):
                 _, pane_out, _ = await _run(
                     _tmux("capture-pane", "-t", tmux_session, "-p"), timeout=5,
                 )
                 if "Bypass Permissions" in pane_out and "Yes, I accept" in pane_out:
+                    await _emit_progress({
+                        "stage": "accepting_bypass", "icon": "👋",
+                        "detail": "accepting bypass-permissions safety prompt",
+                    })
                     await _run(_tmux("send-keys", "-t", tmux_session, "Down"), timeout=5)
                     await asyncio.sleep(0.2)
                     await _run(_tmux("send-keys", "-t", tmux_session, "Enter"), timeout=5)
@@ -866,6 +874,10 @@ class ClaudeCodeAdapter:
             # ── 2b. Paste the brief into CC's input prompt ──
             # tmux paste-buffer is the cleanest way to handle multi-line text
             # reliably (send-keys with newlines triggers send).
+            await _emit_progress({
+                "stage": "pasting_brief", "icon": "📤",
+                "detail": f"pasting {len(brief)}-char brief into CC",
+            })
             buf_name = f"cb_{cc_session_id[:8]}"
             await _run(_tmux("set-buffer", "-b", buf_name, brief), timeout=5)
             await _run(_tmux("paste-buffer", "-b", buf_name, "-t", tmux_session), timeout=5)
@@ -874,7 +886,7 @@ class ClaudeCodeAdapter:
             await asyncio.sleep(0.3)
             await _run(_tmux("send-keys", "-t", tmux_session, "Enter"), timeout=5)
 
-            await _emit_progress({"stage": "brief_sent", "icon": "▶️", "detail": "task accepted, thinking…"})
+            await _emit_progress({"stage": "brief_sent", "icon": "▶️", "detail": "brief submitted to CC"})
 
             # ── 3. Tail the session.jsonl ──
             async def _heartbeat(msg: str) -> None:
@@ -1247,6 +1259,11 @@ async def _tail_jsonl_impl(
     saw_assistant_text = False
     saw_end_turn = False
     last_stop_reason: str | None = None
+    # Track what CC most recently DID so heartbeats can say "thinking after
+    # Bash · 24s" instead of an opaque "still thinking…". Per SoT C-25:
+    # opacity is only acceptable when an LLM is genuinely in its own
+    # thinking phase; even then we can name *what* it's thinking about.
+    last_tool_label: str | None = None
     partial = ""
 
     while loop.time() < deadline:
@@ -1301,6 +1318,24 @@ async def _tail_jsonl_impl(
                             last_assistant_text = c["text"]
                         elif c.get("type") == "tool_use":
                             n_tool_uses += 1
+                            # Build a compact label for the heartbeat:
+                            # tool name + (description | first arg).
+                            tname = c.get("name") or "tool"
+                            tin = c.get("input") or {}
+                            tdesc = ""
+                            if isinstance(tin, dict):
+                                tdesc = (
+                                    tin.get("description")
+                                    or tin.get("file_path")
+                                    or tin.get("path")
+                                    or tin.get("pattern")
+                                    or tin.get("command")
+                                    or ""
+                                )
+                                if not isinstance(tdesc, str):
+                                    tdesc = str(tdesc)
+                            tdesc = tdesc.strip().splitlines()[0] if tdesc else ""
+                            last_tool_label = f"{tname}: {tdesc}"[:80] if tdesc else tname
 
                 coro = on_event(ev)
                 if coro is not None:
@@ -1340,9 +1375,11 @@ async def _tail_jsonl_impl(
 
         # ── Heartbeat: extended-thinking opacity ──
         # Opus doesn't stream thinking deltas to disk while thinking. If we've
-        # been quiet for `heartbeat_s`, emit a "still thinking" beacon so the
-        # HUD doesn't look like the agent died. Subsequent heartbeats every
-        # `heartbeat_s` seconds until something else happens.
+        # been quiet for `heartbeat_s`, emit a beacon that honestly says WHAT
+        # CC is thinking about (the last tool result it just got, if any) +
+        # how long the silence has been — never a generic "still thinking".
+        # Per SoT C-25, model-thinking is the only state allowed to be a
+        # black box, and even then we name the context.
         now = loop.time()
         if (
             emit_heartbeat is not None
@@ -1350,8 +1387,14 @@ async def _tail_jsonl_impl(
             and (now - last_heartbeat_at) >= heartbeat_s
         ):
             elapsed_quiet = int(now - last_change)
+            if last_tool_label:
+                msg = f"Opus reasoning after {last_tool_label} · {elapsed_quiet}s"
+            elif saw_assistant_text:
+                msg = f"Opus reasoning after assistant text · {elapsed_quiet}s"
+            else:
+                msg = f"Opus reasoning · {elapsed_quiet}s"
             try:
-                await emit_heartbeat(f"still thinking… ({elapsed_quiet}s quiet)")
+                await emit_heartbeat(msg)
             except Exception:
                 pass
             last_heartbeat_at = now

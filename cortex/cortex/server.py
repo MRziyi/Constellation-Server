@@ -428,6 +428,39 @@ class CortexServer:
         except Exception as e:
             log.warning("progress.send_failed", error=str(e))
 
+    async def _emit_progress_to_glass(
+        self,
+        *,
+        parent_event_id: str,
+        stage: str,
+        icon: str,
+        detail: str,
+    ) -> None:
+        """Cortex-side internal progress emit. Same wire shape as the
+        agent_progress frames from tool_agent, just sourced locally — used to
+        make EVERY internal step visible (classifier / selector / brief
+        assembly / planner / per-subtask dispatch). The only state that's
+        allowed to stay opaque is an LLM in its own thinking phase
+        (jsonl-silent CC turn); everything else must surface a real label.
+        """
+        if not self._glass_conn:
+            return
+        frame = {
+            "id": f"prog_{ids.event_id()[4:]}",
+            "kind": "progress",
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "parent_event_id": parent_event_id,
+            "stage": stage,
+            "icon": icon,
+            "detail": (detail or "")[:200],
+            "is_error": False,
+            "tool": None,
+        }
+        try:
+            await self._glass_conn.send(json.dumps(frame, ensure_ascii=False))
+        except Exception as e:
+            log.warning("local_progress.send_failed", error=str(e))
+
     async def _handle_progress_feedback(self, event: Event) -> None:
         """User typed/spoke something during a progress window. If substantive,
         inject into the active CC tmux session via send-keys. Else drop."""
@@ -639,6 +672,11 @@ class CortexServer:
         twin_slices: dict[str, str] = {}
         if self.twin is not None:
             try:
+                await self._emit_progress_to_glass(
+                    parent_event_id=event.id,
+                    stage="selecting_twin", icon="📚",
+                    detail="picking Twin slices for context (gpt-5.2)",
+                )
                 toc_entries = self.twin.build_toc()
                 toc_paths = {p for p, _ in toc_entries}
                 toc_table = self.twin.toc_as_table()
@@ -648,6 +686,12 @@ class CortexServer:
                     toc_paths=toc_paths,
                 )
                 twin_slices = self.twin.assemble_context_pack(picked)
+                picked_label = ", ".join(p.rsplit("/", 1)[-1] for p in picked) or "(none)"
+                await self._emit_progress_to_glass(
+                    parent_event_id=event.id,
+                    stage="twin_loaded", icon="📚",
+                    detail=f"loaded {len(picked)} Twin path(s): {picked_label}",
+                )
             except Exception as e:
                 log.warning("agent.selector_failed", error=str(e))
                 twin_slices = {}
@@ -667,10 +711,20 @@ class CortexServer:
             output_schema=schema_hint,
             available_dirs=add_dirs,
         )
+        await self._emit_progress_to_glass(
+            parent_event_id=event.id,
+            stage="brief_assembled", icon="📝",
+            detail=f"agent brief assembled ({len(brief)} chars)",
+        )
 
         # Dispatch the agent action. RPC returns when CC end_turn's
         # (checkpoint or final).
         try:
+            await self._emit_progress_to_glass(
+                parent_event_id=event.id,
+                stage="dispatching_agent", icon="🤖",
+                detail="dispatching claude_code.agent",
+            )
             rpc = await self._dispatch_to_tool({
                 "tool": "claude_code", "action": "agent",
                 "args": {
@@ -827,19 +881,45 @@ class CortexServer:
         # continue through the existing planner + executor-adapter dispatch.
         if not self.use_stub_router:   # stub router (Phase 1) is for tests only
             from .classifier import classify_intent
+            await self._emit_progress_to_glass(
+                parent_event_id=event.id,
+                stage="classifying", icon="🧭",
+                detail="classifying intent (gpt-5.2)",
+            )
             try:
                 decision = await classify_intent(event)
+                why = str(decision.get("why") or "")[:80]
                 if decision.get("complex"):
                     log.info("intent.complex_via_agent", why=decision.get("why"))
+                    await self._emit_progress_to_glass(
+                        parent_event_id=event.id,
+                        stage="classified", icon="🧭",
+                        detail=f"intent: complex → agent — {why}",
+                    )
                     await self._dispatch_complex_agent(event)
                     return
                 log.info("intent.simple_via_router", why=decision.get("why"))
+                await self._emit_progress_to_glass(
+                    parent_event_id=event.id,
+                    stage="classified", icon="🧭",
+                    detail=f"intent: simple → planner — {why}",
+                )
             except Exception as e:
                 log.warning("classifier.errored_falling_through", error=str(e))
                 # Fall through to existing path on classifier failure
 
+        await self._emit_progress_to_glass(
+            parent_event_id=event.id,
+            stage="planning", icon="🧠",
+            detail="planning dispatch (gpt-5.2 router)",
+        )
         plan = await self._route(event)
         log.info("plan.generated", primary_intent=plan["primary_intent"])
+        await self._emit_progress_to_glass(
+            parent_event_id=event.id,
+            stage="planned", icon="🎯",
+            detail=f"plan: {plan['primary_intent']} · {len(plan.get('subtasks', []))} subtasks",
+        )
 
         # Router occasionally slips kind="tool_card" for normal user_invoke; that
         # kind is reserved for reverse-wake (see _handle_tool_reverse_wake which
@@ -881,8 +961,13 @@ class CortexServer:
         #   - hud_show:       confirm-policy says auto. Dispatch ALL subtasks now so the
         #                     hud_show body can reflect real results; receipt written immediately.
         subtask_results: list[dict[str, Any]] = []
-        for st in plan["subtasks"]:
+        for i, st in enumerate(plan["subtasks"]):
             if st["result_format"] in ("draft", "query") or hud_kind == "hud_show":
+                await self._emit_progress_to_glass(
+                    parent_event_id=event.id,
+                    stage="dispatch", icon="🔧",
+                    detail=f"{st['tool']}.{st['action']} · subtask {i+1}/{len(plan['subtasks'])}",
+                )
                 # Re-interpolate args (subtask N may reference N-1's result)
                 args = self._interpolate_args(st.get("args", {}), subtask_results, plan=plan)
                 rpc_result = await self._dispatch_to_tool({**st, "args": args})
@@ -890,6 +975,11 @@ class CortexServer:
             else:
                 subtask_results.append({})  # placeholder so indices align
 
+        await self._emit_progress_to_glass(
+            parent_event_id=event.id,
+            stage="preparing_card", icon="🎴",
+            detail=f"preparing {hud_kind}",
+        )
         cmd = self._build_command(plan, subtask_results)
         self._pending_previews[cmd.id] = {
             "event": event,  # full event kept so we can re-route on feedback / advance
