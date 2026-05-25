@@ -266,6 +266,10 @@ class ClaudeCodeAdapter:
         if action == "__test_inject_wake__":
             return await self._test_inject_wake(args)
 
+        # v2 streaming agent (per AGENT-ARCHITECTURE-V2.md Phase 5a)
+        if action == "agent":
+            return await self._agent(args)
+
         raise ValueError(f"claude_code: unknown action '{action}'")
 
     # ── actions ──
@@ -688,3 +692,483 @@ class ClaudeCodeAdapter:
             "actual": actual,
             "tracked": list(self._tmux_sessions.values()),
         }
+
+    # ── Streaming agent (AGENT-ARCHITECTURE-V2.md Phase 5a, v2 = tmux) ──────
+    #
+    # v2 deliberately avoids `claude -p` because that bills from a separate
+    # API quota. Interactive TUI mode (regular `claude`) uses the user's
+    # subscription. We get the same per-event visibility by TAILING the
+    # session.jsonl file CC writes to ~/.claude/projects/<sanitized-cwd>/
+    # <session-id>.jsonl — its format is essentially stream-json persisted.
+    #
+    # Mid-flight correction: send_keys the new user text into the tmux pane.
+
+    async def _agent(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Run CC as the agent for a complex task.
+
+        Spawns a tmux-hosted interactive `claude` (uses user's subscription
+        quota, NOT the -p API quota), sends the brief, tails CC's session
+        .jsonl file as a stream-json equivalent, distills events to HUD
+        progress, returns the final structured result.
+
+        Args:
+          brief:              full prompt for CC (caller inlines context)
+          output_schema_hint: (optional) JSON Schema dict OR text description
+                              of the required shape — appended to the brief so
+                              CC's last assistant message contains parseable
+                              JSON. (No --json-schema flag in TUI mode.)
+          add_dirs:           paths to grant CC read access to
+          working_dir:        cwd for CC (default $HOME)
+          parent_event_id:    Cortex event id this run belongs to
+          timeout_s:          total wall-clock cap (default 300s)
+          idle_quiet_s:       seconds of jsonl silence after a final assistant
+                              message that counts as "done" (default 6s)
+        """
+        brief = args.get("brief")
+        if not brief:
+            raise ValueError("claude_code.agent: 'brief' is required")
+        output_schema_hint = args.get("output_schema_hint") or args.get("output_schema")
+        add_dirs = args.get("add_dirs") or []
+        working_dir = args.get("working_dir") or os.path.expanduser("~")
+        parent_event_id = args.get("parent_event_id") or args.get("_event_id")
+        timeout_s = float(args.get("timeout_s", 300.0))
+        idle_quiet_s = float(args.get("idle_quiet_s", 6.0))
+
+        # ── 1. Pre-allocate a session UUID so we know the jsonl path upfront ──
+        cc_session_id = str(uuid.uuid4())
+        # CC names project dirs from the REAL path (follows symlinks). On macOS
+        # /tmp is symlinked to /private/tmp, so resolve before sanitising.
+        real_cwd = Path(os.path.expanduser(working_dir)).resolve()
+        sanitized = str(real_cwd).replace("/", "-")
+        project_dir = Path.home() / ".claude" / "projects" / sanitized
+        session_jsonl = project_dir / f"{cc_session_id}.jsonl"
+
+        # Ensure target dir exists (CC may not create it if cwd is brand new)
+        try:
+            project_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+
+        # Append schema hint to brief if one was given (no --json-schema flag in TUI)
+        if output_schema_hint:
+            if isinstance(output_schema_hint, dict):
+                schema_block = json.dumps(output_schema_hint, ensure_ascii=False, indent=2)
+            else:
+                schema_block = str(output_schema_hint)
+            brief = (
+                f"{brief}\n\n"
+                f"=== REQUIRED OUTPUT ===\n"
+                f"Your FINAL message must be ONLY this JSON object (no prose, "
+                f"no ```json fence — just the raw object so it parses cleanly):\n\n"
+                f"Schema:\n{schema_block}"
+            )
+
+        # Helpers
+        n_progress_emitted = 0
+        async def _emit_progress(progress: dict[str, Any]) -> None:
+            nonlocal n_progress_emitted
+            if not self._event_pusher or not parent_event_id:
+                return
+            await self._event_pusher({
+                "kind": "agent_progress",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "payload": {
+                    "parent_event_id": parent_event_id,
+                    "agent_session_id": cc_session_id,
+                    **progress,
+                },
+            })
+            n_progress_emitted += 1
+
+        await _emit_progress({"stage": "started", "detail": "Agent spawning (tmux + subscription)…"})
+
+        started_at = datetime.now(timezone.utc).isoformat()
+
+        # ── 2. Launch claude in tmux with our session UUID ──
+        # Use a dedicated tmux session name (claude_code adapter's existing
+        # socket + prefix conventions).
+        tmux_session = f"{TMUX_SESSION_PREFIX}agent-{cc_session_id[:8]}"
+        claude_cmd_parts = ["claude", "--session-id", cc_session_id]
+        for d in add_dirs:
+            claude_cmd_parts += ["--add-dir", os.path.expanduser(str(d))]
+        # Quote each part for the shell command tmux will run
+        import shlex as _shlex
+        claude_cmd_str = " ".join(_shlex.quote(p) for p in claude_cmd_parts)
+        tmux_new = _tmux(
+            "new-session", "-d", "-s", tmux_session,
+            "-c", working_dir,
+            "-x", "200", "-y", "50",  # nicer pane width for readability
+            claude_cmd_str,
+        )
+        rc, _, err = await _run(tmux_new, timeout=10)
+        if rc != 0:
+            await _emit_progress({"stage": "error", "detail": f"tmux new-session failed: {err[:200]}"})
+            return {"ok": False, "error": f"tmux: {err.strip() or 'unknown'}", "session_id": cc_session_id}
+
+        # Track in the adapter's session map (so /api/cc/sessions sees it)
+        self._tmux_sessions[tmux_session] = {
+            "session_name": tmux_session,
+            "kind": "agent",
+            "cc_session_id": cc_session_id,
+            "started_at": started_at,
+            "state": "running",
+        }
+
+        try:
+            # Wait for CC to reach the prompt input area, then paste the brief.
+            # CC TUI typically renders the input prompt within 2-3s.
+            await asyncio.sleep(2.5)
+            # Send the brief: tmux paste-buffer is the cleanest way to handle
+            # multi-line text reliably (send-keys with newlines triggers send).
+            buf_name = f"cb_{cc_session_id[:8]}"
+            await _run(_tmux("set-buffer", "-b", buf_name, brief), timeout=5)
+            await _run(_tmux("paste-buffer", "-b", buf_name, "-t", tmux_session), timeout=5)
+            await _run(_tmux("delete-buffer", "-b", buf_name), timeout=5)
+            # Press Enter to submit
+            await asyncio.sleep(0.3)
+            await _run(_tmux("send-keys", "-t", tmux_session, "Enter"), timeout=5)
+
+            await _emit_progress({"stage": "brief_sent", "detail": "Brief delivered; agent thinking…"})
+
+            # ── 3. Tail the session.jsonl ──
+            result = await _tail_jsonl_until_idle(
+                session_jsonl,
+                on_event=lambda ev: self._handle_jsonl_event(
+                    ev, _emit_progress, cc_session_id,
+                ),
+                timeout_s=timeout_s,
+                idle_quiet_s=idle_quiet_s,
+            )
+
+            last_assistant_text = result["last_assistant_text"]
+            n_tool_uses = result["n_tool_uses"]
+            terminate_reason = result["terminate_reason"]
+
+            # ── 4. Parse final structured output from the last assistant text ──
+            structured: Any = None
+            parse_err: str | None = None
+            if output_schema_hint:
+                import re as _re
+                txt = (last_assistant_text or "").strip()
+                # Build candidate JSON strings to try, in priority order
+                candidates: list[str] = []
+                if txt:
+                    candidates.append(txt)  # raw
+                    fence_m = _re.search(r"```(?:json)?\s*\n?(.*?)```", txt, _re.DOTALL)
+                    if fence_m:
+                        candidates.append(fence_m.group(1).strip())
+                    # Try to extract the {...} block if there's prose around it
+                    brace_m = _re.search(r"(\{.*\})", txt, _re.DOTALL)
+                    if brace_m:
+                        candidates.append(brace_m.group(1).strip())
+                for candidate in candidates:
+                    try:
+                        structured = json.loads(candidate)
+                        parse_err = None
+                        break
+                    except json.JSONDecodeError as e:
+                        parse_err = f"json parse failed: {e}"
+                        continue
+
+            # ── 5. Kill the tmux session (CC's session is persisted on disk) ──
+            await _run(_tmux("kill-session", "-t", tmux_session), timeout=5)
+            self._tmux_sessions.pop(tmux_session, None)
+
+            finished_at = datetime.now(timezone.utc).isoformat()
+
+            await _emit_progress({
+                "stage": "completed",
+                "detail": f"Agent done ({terminate_reason}); {n_tool_uses} tool uses, {len(result['events'])} events.",
+                "n_tool_uses": n_tool_uses,
+            })
+
+            return {
+                "ok": (parse_err is None) if output_schema_hint else True,
+                "session_id": cc_session_id,
+                "tmux_session": tmux_session,
+                "session_jsonl": str(session_jsonl),
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "n_tool_uses": n_tool_uses,
+                "n_progress_emitted": n_progress_emitted,
+                "n_events_seen": len(result["events"]),
+                "terminate_reason": terminate_reason,
+                "result_text": last_assistant_text,
+                "structured": structured,
+                "parse_error": parse_err,
+            }
+        except Exception as e:
+            # Best-effort cleanup
+            await _run(_tmux("kill-session", "-t", tmux_session), timeout=5)
+            self._tmux_sessions.pop(tmux_session, None)
+            await _emit_progress({"stage": "error", "detail": f"agent: {type(e).__name__}: {e}"})
+            return {
+                "ok": False, "error": f"{type(e).__name__}: {e}",
+                "session_id": cc_session_id,
+                "tmux_session": tmux_session,
+            }
+
+    # ── helper for jsonl streaming ─────────────────────────────────────────
+    def _handle_jsonl_event(
+        self,
+        ev: dict[str, Any],
+        emit: Callable[[dict[str, Any]], Awaitable[None]],
+        cc_session_id: str,
+    ) -> Awaitable[None] | None:
+        """Distill ONE jsonl event + emit progress. Schedules a coroutine."""
+        progress = _distill_jsonl_event(ev)
+        if progress:
+            return emit(progress)
+        return None
+
+
+# ── Session.jsonl tail + distillation (module-level helpers) ──────────────
+
+async def _tail_jsonl_until_idle(
+    path: Path,
+    *,
+    on_event,    # callable(dict) -> Awaitable | None
+    timeout_s: float,
+    idle_quiet_s: float,
+    poll_s: float = 0.4,
+) -> dict[str, Any]:
+    """Tail a CC session.jsonl until: (a) we've seen at least one assistant
+    message AND no new events for `idle_quiet_s`, OR (b) `timeout_s` elapses.
+
+    Returns:
+      {
+        "events": [...all decoded events],
+        "last_assistant_text": str | None,
+        "n_tool_uses": int,
+        "terminate_reason": "idle_after_assistant" | "timeout" | "file_missing"
+      }
+    """
+    started = asyncio.get_event_loop().time()
+    deadline = started + timeout_s
+
+    events: list[dict[str, Any]] = []
+    last_assistant_text: str | None = None
+    n_tool_uses = 0
+    last_change = started
+    pos = 0  # byte offset into the jsonl file
+    saw_assistant = False
+    partial = ""
+
+    while asyncio.get_event_loop().time() < deadline:
+        if not path.exists():
+            await asyncio.sleep(poll_s)
+            # If file still missing for > 10s, bail
+            if asyncio.get_event_loop().time() - started > 10 and not events:
+                return {
+                    "events": events, "last_assistant_text": None,
+                    "n_tool_uses": 0, "terminate_reason": "file_missing",
+                }
+            continue
+
+        try:
+            with path.open("rb") as f:
+                f.seek(pos)
+                chunk = f.read().decode("utf-8", errors="replace")
+                pos = f.tell()
+        except OSError:
+            await asyncio.sleep(poll_s)
+            continue
+
+        if chunk:
+            partial += chunk
+            *lines, partial = partial.split("\n")
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                events.append(ev)
+                last_change = asyncio.get_event_loop().time()
+
+                # Track assistant messages for completion detection
+                if ev.get("type") == "assistant":
+                    msg = ev.get("message") or {}
+                    saw_assistant = True
+                    for c in msg.get("content") or []:
+                        if c.get("type") == "text" and c.get("text"):
+                            last_assistant_text = c["text"]
+                        if c.get("type") == "tool_use":
+                            n_tool_uses += 1
+
+                # Fire-and-forget the callback
+                coro = on_event(ev)
+                if coro is not None:
+                    try:
+                        await coro
+                    except Exception:
+                        pass
+
+        # Completion: saw at least one assistant message AND no new events
+        # for idle_quiet_s seconds.
+        if saw_assistant and (asyncio.get_event_loop().time() - last_change) >= idle_quiet_s:
+            return {
+                "events": events, "last_assistant_text": last_assistant_text,
+                "n_tool_uses": n_tool_uses, "terminate_reason": "idle_after_assistant",
+            }
+        await asyncio.sleep(poll_s)
+
+    return {
+        "events": events, "last_assistant_text": last_assistant_text,
+        "n_tool_uses": n_tool_uses, "terminate_reason": "timeout",
+    }
+
+
+def _distill_jsonl_event(ev: dict[str, Any]) -> dict[str, Any] | None:
+    """Distill ONE CC session.jsonl event → user-facing progress message.
+
+    The jsonl format has top-level `type` in {user, assistant, system,
+    queue-operation, file-history-snapshot, ai-title, last-prompt, attachment}.
+    Only user/assistant carry actionable content; the rest are CC internals.
+    """
+    t = ev.get("type")
+
+    # Defensive helper — content may be a list[dict] (normal) OR a bare string
+    # (older CC sessions / certain message shapes). Skip cleanly if not list.
+    def _content_blocks(msg: dict[str, Any]) -> list[dict[str, Any]]:
+        c = msg.get("content")
+        return c if isinstance(c, list) else []
+
+    if t == "assistant":
+        for c in _content_blocks(ev.get("message") or {}):
+            if not isinstance(c, dict):
+                continue
+            ct = c.get("type")
+            if ct == "tool_use":
+                return {
+                    "stage": "tool_call",
+                    "tool": c.get("name", "tool"),
+                    "detail": _tool_input_to_detail(c.get("name", "?"), c.get("input") or {}),
+                }
+            if ct == "text":
+                text = (c.get("text") or "").strip()
+                if not text:
+                    return None
+                return {"stage": "assistant_text", "detail": text[:400]}
+            if ct == "thinking":
+                return None
+        return None
+
+    if t == "user":
+        for c in _content_blocks(ev.get("message") or {}):
+            if not isinstance(c, dict):
+                continue
+            if c.get("type") == "tool_result":
+                content = c.get("content", "")
+                if isinstance(content, list):
+                    parts = []
+                    for x in content:
+                        if isinstance(x, dict):
+                            parts.append(str(x.get("text", x)))
+                        else:
+                            parts.append(str(x))
+                    content = " ".join(parts)
+                is_err = bool(c.get("is_error"))
+                snippet = str(content).replace("\n", " ⏎ ")[:240]
+                return {
+                    "stage": "tool_result",
+                    "detail": f"ERROR: {snippet}" if is_err else snippet,
+                    "is_error": is_err,
+                }
+        return None
+
+    return None
+
+
+# ── Stream-json distillation (legacy -p mode, kept for reference) ─────────
+
+def _distill_progress(ev: dict[str, Any]) -> dict[str, Any] | None:
+    """Turn one CC stream-json event into a user-facing HUD progress message.
+
+    Returns None to skip noisy / internal events (thinking, partial token
+    deltas, content_block_stop, etc.). The signal we care about:
+      - which tool CC is invoking (Bash command, Read path, Write path, etc.)
+      - which tool result came back (truncated)
+      - any assistant text the user might want to see (also truncated)
+    """
+    t = ev.get("type")
+
+    if t == "assistant":
+        msg = ev.get("message") or {}
+        for c in msg.get("content", []) or []:
+            ct = c.get("type")
+            if ct == "tool_use":
+                tool_name = c.get("name", "tool")
+                inp = c.get("input") or {}
+                detail = _tool_input_to_detail(tool_name, inp)
+                return {
+                    "stage": "tool_call",
+                    "detail": detail,
+                    "tool": tool_name,
+                }
+            if ct == "text":
+                text = (c.get("text") or "").strip()
+                if not text:
+                    return None
+                return {
+                    "stage": "assistant_text",
+                    "detail": text[:400],
+                }
+        return None
+
+    if t == "user":
+        # Tool result returning to CC
+        msg = ev.get("message") or {}
+        for c in msg.get("content", []) or []:
+            if c.get("type") == "tool_result":
+                content = c.get("content", "")
+                if isinstance(content, list):
+                    parts = []
+                    for x in content:
+                        if isinstance(x, dict):
+                            parts.append(str(x.get("text", x)))
+                        else:
+                            parts.append(str(x))
+                    content = " ".join(parts)
+                is_err = bool(c.get("is_error"))
+                snippet = str(content).replace("\n", " ⏎ ")[:240]
+                return {
+                    "stage": "tool_result",
+                    "detail": (f"ERROR: {snippet}" if is_err else snippet),
+                    "is_error": is_err,
+                }
+        return None
+
+    # Most stream_event sub-events are noisy (per-token deltas, block start/stop)
+    # — skip. The assistant + user envelopes above carry the signal.
+    return None
+
+
+def _tool_input_to_detail(tool: str, inp: dict[str, Any]) -> str:
+    """Best-effort one-line summary of a tool invocation for the HUD."""
+    if tool == "Bash":
+        cmd = inp.get("command", "")
+        desc = inp.get("description") or ""
+        return f"$ {cmd[:160]}" + (f"  ({desc[:60]})" if desc else "")
+    if tool == "Read":
+        fp = inp.get("file_path") or inp.get("path") or "?"
+        return f"📖 read {fp}"
+    if tool == "Write":
+        fp = inp.get("file_path") or inp.get("path") or "?"
+        return f"✍ write {fp}"
+    if tool == "Edit":
+        fp = inp.get("file_path") or inp.get("path") or "?"
+        return f"✎ edit {fp}"
+    if tool == "WebFetch":
+        url = inp.get("url") or "?"
+        return f"🌐 fetch {url[:100]}"
+    if tool == "WebSearch":
+        return f"🔎 search: {(inp.get('query') or '?')[:120]}"
+    if tool in ("Glob", "Grep"):
+        return f"🔍 {tool}: {(inp.get('pattern') or inp.get('query') or '?')[:120]}"
+    if tool == "TodoWrite":
+        return "📋 (CC updating its own todo list)"
+    # Generic fallback
+    return f"{tool}: {json.dumps(inp, ensure_ascii=False)[:180]}"
