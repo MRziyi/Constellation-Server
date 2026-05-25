@@ -382,11 +382,30 @@ def make_app(plane: ControlPlane) -> web.Application:
 
         async def _run_agent() -> None:
             try:
+                # Inject the canonical actions[] schema if caller didn't supply one
+                schema_hint = body.get("output_schema_hint") or {
+                    "type": "object", "required": ["actions"],
+                    "properties": {
+                        "actions": {
+                            "type": "array",
+                            "description": (
+                                "List of actions Cortex should execute after Zack confirms. "
+                                "Each item has a 'type' field; valid types are: email, reminder, "
+                                "calendar_event, imessage, fs_write, shortcut. Per-type fields "
+                                "follow the AGENT-ARCHITECTURE-V2 §4 schema."
+                            ),
+                            "items": {"type": "object", "required": ["type"]},
+                        },
+                        "summary": {"type": "string"},
+                        "notes": {"type": "string"},
+                    },
+                }
+
                 rpc = await plane.server._dispatch_to_tool({
                     "tool": "claude_code", "action": "agent",
                     "args": {
                         "brief": text,
-                        "output_schema_hint": body.get("output_schema_hint"),
+                        "output_schema_hint": schema_hint,
                         "add_dirs": body.get("add_dirs") or [],
                         "working_dir": body.get("working_dir"),
                         "parent_event_id": event.id,
@@ -394,39 +413,71 @@ def make_app(plane: ControlPlane) -> web.Application:
                     },
                     "result_format": "execute",
                 })
-                # When the agent completes, build a preview card from the
-                # structured output (if any) and push to Glass. Phase 5e will
-                # flesh out the actions[] rendering; v1 just shows the raw
-                # JSON in body so we can see end-to-end.
-                if plane.server._glass_conn:
-                    import json as _json
-                    structured = (rpc.result or {}).get("structured")
-                    body_md = (
-                        "```json\n" + _json.dumps(structured, ensure_ascii=False, indent=2) + "\n```"
-                        if structured else (rpc.result or {}).get("result_text", "(no output)")
+
+                if not plane.server._glass_conn:
+                    return
+
+                from .schema import Command
+                from .server import (
+                    _action_to_subtask, _render_actions_preview,
+                )
+
+                rpc_result = rpc.result or {}
+                structured = rpc_result.get("structured") or {}
+                actions = structured.get("actions") if isinstance(structured, dict) else None
+
+                if isinstance(actions, list) and actions:
+                    # Map each action to an executor subtask; ones we can't map
+                    # are listed but won't fire.
+                    subtasks = []
+                    for a in actions:
+                        st = _action_to_subtask(a)
+                        if st is not None:
+                            subtasks.append(st)
+                    body_md = _render_actions_preview(
+                        actions,
+                        summary=structured.get("summary"),
+                        notes=structured.get("notes"),
                     )
-                    from .schema import Command
-                    cmd = Command(
-                        id=ids.command_id(),
-                        ts=datetime.now(timezone.utc),
-                        kind="preview_action",
-                        payload={
-                            "title": "Agent finished — review",
-                            "body": body_md[:1500],
-                            "icon": "✦",
-                            "options": ["Send all", "Edit", "Cancel"],
-                        },
-                        requires_confirm=True, ttl_ms=300_000,
-                    )
-                    plane.server._pending_previews[cmd.id] = {
-                        "event": event, "plan": {
-                            "primary_intent": "agent_result",
-                            "subtasks": [], "reasoning": "agent dev endpoint",
-                            "hud_response": cmd.payload,
-                        },
-                        "subtask_results": [(rpc.result or {})],
-                    }
-                    await plane.server._glass_conn.send(cmd.model_dump_json())
+                    n_exec = len(subtasks)
+                    title = f"Agent ready — {n_exec} action{'s' if n_exec != 1 else ''}"
+                else:
+                    # No actions — show whatever the agent said. Still preview
+                    # so the user sees + can dismiss; nothing will execute.
+                    subtasks = []
+                    body_md = (rpc_result.get("result_text") or "(no actions proposed)")[:1500]
+                    title = "Agent finished — no actions"
+
+                cmd = Command(
+                    id=ids.command_id(),
+                    ts=datetime.now(timezone.utc),
+                    kind="preview_action",
+                    payload={
+                        "title": title,
+                        "body": body_md[:2000],
+                        "icon": "✦",
+                        "options": (["Send all", "Cancel"] if subtasks else ["OK"]),
+                    },
+                    requires_confirm=True, ttl_ms=300_000,
+                )
+                # Stash synthetic plan so _handle_user_decision SEND path
+                # iterates executor subtasks via _execute_remaining.
+                plane.server._pending_previews[cmd.id] = {
+                    "event": event,
+                    "plan": {
+                        "primary_intent": "agent_actions",
+                        "subtasks": subtasks,
+                        "reasoning": f"agent dispatch from /api/dev/agent_invoke (cc_session={rpc_result.get('session_id','?')[:8]})",
+                        "hud_response": cmd.payload,
+                        "task_continues": False,
+                    },
+                    # subtask_results aligned w/ subtasks — empty until SEND fires them
+                    "subtask_results": [{} for _ in subtasks],
+                    "task_history": [],
+                    "from_agent": True,
+                    "agent_result": rpc_result,
+                }
+                await plane.server._glass_conn.send(cmd.model_dump_json())
             except Exception as e:
                 log.error("dev_agent_invoke.failed", error=str(e), exc_info=True)
 

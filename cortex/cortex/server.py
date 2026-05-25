@@ -110,6 +110,140 @@ def _default_icon_for_stage(stage: str) -> str:
     return _STAGE_DEFAULT_ICONS.get(stage, "·")
 
 
+# ── Agent result → preview card / executor subtasks ───────────────────────
+#
+# CC's structured output uses the `actions[]` shape from
+# AGENT-ARCHITECTURE-V2 §4. Each action maps to one of our 7 executor
+# adapters; the preview card iterates them as rows; SEND fires them all
+# in order via the existing _execute_remaining path.
+
+_ACTION_ICONS: dict[str, str] = {
+    "email":          "✉",
+    "reminder":       "🔔",
+    "calendar_event": "📅",
+    "imessage":       "💬",
+    "fs_write":       "📄",
+    "shortcut":       "⚡",
+}
+
+
+def _action_to_subtask(action: dict[str, Any]) -> dict[str, Any] | None:
+    """Map one action dict to the dispatch subtask shape _execute_remaining
+    expects. Returns None on unknown action type (silently skipped)."""
+    t = (action or {}).get("type")
+    if t == "email":
+        args: dict[str, Any] = {"body": action.get("body", "")}
+        if action.get("reply_to_message_id"):
+            args["reply_to_message_id"] = action["reply_to_message_id"]
+        else:
+            args["to"] = action.get("to", "")
+            args["subject"] = action.get("subject", "")
+            if action.get("account"):
+                args["account"] = action["account"]
+        return {
+            "tool": "applescript_mail", "action": "send", "args": args,
+            "context_pack": [], "result_format": "execute",
+            "requires_confirm": False,   # the agent's preview WAS the confirm
+        }
+    if t == "reminder":
+        args = {"title": action.get("title", "")}
+        if action.get("due_iso"):
+            args["due"] = action["due_iso"]
+        if action.get("list"):
+            args["list"] = action["list"]
+        if action.get("notes"):
+            args["notes"] = action["notes"]
+        return {
+            "tool": "applescript_reminders", "action": "add", "args": args,
+            "context_pack": [], "result_format": "execute",
+            "requires_confirm": False,
+        }
+    if t == "calendar_event":
+        args = {
+            "title": action.get("title", ""),
+            "start": action.get("start_iso", ""),
+            "end": action.get("end_iso", ""),
+        }
+        for k in ("location", "notes", "calendar"):
+            if action.get(k):
+                args[k] = action[k]
+        return {
+            "tool": "applescript_calendar", "action": "add_event", "args": args,
+            "context_pack": [], "result_format": "execute",
+            "requires_confirm": False,
+        }
+    if t == "imessage":
+        return {
+            "tool": "imessage", "action": "send",
+            "args": {"to": action.get("to", ""), "body": action.get("body", "")},
+            "context_pack": [], "result_format": "execute",
+            "requires_confirm": False,
+        }
+    if t == "fs_write":
+        return {
+            "tool": "fs", "action": "write",
+            "args": {"path": action.get("path", ""), "content": action.get("content", "")},
+            "context_pack": [], "result_format": "execute",
+            "requires_confirm": False,
+        }
+    if t == "shortcut":
+        return {
+            "tool": "apple_shortcuts", "action": "run",
+            "args": {"name": action.get("name", ""), "input": action.get("input")},
+            "context_pack": [], "result_format": "execute",
+            "requires_confirm": False,
+        }
+    return None
+
+
+def _render_actions_preview(actions: list[dict[str, Any]], summary: str | None = None, notes: str | None = None) -> str:
+    """Render a glanceable markdown body for the preview card."""
+    lines: list[str] = []
+    if summary:
+        lines.append(f"**{summary}**")
+        lines.append("")
+    for i, a in enumerate(actions, start=1):
+        t = (a or {}).get("type", "?")
+        icon = _ACTION_ICONS.get(t, "·")
+        if t == "email":
+            who = a.get("to") or "(reply)"
+            subj = a.get("subject") or "(no subject)"
+            body_snip = (a.get("body") or "")[:140].replace("\n", " ⏎ ")
+            lines.append(f"**{i}. {icon} email → {who}**")
+            lines.append(f"   *{subj}*")
+            lines.append(f"   {body_snip}{'…' if len(a.get('body') or '') > 140 else ''}")
+        elif t == "reminder":
+            title = a.get("title", "?")
+            due = a.get("due_iso", "no time")
+            lines.append(f"**{i}. {icon} reminder** — {title} *(due {due})*")
+        elif t == "calendar_event":
+            title = a.get("title", "?")
+            start = a.get("start_iso", "?")
+            end = a.get("end_iso", "?")
+            loc = a.get("location")
+            line = f"**{i}. {icon} event** — {title} *({start} → {end})*"
+            if loc:
+                line += f" @ {loc}"
+            lines.append(line)
+        elif t == "imessage":
+            who = a.get("to") or "?"
+            body_snip = (a.get("body") or "")[:100].replace("\n", " ⏎ ")
+            lines.append(f"**{i}. {icon} iMessage → {who}** — {body_snip}")
+        elif t == "fs_write":
+            path = a.get("path", "?")
+            n = len(a.get("content") or "")
+            lines.append(f"**{i}. {icon} write file** — `{path}` ({n}c)")
+        elif t == "shortcut":
+            name = a.get("name", "?")
+            lines.append(f"**{i}. {icon} run shortcut** — {name}")
+        else:
+            lines.append(f"**{i}. {icon} {t}** — {json.dumps(a, ensure_ascii=False)[:120]}")
+        lines.append("")
+    if notes:
+        lines.append(f"_{notes}_")
+    return "\n".join(lines).strip() or "(no actions)"
+
+
 class CortexServer:
     """Single-process server holding the active Glass connection + Tool Agent connection."""
 
