@@ -789,7 +789,7 @@ class CortexServer:
             if sid:
                 self.sessions.append(
                     sid, "card_surfaced",
-                    cmd_id=cmd.id, kind="preview_action", is_checkpoint=True,
+                    cmd_id=cmd.id, cmd_kind="preview_action", is_checkpoint=True,
                     title=cmd.payload["title"], body_excerpt=cmd.payload["body"][:400],
                 )
             if self._glass_conn:
@@ -836,7 +836,7 @@ class CortexServer:
         if sid:
             self.sessions.append(
                 sid, "card_surfaced",
-                cmd_id=cmd.id, kind="preview_action", is_checkpoint=False,
+                cmd_id=cmd.id, cmd_kind="preview_action", is_checkpoint=False,
                 title=cmd.payload["title"], body_excerpt=cmd.payload["body"][:400],
                 n_actions=len(subtasks),
             )
@@ -1207,7 +1207,7 @@ class CortexServer:
         if sid:
             self.sessions.append(
                 sid, "card_surfaced",
-                cmd_id=cmd.id, kind=cmd.kind, is_checkpoint=False,
+                cmd_id=cmd.id, cmd_kind=cmd.kind, is_checkpoint=False,
                 title=cmd.payload.get("title", ""),
                 body_excerpt=(cmd.payload.get("body") or "")[:400],
                 primary_intent=plan.get("primary_intent"),
