@@ -103,148 +103,90 @@ def build_agent_brief(
         L.append("PHOTO: attached (glass camera)")
     L.append("")
 
-    # 2. Output contract — front-loaded with YOU MUST + verification step
+    # 2. Output contract — hand-written, terse. (We DON'T dump JSON Schema —
+    # that's 30 lines of bloat for a 6-field contract. Show the actual JSON
+    # CC must emit, with comments. CC parses this faster than schema.)
     if output_schema is not None:
-        if isinstance(output_schema, dict):
-            schema_text = json.dumps(output_schema, ensure_ascii=False, indent=2)
-        else:
-            schema_text = str(output_schema)
-        L.append("== YOU MUST OUTPUT EXACTLY THIS JSON AS YOUR FINAL MESSAGE ==")
-        L.append("(no prose around it · no markdown fence · just the raw object)")
-        L.append("")
-        L.append(schema_text)
-        L.append("")
-        L.append("Action `type` values: email | reminder | calendar_event | imessage | fs_write | shortcut")
-        L.append("Per-type fields: see APPENDIX (bottom).")
-        L.append("")
-        L.append("BEFORE you emit, self-check:")
-        L.append("  ✓ JSON parses cleanly (paste into a parser mentally)")
-        L.append("  ✓ each action has its required fields")
-        L.append("  ✓ all times are ISO 8601 WITH timezone offset (e.g. 2026-05-27T14:00:00-05:00)")
+        L.append("== OUTPUT (your FINAL message must be exactly this JSON; nothing around it) ==")
+        L.append("```")
+        L.append("{")
+        L.append('  "summary":    "1-line for HUD",                  // required')
+        L.append('  "actions":    [ ... ],                           // required; 0+ items, shapes below')
+        L.append('  "notes":      "optional info Zack should know",  // optional')
+        L.append('  "phase_done": true,                              // only at a phase checkpoint')
+        L.append('  "next":       "1-line plan for next phase"       // only with phase_done')
+        L.append("}")
+        L.append("```")
+        L.append("Action shapes (omit fields not needed):")
+        L.append("  " + _ACTION_APPENDIX.replace("\n", "\n  "))
+        L.append("Self-check before emitting: parses cleanly · required fields per type · all times ISO 8601 with TZ.")
         L.append("")
     else:
         L.append("== OUTPUT ==")
         L.append("Free-form text. Terse — Zack reads on a HUD.")
         L.append("")
 
-    # 3. Rules — YOU MUST emphasis on the criticals; ≤3 to keep them salient
+    # 3. Rules — ≤2 critical rules with YOU MUST emphasis. R3 dropped (mid-
+    # stream send_keys is unreliable; phase checkpoints handle correction).
     L.append("== RULES ==")
-    L.append("R1  YOU MUST NOT execute side effects yourself. SEND mail, ADD reminder,")
-    L.append("    ADD calendar, SEND imessage, fs.write outside /tmp — all of these are")
-    L.append("    forbidden. Propose them in actions[] only; Cortex executes after Zack")
-    L.append("    confirms a preview. Read ops on any of those apps are fine.")
-    L.append("")
-    L.append("R2  YOU MUST emit actions[] even with partial info. If a Read fails with")
-    L.append("    \"file too large\" or any token limit, STOP retrying that file — move on")
-    L.append("    with what you already have. If truly nothing to propose, emit")
-    L.append("    actions:[] + explain in notes:. Never go silent.")
-    L.append("")
-    L.append("R3  If a new \"user\" message appears in your conversation mid-task, it's")
-    L.append("    Zack speaking live. Integrate before emitting JSON, best-effort. If you")
-    L.append("    miss it (deep in thinking), that's OK — he'll correct at the preview.")
+    L.append("R1  YOU MUST NOT execute side effects (mail send, reminder add, calendar add,")
+    L.append("    imessage, fs.write outside /tmp). Propose in actions[]; Cortex previews +")
+    L.append("    executes after Zack approves. Reads are fine.")
+    L.append("R2  YOU MUST always emit valid JSON. On Read/Bash failure or token limit: stop")
+    L.append("    that path, commit with what you have, explain in notes:. Never go silent.")
     L.append("")
 
-    # 4. Bounded approach — soft budget; Claude Code docs warn about "infinite exploration"
-    L.append("== APPROACH ==")
-    L.append("Plan briefly in your thinking block, then act. Aim for ≤8 tool calls before")
-    L.append("committing. If you find yourself at 6+ calls without a clear path, COMMIT")
-    L.append("with what you have and use notes: to explain what's incomplete.")
+    # 4. Phases — when to checkpoint vs final. Compact.
+    L.append("== PHASES ==")
+    L.append('A "phase" is a logical step (e.g. find emails · then draft reply). End a phase')
+    L.append("by emitting {phase_done:true, summary, next, actions:[]} and STOPPING your turn.")
+    L.append('Zack replies "continue" (proceed with next as stated), free text (redirect),')
+    L.append('or "kill" (abandon).')
+    L.append("")
+    L.append("CHECKPOINT before: ambiguous keyword searches · sensitive drafts · acting on")
+    L.append('  parsed data you\'re unsure about. SKIP checkpoint when one bounded step ("remind')
+    L.append('  me to X", "write Y to file Z"). FINAL turn: phase_done absent/false +')
+    L.append("  actions[] populated (or empty + notes explaining).")
+    L.append("Aim ≤8 tool calls per phase. At 6+ with no clear path → COMMIT, don't loop.")
     L.append("")
 
-    # 5. Phase checkpoints — the multi-step blocking control loop (v2.6)
-    L.append("== PHASES (when to checkpoint vs go straight to final) ==")
-    L.append("If your work has 2+ distinct phases (e.g. \"check emails THEN find dir THEN")
-    L.append("draft reply\"), CHECKPOINT between phases instead of running straight through.")
-    L.append("This lets Zack confirm or redirect before each phase — critical for sensitive")
-    L.append("operations or when a wrong keyword could send research the wrong direction.")
-    L.append("")
-    L.append("AT A CHECKPOINT, your final JSON for THIS turn must be:")
-    L.append("  {")
-    L.append('    "phase_done": true,')
-    L.append('    "summary":    "<what you just finished, 1 line for HUD>",')
-    L.append('    "found":      "<key findings, ≤3 sentences>",         // optional')
-    L.append('    "next":       "<concrete one-line plan for next phase>",')
-    L.append('    "actions":    []')
-    L.append("  }")
-    L.append("Then END YOUR TURN and wait. Zack will reply with one of:")
-    L.append("  - \"continue\" / \"go\" / \"yes\" → proceed with next as stated")
-    L.append("  - free-form text → redirect; integrate before next phase")
-    L.append("  - \"cancel\" / \"stop\" → abandon; emit actions:[] + notes on next turn")
-    L.append("")
-    L.append("CHECKPOINT BEFORE: searching a directory you guessed at · acting on parsed")
-    L.append("data that might be ambiguous · any keyword search where wrong terms waste")
-    L.append("time · before drafting a sensitive reply.")
-    L.append("")
-    L.append("SKIP CHECKPOINT WHEN: the entire task is one bounded mechanical step")
-    L.append("(\"remind me to X\", \"write Y to file Z\"). Go straight to final actions[].")
-    L.append("")
-    L.append("FINAL OUTPUT (only when truly done; no more phases) must have phase_done")
-    L.append("absent or false, AND actions[] populated (or empty with notes explaining why).")
-    L.append("That's how Cortex knows to stop calling you.")
-    L.append("")
-
-    # 5. Twin pointer — DON'T pre-inline (per Zack 2026-05-25). CC's skill
-    # auto-discovery (~/constellation/twin/.claude/skills/) + Read on demand
-    # is the loading mechanism. Skills are empty initially and grow over
-    # time from real Approve/Modify interactions; trust the base model for
-    # everything else.
+    # 5. Twin pointer — no pre-load. CC discovers .claude/skills/ + Reads on demand.
     L.append("== ZACK'S TWIN ==")
     L.append("Path: ~/constellation/twin/  (granted via --add-dir)")
-    L.append("- .claude/skills/   auto-discovered by you (Agent Skills format). May be empty.")
-    L.append("- identity.md      Zack's preferred name, accounts, accent preferences. Read when relevant.")
-    L.append("- people/core/<slug>.md   when Zack names a person, read this for their email / phone / style notes.")
-    L.append("- _system/TOC.md   master index if you want to discover further files.")
-    L.append("Read on demand — DON'T preemptively Read everything; that's wasted tokens.")
+    L.append("- .claude/skills/    auto-discovered by you. Empty initially.")
+    L.append("- identity.md        Zack's preferred name, accounts. Read when needed.")
+    L.append("- people/core/<slug>.md  when Zack names someone, read for their email/style.")
+    L.append("- _system/TOC.md     index if you want to discover further files.")
+    L.append("Read on demand — never preemptively Read everything.")
     L.append("")
 
-    # 6. Available scopes — just paths, no lecture on tools
+    # 6. Available scopes
     if available_dirs:
-        L.append("== AVAILABLE PATHS (--add-dir granted) ==")
+        L.append("== --add-dir PATHS ==")
         for d in available_dirs:
             L.append(f"  {d}")
         L.append("")
 
-    # 6b. Apple ecosystem access (READ ONLY here — writes go through actions[])
-    # Zack uses Apple Mail / Calendar / Reminders / Notes / Messages — NOT
-    # Gmail / Google Calendar / Drive (those MCPs are deliberately disabled).
-    # Query them via Bash + osascript. Examples:
-    L.append("== APPLE ECOSYSTEM (read-only via Bash + osascript) ==")
-    L.append("Zack lives in Apple's stack, not Google's. To search/read his stuff use")
-    L.append("Bash with osascript. Common one-liners (treat as starting templates):")
-    L.append("  # Recent Mail messages from / to / about someone")
-    L.append("  osascript -e 'tell application \"Mail\"")
+    # 6b. Apple ecosystem — Mail/Calendar/Reminders/Safari live LOCAL not Google.
+    # One concise reminder + minimal starter snippet. CC knows osascript.
+    L.append("== APPLE ECOSYSTEM (Mail/Calendar/Reminders/Notes/iMessage/Safari) ==")
+    L.append("Zack uses Apple apps, NOT Google. Read via Bash + osascript (Gmail/GCal/Drive")
+    L.append("MCPs are deliberately disabled). For Mail prefer whose-clauses for speed:")
+    L.append('  tell application "Mail"')
     L.append("    set cutoff to (current date) - (60 * days)")
     L.append("    repeat with acc in every account")
     L.append("      repeat with mb in every mailbox of acc")
     L.append("        try")
     L.append("          set msgs to (messages of mb whose date received > cutoff)")
-    L.append("          repeat with m in msgs")
-    L.append("            -- filter by sender, subject, recipient as needed")
+    L.append("          repeat with m in msgs -- filter by sender/subject as needed")
     L.append("          end repeat")
     L.append("        end try")
     L.append("      end repeat")
     L.append("    end repeat")
-    L.append("  end tell'")
-    L.append("  # Today's calendar events")
-    L.append("  osascript -e 'tell application \"Calendar\" to return summary of every event of every")
-    L.append("    calendar whose start date ≥ (current date) and start date < ((current date) + days)'")
-    L.append("  # Reminders lists")
-    L.append("  osascript -e 'tell application \"Reminders\" to return name of every list'")
-    L.append("  # Active Safari tab")
-    L.append("  osascript -e 'tell application \"Safari\" to return URL of current tab of front window'")
+    L.append("  end tell")
+    L.append("Calendar/Reminders/Safari follow the same `tell application` pattern; CC knows.")
+    L.append("Side effects → emit in actions[] per R1; don't tell-application-send-it.")
     L.append("")
-    L.append("Notes:")
-    L.append("- Mail.app may take a few seconds on the first query (TCC + cold AppleScript).")
-    L.append("- Mail's whose-clause filtering is faster than iterating then matching in shell.")
-    L.append("- These are READ ops only. To send mail / add reminder / add event / send iMessage,")
-    L.append("  EMIT an action in actions[] — Cortex executes after Zack confirms (R1).")
-    L.append("- Do NOT try Gmail / Google Calendar / Google Drive MCP — disabled by design.")
-    L.append("")
-
-    # 7. Appendix — action shapes
-    if output_schema is not None:
-        L.append("== APPENDIX — action shapes ==")
-        L.append(_ACTION_APPENDIX)
 
     return "\n".join(L)
 

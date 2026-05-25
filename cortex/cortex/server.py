@@ -258,18 +258,17 @@ def _render_actions_preview(actions: list[dict[str, Any]], summary: str | None =
     return "\n".join(lines).strip() or "(no actions)"
 
 
-# ── Two-option decision canonicalization (Zack 2026-05-25) ────────────────
-# Every blocking card has exactly two buttons: Approve / Modify.
+# ── Three-option decision canonicalization (Zack 2026-05-25 v2) ───────────
+# Every blocking card has exactly three buttons: Approve / Modify / Kill.
 # Free-text on the feedback channel (typed in the composer, or spoken via
-# STT on Glass) gets classified into the same two outcomes server-side so
-# the user doesn't have to click — saying "ok, go" is approve; saying
-# anything substantive is modify-with-content.
+# STT on Glass) gets classified into the same three outcomes server-side so
+# the user doesn't have to click — "ok, go" is approve; "停" / "kill it" is
+# kill; anything else substantive is modify-with-content.
 #
 # Approve = proceed exactly as previewed (send / continue / execute / yes).
 # Modify  = redirect with details (the text is the redirection).
-# Cancel/dismiss does NOT exist as a button anymore — to abandon, the user
-# can Modify with "cancel this" or just ignore the card until ttl fires.
-_TWO_OPTIONS = ["Approve", "Modify"]
+# Kill    = abandon: kill any agent tmux + drop pending + log a kill signal.
+_THREE_OPTIONS = ["Approve", "Modify", "Kill"]
 
 _APPROVE_BUTTON_TOKENS = {
     # English
@@ -281,6 +280,10 @@ _APPROVE_BUTTON_TOKENS = {
 _MODIFY_BUTTON_TOKENS = {
     "modify", "feedback", "adjust", "edit", "fix", "change",
     "修改", "改", "编辑",
+}
+_KILL_BUTTON_TOKENS = {
+    "kill", "stop", "abort", "abandon", "cancel", "nevermind", "drop", "scrap",
+    "掐断", "停", "停下", "取消", "算了", "别做了", "终止", "中断", "撤销",
 }
 # Phrases that, even when sent as free text, mean "approve as-is".
 _LEARNING_QUEUE_REL = "_system/learning_queue.jsonl"
@@ -364,24 +367,32 @@ _APPROVE_FREE_TEXT_PREFIXES = (
     "continue", "approve", "confirm",
     "好的", "好", "可以", "继续", "确认", "确定", "没问题", "通过", "行",
 )
+_KILL_FREE_TEXT_PHRASES = (
+    "kill it", "kill this", "stop it", "stop this", "abort", "abandon this",
+    "cancel this", "never mind", "nevermind", "drop it", "scrap it",
+    "forget it", "don't do it", "do not do",
+    "停下", "停止", "掐断", "算了", "别做了", "取消这个", "终止", "中断", "撤销",
+)
 
 
 def _classify_user_decision(
     decision: str | None,
     feedback_text: str | None,
 ) -> tuple[str, str | None]:
-    """Return ('approve' | 'modify', resolved_text_for_modify_or_None).
+    """Return ('approve' | 'modify' | 'kill', resolved_text_for_modify_or_None).
 
     - Button click: `decision` is the button label. Map via the token sets.
       A button-click "Modify" with empty feedback_text → ('modify', None);
       caller must re-surface the card.
     - Free text: `decision` may be a generic marker like "feedback" or "send"
       while `feedback_text` carries the actual content. The free-text content
-      itself is checked for approve-like phrases.
+      itself is checked for approve-like / kill-like phrases.
     """
     d = (decision or "").strip().lower()
     if d in _APPROVE_BUTTON_TOKENS:
         return "approve", None
+    if d in _KILL_BUTTON_TOKENS:
+        return "kill", None
     if d in _MODIFY_BUTTON_TOKENS:
         ftext = (feedback_text or "").strip()
         return "modify", ftext or None
@@ -394,6 +405,11 @@ def _classify_user_decision(
     tl = text.lower()
     if tl in _APPROVE_BUTTON_TOKENS:
         return "approve", None
+    if tl in _KILL_BUTTON_TOKENS:
+        return "kill", None
+    # Kill-phrase match (substring within short utterance).
+    if len(tl) <= 40 and any(phrase in tl for phrase in _KILL_FREE_TEXT_PHRASES):
+        return "kill", None
     # Short utterances starting with an approve phrase (and nothing
     # substantive after) → approve.
     for prefix in _APPROVE_FREE_TEXT_PREFIXES:
@@ -738,7 +754,7 @@ class CortexServer:
                     "title": f"Phase pause — {summary[:60]}",
                     "body": "\n".join(lines)[:2000],
                     "icon": "⏸",
-                    "options": list(_TWO_OPTIONS),
+                    "options": list(_THREE_OPTIONS),
                 },
                 requires_confirm=True, ttl_ms=600_000,
             )
@@ -778,7 +794,7 @@ class CortexServer:
             kind="preview_action",
             payload={
                 "title": title, "body": body_md[:2000], "icon": "✦",
-                "options": (list(_TWO_OPTIONS) if subtasks else []),
+                "options": (list(_THREE_OPTIONS) if subtasks else []),
             },
             requires_confirm=bool(subtasks), ttl_ms=300_000,
         )
@@ -1168,12 +1184,13 @@ class CortexServer:
     def _build_command(self, plan: dict[str, Any], results: list[dict[str, Any]]) -> Command:
         hud = plan["hud_response"]
         body = self._interpolate(hud["body_template"], results, plan=plan)
-        # Two-option contract (Zack 2026-05-25): every blocking card has
-        # exactly Approve / Modify; info cards (hud_show) have no buttons.
-        # Whatever the router emitted under hud_response.options is ignored.
+        # Three-option contract (Zack 2026-05-25 v2): every blocking card has
+        # exactly Approve / Modify / Kill; info cards (hud_show) have no
+        # buttons. Whatever the router emitted under hud_response.options is
+        # ignored — cortex enforces the contract regardless of LLM drift.
         kind = hud["kind"]
         if kind == "preview_action":
-            options: list[str] = list(_TWO_OPTIONS)
+            options: list[str] = list(_THREE_OPTIONS)
         else:
             options = []
         return Command(
@@ -1270,16 +1287,51 @@ class CortexServer:
                         log.warning("agent_kill.failed", error=str(e))
             return
 
-        # Canonicalize: every blocking card has exactly two outcomes —
-        # approve (proceed as previewed) or modify (redirect with text).
-        # Free-text on the feedback channel is classified by content.
+        # Canonicalize: every blocking card has exactly three outcomes —
+        # approve (proceed as previewed), modify (redirect with text), or
+        # kill (abandon + clean up). Free-text classified by content.
         kind, resolved_text = _classify_user_decision(decision, feedback_text)
         log.info(
             "decision.classified",
             kind=kind,
             has_text=bool(resolved_text),
-            from_button=bool(decision and decision.strip().lower() in (_APPROVE_BUTTON_TOKENS | _MODIFY_BUTTON_TOKENS)),
+            from_button=bool(
+                decision
+                and decision.strip().lower()
+                in (_APPROVE_BUTTON_TOKENS | _MODIFY_BUTTON_TOKENS | _KILL_BUTTON_TOKENS)
+            ),
         )
+
+        # Kill: terminate any active agent tmux, drop pending, log a kill
+        # signal (negative training data for learning_queue), no further work.
+        if kind == "kill":
+            self._pending_previews.pop(cmd_id, None)
+            _append_learning_signal(
+                self.twin, event=pending["event"], pending=pending,
+                decision_kind="kill", correction_text=None,
+            )
+            agent_result = pending.get("agent_result")
+            tmux_session = (agent_result or {}).get("tmux_session")
+            if tmux_session:
+                try:
+                    await self._dispatch_to_tool({
+                        "tool": "claude_code", "action": "agent_kill",
+                        "args": {"tmux_session": tmux_session},
+                        "result_format": "execute",
+                    })
+                except Exception as e:
+                    log.warning("agent_kill.failed", error=str(e))
+            if self._glass_conn:
+                await self._glass_conn.send(json.dumps({
+                    "id": f"prog_{ids.event_id()[4:]}",
+                    "kind": "progress",
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "parent_event_id": pending["event"].id,
+                    "stage": "killed", "icon": "✗",
+                    "detail": "killed at your request",
+                }, ensure_ascii=False))
+            log.info("decision.killed", cmd_id=cmd_id)
+            return
 
         # Modify clicked but no text yet → re-surface the card, don't ack.
         # The web client is expected to focus the composer; user submits and
