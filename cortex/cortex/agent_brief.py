@@ -183,17 +183,19 @@ def build_agent_brief(
     L.append("That's how Cortex knows to stop calling you.")
     L.append("")
 
-    # 5. Twin slices the selector picked (only what's relevant)
-    if twin_slices:
-        L.append("== ZACK'S TWIN (selector-picked, already loaded) ==")
-        for path, content in twin_slices.items():
-            L.append(f"=== {path} ===")
-            L.append(content.rstrip())
-            L.append("")
-    else:
-        L.append("== ZACK'S TWIN ==")
-        L.append("(none pre-loaded; read ~/constellation/twin/ if needed)")
-        L.append("")
+    # 5. Twin pointer — DON'T pre-inline (per Zack 2026-05-25). CC's skill
+    # auto-discovery (~/constellation/twin/.claude/skills/) + Read on demand
+    # is the loading mechanism. Skills are empty initially and grow over
+    # time from real Approve/Modify interactions; trust the base model for
+    # everything else.
+    L.append("== ZACK'S TWIN ==")
+    L.append("Path: ~/constellation/twin/  (granted via --add-dir)")
+    L.append("- .claude/skills/   auto-discovered by you (Agent Skills format). May be empty.")
+    L.append("- identity.md      Zack's preferred name, accounts, accent preferences. Read when relevant.")
+    L.append("- people/core/<slug>.md   when Zack names a person, read this for their email / phone / style notes.")
+    L.append("- _system/TOC.md   master index if you want to discover further files.")
+    L.append("Read on demand — DON'T preemptively Read everything; that's wasted tokens.")
+    L.append("")
 
     # 6. Available scopes — just paths, no lecture on tools
     if available_dirs:

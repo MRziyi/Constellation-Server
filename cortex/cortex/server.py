@@ -258,6 +258,155 @@ def _render_actions_preview(actions: list[dict[str, Any]], summary: str | None =
     return "\n".join(lines).strip() or "(no actions)"
 
 
+# ── Two-option decision canonicalization (Zack 2026-05-25) ────────────────
+# Every blocking card has exactly two buttons: Approve / Modify.
+# Free-text on the feedback channel (typed in the composer, or spoken via
+# STT on Glass) gets classified into the same two outcomes server-side so
+# the user doesn't have to click — saying "ok, go" is approve; saying
+# anything substantive is modify-with-content.
+#
+# Approve = proceed exactly as previewed (send / continue / execute / yes).
+# Modify  = redirect with details (the text is the redirection).
+# Cancel/dismiss does NOT exist as a button anymore — to abandon, the user
+# can Modify with "cancel this" or just ignore the card until ttl fires.
+_TWO_OPTIONS = ["Approve", "Modify"]
+
+_APPROVE_BUTTON_TOKENS = {
+    # English
+    "approve", "send", "send all", "continue", "ok", "yes", "go", "go ahead",
+    "proceed", "confirm", "looks good", "lgtm",
+    # 中文
+    "确认", "确定", "继续", "没问题", "好的", "好", "对", "可以", "行", "通过",
+}
+_MODIFY_BUTTON_TOKENS = {
+    "modify", "feedback", "adjust", "edit", "fix", "change",
+    "修改", "改", "编辑",
+}
+# Phrases that, even when sent as free text, mean "approve as-is".
+_LEARNING_QUEUE_REL = "_system/learning_queue.jsonl"
+
+
+def _append_learning_signal(
+    twin_root: Any,
+    *,
+    event: Event,
+    pending: dict[str, Any],
+    decision_kind: str,         # "approve" | "modify"
+    correction_text: str | None,
+) -> None:
+    """Append one Approve/Modify decision to the implicit-learning queue.
+
+    The queue is `~/constellation/twin/_system/learning_queue.jsonl`. A future
+    Insight-Engine pass (Phase 7) reads this corpus and distills SKILL.md
+    entries for ~/constellation/twin/.claude/skills/ when stable patterns
+    emerge from Zack's corrections.
+
+    Per Zack 2026-05-25: skills should not be hand-curated placeholders —
+    they should be derived from real Approve/Modify interactions where Zack
+    pushed back and steered the agent. This function captures the raw
+    training signal; skill-generation happens elsewhere later.
+
+    Schema (one JSON object per line):
+      {
+        "ts":              ISO-8601 UTC,
+        "event_id":        evt_*,
+        "user_ask":        original Zack ask (text),
+        "agent_intent":    primary_intent the agent settled on,
+        "agent_proposal":  compact summary of the actions / hud body shown,
+        "decision":        "approve" | "modify",
+        "correction":      Zack's modify text (None when approve),
+        "was_checkpoint":  bool — phase-pause vs final preview,
+        "was_agent_path":  bool — true if CC produced this; false if v0.5 planner.
+      }
+    Best-effort: silently skip on write failure (we never want a learning-log
+    failure to break the decision flow).
+    """
+    try:
+        # Resolve the path defensively — twin_root may be None or non-path-like.
+        twin_path = getattr(twin_root, "root", None) or getattr(twin_root, "path", None) or twin_root
+        if twin_path is None:
+            return
+        from pathlib import Path as _Path
+        p = _Path(str(twin_path)) / _LEARNING_QUEUE_REL
+        p.parent.mkdir(parents=True, exist_ok=True)
+
+        plan = pending.get("plan") or {}
+        hud = plan.get("hud_response") or {}
+        subtasks = plan.get("subtasks") or []
+        proposal_compact = {
+            "title": hud.get("title"),
+            "body": (hud.get("body_template") or "")[:400],
+            "subtasks": [
+                {"tool": s.get("tool"), "action": s.get("action"), "args": s.get("args")}
+                for s in subtasks
+            ],
+        }
+
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "event_id": event.id,
+            "user_ask": ((event.payload or {}).get("text") or "")[:600],
+            "agent_intent": plan.get("primary_intent"),
+            "agent_proposal": proposal_compact,
+            "decision": decision_kind,
+            "correction": (correction_text or "")[:1000] or None,
+            "was_checkpoint": bool(pending.get("is_checkpoint")),
+            "was_agent_path": bool(pending.get("from_agent") or pending.get("agent_result")),
+        }
+        with p.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log.warning("learning_queue.append_failed", error=str(e))
+
+
+_APPROVE_FREE_TEXT_PREFIXES = (
+    "ok", "yes", "go ahead", "go", "proceed", "looks good", "lgtm",
+    "continue", "approve", "confirm",
+    "好的", "好", "可以", "继续", "确认", "确定", "没问题", "通过", "行",
+)
+
+
+def _classify_user_decision(
+    decision: str | None,
+    feedback_text: str | None,
+) -> tuple[str, str | None]:
+    """Return ('approve' | 'modify', resolved_text_for_modify_or_None).
+
+    - Button click: `decision` is the button label. Map via the token sets.
+      A button-click "Modify" with empty feedback_text → ('modify', None);
+      caller must re-surface the card.
+    - Free text: `decision` may be a generic marker like "feedback" or "send"
+      while `feedback_text` carries the actual content. The free-text content
+      itself is checked for approve-like phrases.
+    """
+    d = (decision or "").strip().lower()
+    if d in _APPROVE_BUTTON_TOKENS:
+        return "approve", None
+    if d in _MODIFY_BUTTON_TOKENS:
+        ftext = (feedback_text or "").strip()
+        return "modify", ftext or None
+
+    # No clear button match. Treat as free-text channel — content drives.
+    text = (feedback_text or decision or "").strip()
+    if not text:
+        # Empty signal in the free-text channel → modify-needs-text.
+        return "modify", None
+    tl = text.lower()
+    if tl in _APPROVE_BUTTON_TOKENS:
+        return "approve", None
+    # Short utterances starting with an approve phrase (and nothing
+    # substantive after) → approve.
+    for prefix in _APPROVE_FREE_TEXT_PREFIXES:
+        if tl == prefix or tl.startswith(prefix + " ") or tl.startswith(prefix + ",") or tl.startswith(prefix + "."):
+            # If it's just the prefix + a short tail like "go ahead and send", treat as approve.
+            tail = tl[len(prefix):].strip(" ,.!。，！")
+            if not tail or tail in {"send", "send it", "send all", "and send", "and continue"}:
+                return "approve", None
+            # Substantive tail → fall through to modify with the full text.
+            break
+    return "modify", text
+
+
 class CortexServer:
     """Single-process server holding the active Glass connection + Tool Agent connection."""
 
@@ -512,12 +661,17 @@ class CortexServer:
     async def _resume_agent_phase(
         self, pending: dict[str, Any], decision: str, feedback_text: str | None, event: Event,
     ) -> None:
-        """Continue a paused multi-phase agent. Decision routes are:
-          - "send" / "continue" → "continue" (CC proceeds as proposed in next:)
-          - "feedback" + feedback_text → use that text as redirection
-          - any other "option" pick (Adjust w/o text via Glass options) → treat as continue
-        After CC resumes, parse the next output and surface the next card
-        (could be another checkpoint or the final actions[] preview).
+        """Continue a paused multi-phase agent. Per Zack 2026-05-25 the
+        decision surface is reduced to exactly two outcomes:
+
+          - APPROVE: send the literal "continue" to CC; it follows `next:`
+            as proposed.
+          - MODIFY:  MUST carry text. Send the user's text to CC as a fresh
+            user message; CC integrates and re-emits.
+
+        A clicked-Modify with NO text is a NO-OP — we re-surface the same
+        card so the user can supply text. (Old bug: empty Modify silently
+        became continue, swallowing the user's intent.)
         """
         agent_result = pending["agent_result"]
         tmux_session = agent_result.get("tmux_session")
@@ -526,14 +680,11 @@ class CortexServer:
         timeout_s = float(pending.get("agent_timeout_s") or 240)
         original_event = pending["event"]
 
-        if decision == "feedback" and (feedback_text or "").strip():
-            user_text = feedback_text.strip()
-        elif decision in ("send", "Continue", "continue", "Send"):
-            user_text = "continue"
-        elif decision == "Adjust":
-            user_text = feedback_text.strip() if (feedback_text or "").strip() else "continue"
-        else:
-            user_text = (feedback_text or decision or "continue").strip()
+        # Caller (_handle_user_decision) has already canonicalized to
+        # approve | modify-with-text; the modify-without-text case never
+        # reaches us (parent re-surfaces the card and bails).
+        kind, resolved_text = _classify_user_decision(decision, feedback_text)
+        user_text = "continue" if kind == "approve" else (resolved_text or "continue")
 
         log.info("agent.resuming", tmux_session=tmux_session, user_text=user_text[:80])
 
@@ -587,7 +738,7 @@ class CortexServer:
                     "title": f"Phase pause — {summary[:60]}",
                     "body": "\n".join(lines)[:2000],
                     "icon": "⏸",
-                    "options": ["Continue", "Adjust", "Cancel"],
+                    "options": list(_TWO_OPTIONS),
                 },
                 requires_confirm=True, ttl_ms=600_000,
             )
@@ -627,9 +778,9 @@ class CortexServer:
             kind="preview_action",
             payload={
                 "title": title, "body": body_md[:2000], "icon": "✦",
-                "options": (["Send all", "Cancel"] if subtasks else ["OK"]),
+                "options": (list(_TWO_OPTIONS) if subtasks else []),
             },
-            requires_confirm=True, ttl_ms=300_000,
+            requires_confirm=bool(subtasks), ttl_ms=300_000,
         )
         self._pending_previews[cmd.id] = {
             "event": event,
@@ -663,38 +814,16 @@ class CortexServer:
         card (checkpoint or final) via _send_agent_card_for_decision.
         """
         from .agent_brief import build_agent_brief, CANONICAL_ACTIONS_SCHEMA
-        from .router import select_twin_paths
 
         payload = event.payload or {}
         ask_text = (payload.get("text") or "").strip()
 
-        # Selector — pick Twin slices to inline into CC's brief.
+        # No Twin pre-load anymore (per Zack 2026-05-25). CC discovers
+        # ~/constellation/twin/.claude/skills/ natively (Agent Skills format)
+        # and reads identity.md / people/core/* on demand via its own Read
+        # tool. The v0.5 selector LLM call was a brief-assembly step from
+        # the round-based router era — it's pure latency now.
         twin_slices: dict[str, str] = {}
-        if self.twin is not None:
-            try:
-                await self._emit_progress_to_glass(
-                    parent_event_id=event.id,
-                    stage="selecting_twin", icon="📚",
-                    detail="picking Twin slices for context (gpt-5.2)",
-                )
-                toc_entries = self.twin.build_toc()
-                toc_paths = {p for p, _ in toc_entries}
-                toc_table = self.twin.toc_as_table()
-                picked = await select_twin_paths(
-                    event=event,
-                    twin_toc_table=toc_table,
-                    toc_paths=toc_paths,
-                )
-                twin_slices = self.twin.assemble_context_pack(picked)
-                picked_label = ", ".join(p.rsplit("/", 1)[-1] for p in picked) or "(none)"
-                await self._emit_progress_to_glass(
-                    parent_event_id=event.id,
-                    stage="twin_loaded", icon="📚",
-                    detail=f"loaded {len(picked)} Twin path(s): {picked_label}",
-                )
-            except Exception as e:
-                log.warning("agent.selector_failed", error=str(e))
-                twin_slices = {}
 
         schema_hint = output_schema or CANONICAL_ACTIONS_SCHEMA
         add_dirs = add_dirs or [
@@ -1039,17 +1168,25 @@ class CortexServer:
     def _build_command(self, plan: dict[str, Any], results: list[dict[str, Any]]) -> Command:
         hud = plan["hud_response"]
         body = self._interpolate(hud["body_template"], results, plan=plan)
+        # Two-option contract (Zack 2026-05-25): every blocking card has
+        # exactly Approve / Modify; info cards (hud_show) have no buttons.
+        # Whatever the router emitted under hud_response.options is ignored.
+        kind = hud["kind"]
+        if kind == "preview_action":
+            options: list[str] = list(_TWO_OPTIONS)
+        else:
+            options = []
         return Command(
             id=ids.command_id(),
             ts=datetime.now(timezone.utc),
-            kind=hud["kind"],
+            kind=kind,
             payload={
                 "title": hud["title"],
                 "body": body,
                 "icon": hud.get("icon", ""),
-                "options": hud.get("options", []),
+                "options": options,
             },
-            requires_confirm=hud["kind"] == "preview_action",
+            requires_confirm=kind == "preview_action",
             ttl_ms=30_000,
         )
 
@@ -1090,14 +1227,18 @@ class CortexServer:
         cmd_id = event.payload.get("in_reply_to")
         feedback_text = event.payload.get("feedback_text")
         log.info("user_decision.received", decision=decision, cmd_id=cmd_id, has_feedback=bool(feedback_text))
-        pending = self._pending_previews.pop(cmd_id, None)
+
+        # Peek (don't pop yet) — we may need to re-register if Modify lacks text.
+        pending = self._pending_previews.get(cmd_id)
         if not pending:
             log.warning("user_decision.no_pending", cmd_id=cmd_id, known=list(self._pending_previews.keys()))
             return
 
-        # Reverse-wake follow-up: decision matches an option id in wake_response_map.
+        # Reverse-wake follow-up: option id matches the wake_response_map keys.
+        # Keep the legacy literal path so allow_once / allow_always / deny still work.
         wake_response_map = pending.get("wake_response_map") or {}
         if wake_response_map and decision in wake_response_map:
+            self._pending_previews.pop(cmd_id, None)
             try:
                 follow_up = wake_response_map[decision]
                 log.info("reverse_wake.responding", decision=decision, follow_up=follow_up)
@@ -1110,9 +1251,12 @@ class CortexServer:
                 raise
             return
 
-        if decision == "dismiss":
-            log.info("dismissed")
-            # If this was a paused agent checkpoint, kill the tmux session
+        # "dismiss" is a non-UI signal — fired by the web client on TTL
+        # expiry or by programmatic callers. Drops the pending card and
+        # kills any active agent tmux session. No button surfaces it.
+        if (decision or "").strip().lower() == "dismiss":
+            self._pending_previews.pop(cmd_id, None)
+            log.info("dismissed", cmd_id=cmd_id)
             if pending.get("is_checkpoint") and pending.get("agent_result"):
                 tmux_session = pending["agent_result"].get("tmux_session")
                 if tmux_session:
@@ -1126,25 +1270,67 @@ class CortexServer:
                         log.warning("agent_kill.failed", error=str(e))
             return
 
-        # ── Multi-phase agent checkpoint: resume CC with the user's input ──
+        # Canonicalize: every blocking card has exactly two outcomes —
+        # approve (proceed as previewed) or modify (redirect with text).
+        # Free-text on the feedback channel is classified by content.
+        kind, resolved_text = _classify_user_decision(decision, feedback_text)
+        log.info(
+            "decision.classified",
+            kind=kind,
+            has_text=bool(resolved_text),
+            from_button=bool(decision and decision.strip().lower() in (_APPROVE_BUTTON_TOKENS | _MODIFY_BUTTON_TOKENS)),
+        )
+
+        # Modify clicked but no text yet → re-surface the card, don't ack.
+        # The web client is expected to focus the composer; user submits and
+        # we get a follow-up user_decision with the text.
+        if kind == "modify" and not resolved_text:
+            log.info("decision.modify_needs_text", cmd_id=cmd_id)
+            if self._glass_conn:
+                await self._glass_conn.send(json.dumps({
+                    "id": f"prog_{ids.event_id()[4:]}",
+                    "kind": "progress",
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "parent_event_id": pending["event"].id,
+                    "stage": "modify_needs_text", "icon": "✍️",
+                    "detail": "Modify clicked — please tell me how to change it.",
+                }, ensure_ascii=False))
+            return  # leave the card pending
+
+        # ── Multi-phase agent checkpoint: resume CC with the canonical outcome ──
         if pending.get("is_checkpoint") and pending.get("agent_result"):
+            self._pending_previews.pop(cmd_id, None)
+            _append_learning_signal(
+                self.twin, event=pending["event"], pending=pending,
+                decision_kind=kind,
+                correction_text=resolved_text,
+            )
             await self._resume_agent_phase(pending, decision, feedback_text, event)
             return
+
+        # Commit: consume the pending entry now.
+        self._pending_previews.pop(cmd_id, None)
+
+        # Implicit-learning signal: append this decision to the learning
+        # queue. Both Approve (positive signal) and Modify (correction
+        # signal) are valuable training data for Phase-7 skill distillation.
+        _append_learning_signal(
+            self.twin, event=pending["event"], pending=pending,
+            decision_kind=kind,
+            correction_text=resolved_text,
+        )
 
         plan = pending["plan"]
         task_continues = bool(plan.get("task_continues"))
         task_history: list[dict[str, Any]] = list(pending.get("task_history") or [])
         original_event: Event = pending["event"]
 
-        if decision == "send":
+        if kind == "approve":
             if task_continues:
-                # Intermediate step: defensively run any execute subtasks (Router should
-                # not emit those for intermediate, but allow + warn).
                 exec_subtasks = [st for st in plan["subtasks"] if st["result_format"] == "execute"]
                 if exec_subtasks:
                     log.warning("intermediate.has_execute_subtasks", n=len(exec_subtasks))
                     await self._execute_remaining_no_receipt(pending)
-                # Write a step receipt (audit trail mid-task)
                 self._write_step_receipt(plan, pending["subtask_results"], event.id, step_index=len(task_history))
                 task_history.append(self._summarize_step_for_history(plan, pending["subtask_results"], "send"))
                 try:
@@ -1153,28 +1339,26 @@ class CortexServer:
                     log.error("task.advance_failed", error=str(e), error_type=type(e).__name__, exc_info=True)
                     raise
             else:
-                # Final step: execute + write final receipt
                 try:
                     await self._execute_remaining(pending, event.id)
                 except Exception as e:
                     log.error("execute_remaining.failed", error=str(e), error_type=type(e).__name__, exc_info=True)
                     raise
+            return
 
-        elif decision == "feedback":
-            # Free-form verbal response; ALWAYS re-route with feedback + task_history.
-            # Router decides: redo current step / advance / skip / inject info (per C-23).
-            task_history.append(self._summarize_step_for_history(
-                plan, pending["subtask_results"], "feedback", feedback_text
-            ))
-            try:
-                await self._advance_task(
-                    original_event, task_history, event.id,
-                    feedback_text=feedback_text,
-                    prior_plan=plan,
-                )
-            except Exception as e:
-                log.error("feedback_loop.failed", error=str(e), error_type=type(e).__name__, exc_info=True)
-                raise
+        # kind == "modify" with text
+        task_history.append(self._summarize_step_for_history(
+            plan, pending["subtask_results"], "feedback", resolved_text
+        ))
+        try:
+            await self._advance_task(
+                original_event, task_history, event.id,
+                feedback_text=resolved_text,
+                prior_plan=plan,
+            )
+        except Exception as e:
+            log.error("feedback_loop.failed", error=str(e), error_type=type(e).__name__, exc_info=True)
+            raise
 
     def _summarize_step_for_history(
         self,
