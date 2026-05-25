@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -612,6 +613,97 @@ class CortexServer:
         if self._glass_conn:
             await self._glass_conn.send(cmd.model_dump_json())
 
+    async def _dispatch_complex_agent(
+        self,
+        event: Event,
+        *,
+        add_dirs: list[str] | None = None,
+        working_dir: str | None = None,
+        timeout_s: float = 240.0,
+        output_schema: dict[str, Any] | None = None,
+    ) -> None:
+        """The Phase 5 agent dispatch path — used by both /api/dev/agent_invoke
+        and the classifier's complex branch in _handle_user_invoke.
+
+        Builds the brief via cortex.agent_brief, picks Twin slices via the
+        v0.5 selector, dispatches claude_code.agent, and surfaces the first
+        card (checkpoint or final) via _send_agent_card_for_decision.
+        """
+        from .agent_brief import build_agent_brief, CANONICAL_ACTIONS_SCHEMA
+        from .router import select_twin_paths
+
+        payload = event.payload or {}
+        ask_text = (payload.get("text") or "").strip()
+
+        # Selector — pick Twin slices to inline into CC's brief.
+        twin_slices: dict[str, str] = {}
+        if self.twin is not None:
+            try:
+                toc_entries = self.twin.build_toc()
+                toc_paths = {p for p, _ in toc_entries}
+                toc_table = self.twin.toc_as_table()
+                picked = await select_twin_paths(
+                    event=event,
+                    twin_toc_table=toc_table,
+                    toc_paths=toc_paths,
+                )
+                twin_slices = self.twin.assemble_context_pack(picked)
+            except Exception as e:
+                log.warning("agent.selector_failed", error=str(e))
+                twin_slices = {}
+
+        schema_hint = output_schema or CANONICAL_ACTIONS_SCHEMA
+        add_dirs = add_dirs or [
+            os.path.expanduser("~/constellation/twin"),
+            os.path.expanduser("~/Code/Projects"),
+            os.path.expanduser("~/.claude/projects"),
+        ]
+
+        brief = build_agent_brief(
+            ask_text=ask_text,
+            now_iso=datetime.now(timezone.utc).astimezone().isoformat(),
+            has_photo=bool(payload.get("image")),
+            twin_slices=twin_slices,
+            output_schema=schema_hint,
+            available_dirs=add_dirs,
+        )
+
+        # Dispatch the agent action. RPC returns when CC end_turn's
+        # (checkpoint or final).
+        try:
+            rpc = await self._dispatch_to_tool({
+                "tool": "claude_code", "action": "agent",
+                "args": {
+                    "brief": brief,
+                    "output_schema_hint": schema_hint,
+                    "add_dirs": add_dirs,
+                    "working_dir": working_dir,
+                    "parent_event_id": event.id,
+                    "timeout_s": timeout_s,
+                },
+                "result_format": "execute",
+            })
+        except Exception as e:
+            log.error("agent_dispatch.failed", error=str(e), exc_info=True)
+            if self._glass_conn:
+                err_cmd = Command(
+                    id=ids.command_id(), ts=datetime.now(timezone.utc),
+                    kind="hud_show",
+                    payload={
+                        "title": "Agent failed",
+                        "body": f"Couldn't dispatch agent: {e}",
+                        "icon": "✗", "options": [],
+                    },
+                    requires_confirm=False, ttl_ms=20_000,
+                )
+                await self._glass_conn.send(err_cmd.model_dump_json())
+            return
+
+        await self._send_agent_card_for_decision(
+            rpc.result or {}, event,
+            working_dir=working_dir, timeout_s=timeout_s,
+        )
+
     async def _inject_feedback_into_agent(self, tmux_session: str, text: str) -> None:
         """Use the existing claude_code tmux machinery to paste user feedback
         into the active CC session. Dispatched via the tool-agent so the same
@@ -729,6 +821,23 @@ class CortexServer:
             self._write_receipt(synthetic_plan, [], event.id)
 
     async def _handle_user_invoke(self, event: Event) -> None:
+        # Phase 5c — classify intent first; complex asks bypass the v0.5
+        # Router entirely and go straight to the CC agent path. Simple
+        # asks (single-step state queries or explicit one-action requests)
+        # continue through the existing planner + executor-adapter dispatch.
+        if not self.use_stub_router:   # stub router (Phase 1) is for tests only
+            from .classifier import classify_intent
+            try:
+                decision = await classify_intent(event)
+                if decision.get("complex"):
+                    log.info("intent.complex_via_agent", why=decision.get("why"))
+                    await self._dispatch_complex_agent(event)
+                    return
+                log.info("intent.simple_via_router", why=decision.get("why"))
+            except Exception as e:
+                log.warning("classifier.errored_falling_through", error=str(e))
+                # Fall through to existing path on classifier failure
+
         plan = await self._route(event)
         log.info("plan.generated", primary_intent=plan["primary_intent"])
 

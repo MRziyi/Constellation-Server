@@ -57,11 +57,9 @@ RULES
 5. ISO 8601 for date/time args; resolve "tomorrow" / "3pm" against NOW.
 
 result_format
-  query   — read-only (list/read/search), no side effect
-  draft   — TEXTUAL artefact, no system touch. ONLY for claude_code.draft and
-            applescript_mail.draft (the two tools with draft semantics)
-  execute — real side effect (add reminder, send email, …). Side-effecting actions
-            are ALWAYS execute, never draft
+  query   — bounded state read (battery, current tab, today's events), no side effect
+  execute — side effect (add reminder, send email, run shortcut, …)
+  (`draft` is legacy — composition/research now lives in the agent path, not here)
 
 OUTPUT — think briefly in plain text if useful, then emit JSON inside a ```json
 fence (Cortex parses only the fence):
@@ -486,105 +484,78 @@ def route_stub(event: Event) -> dict[str, Any]:
     }
 
 
-# ── Available tools catalog (mirrors TOOL-ADAPTERS.md §1-13) ───────────────
+# ── Available tools catalog ────────────────────────────────────────────────
+# Phase 5g (V2 pivot): pruned to the simple-path executor + state-query set.
+# Research / composition / multi-call asks are routed to the agent path by the
+# classifier BEFORE the planner ever runs (see classifier.py + server._dispatch_
+# complex_agent). The planner's catalog is intentionally narrow — bounded
+# single-call actions only.
+#
+# Adapter code in tool-agent retains the full action set (used by the agent
+# path, and kept for regression safety). This catalog is just what the v0.5
+# planner is allowed to NAME.
 
 AVAILABLE_TOOLS: dict[str, dict[str, str]] = {
     "echo": {
         "actions": "echo",
-        "description": "Phase 1 debug: returns args.text verbatim.",
+        "description": "Debug: returns args.text verbatim.",
     },
     "applescript_reminders": {
-        "actions": "add, list, complete, delete",
-        "description": "Reminders.app. add(title, due?, list?, notes?).",
+        "actions": "add",
+        "description": "Reminders.app. add(title, due?, list?, notes?) — bounded reminder.",
     },
     "applescript_calendar": {
-        "actions": "list_today, list_range, add_event, find_conflict, get_event",
+        "actions": "add_event, list_today",
         "description": (
             "Calendar.app. add_event(title, start, end, calendar?='个人', location?, notes?) "
-            "with ISO 8601 start/end."
+            "with ISO 8601 start/end. list_today() → events for current local day."
         ),
     },
     "applescript_mail": {
-        "actions": "read_current, list_inbox, find_messages, draft, send, get_thread",
+        "actions": "send",
         "description": (
-            "Mail.app. Three send modes — pick correctly: "
-            "REPLY → send(reply_to_current=true | reply_to_message_id, body); do NOT pass "
-            "account (Mail auto-uses receiving account). "
+            "Mail.app SEND only (composition / reading is agent territory). "
             "COMPOSE → send(to, subject, body, account?='iCloud'|'Google'|'QQ'|'UIUC' — only "
-            "if Zack named one). "
-            "find_messages(participant?, subject_contains?, account?, mailbox?, limit?) "
-            "returns message_ids for reply_to_message_id. "
-            "send is preview-always; dry_run=true routes to Drafts."
+            "if Zack named one). REPLY → send(reply_to_current=true, body); do NOT pass "
+            "account (Mail auto-uses receiving account). Preview-always."
         ),
     },
     "fs": {
-        "actions": "read, write, append, grep, list, delete",
+        "actions": "write",
         "description": (
-            "Local filesystem. read(path), write(path, content, mode?='overwrite'|'create_only'), "
-            "append(path, content), delete(path), list(path), grep(pattern, path, include_vendored?). "
-            "Args use 'content' for the bytes to write (NOT 'text'/'body'/'data'). "
-            "Reads anywhere; writes under ~/constellation/, ~/Code/Projects/, /tmp/; deletes only "
-            "under ~/constellation/twin/. grep auto-excludes .venv, node_modules, .git, etc."
-        ),
-    },
-    "apple_notes": {
-        "actions": "create, list, read, append, search",
-        "description": (
-            "Notes.app. create(title, body?, folder?) for 'drop a thought' captures; "
-            "search(query) by title. Default account=iCloud, folder=Notes. Prefer over "
-            "Reminders for prose / multi-line content."
+            "Local filesystem WRITE only (reading / searching is agent territory). "
+            "write(path, content, mode?='overwrite'|'create_only'). 'content' is the bytes "
+            "(NOT 'text'/'body'/'data'). Writes under ~/constellation/, ~/Code/Projects/, /tmp/."
         ),
     },
     "system_status": {
         "actions": "get",
         "description": (
-            "Mac state: battery_pct, on_ac, focus_mode, frontmost_app, wifi_ssid, "
-            "tailscale, now_iso, tz. Query before planning if intent depends on context."
-        ),
-    },
-    "apple_shortcuts": {
-        "actions": "list, run",
-        "description": (
-            "Run user-defined Apple Shortcuts. list() enumerates; run(name, input?) → stdout. "
-            "Preview-always."
-        ),
-    },
-    "twin_query": {
-        "actions": "ask",
-        "description": (
-            "Semantic Q&A over Zack's Twin (grep + GPT synthesis with citations). "
-            "ask(question) → {answer, snippets}. Use for '我之前对 X 怎么想的' style recall. "
-            "Read-only; auto."
-        ),
-    },
-    "imessage": {
-        "actions": "send, list_recent",
-        "description": (
-            "iMessage. send(to:phone_or_email, body) preview-always. list_recent reads chat.db "
-            "(needs FDA TCC; soft-errors if not granted)."
+            "Mac state snapshot: battery_pct, on_ac, focus_mode, frontmost_app, wifi_ssid, "
+            "tailscale, now_iso, tz. Single-call bounded query."
         ),
     },
     "safari_state": {
-        "actions": "current_tab, all_tabs, recent_history",
-        "description": (
-            "Safari awareness. current_tab/all_tabs via AppleScript. recent_history reads "
-            "History.db (needs FDA TCC)."
-        ),
+        "actions": "current_tab",
+        "description": "Safari awareness. current_tab() → {url, title}. Single-call bounded query.",
+    },
+    "apple_shortcuts": {
+        "actions": "run",
+        "description": "Run a named Apple Shortcut. run(name, input?) → stdout. Preview-always.",
+    },
+    "imessage": {
+        "actions": "send",
+        "description": "iMessage. send(to:phone_or_email, body). Preview-always.",
     },
     "claude_code": {
-        "actions": (
-            "draft, run, continue_, list_sessions, run_interactive, get_pane, "
-            "send_keys, kill, list_tmux, start_watcher, stop_watcher, __test_inject_wake__"
-        ),
+        "actions": "agent",
         "description": (
-            "Claude Code CLI. Two tracks — pick correctly: "
-            "TRACK A `claude -p` (non-interactive): draft(prompt, working_dir?, add_dirs?) → "
-            "one-shot text; run() tracks session_id for resume; continue_(session_id, prompt) "
-            "resumes. Route web/paper search, code gen, summaries, 'read dir X and tell me' here. "
-            "TRACK B tmux (interactive): run_interactive() spawns CC TUI with reverse-wake "
-            "watcher; get_pane / send_keys(literal?) / kill drive it. Use for 'keep running, "
-            "I'll come check' tasks and UC2 supervision. "
-            "__test_inject_wake__ is test-only."
+            "Escalate to the research-agent path (Claude Code in tmux). Use ONLY for asks "
+            "the classifier should have caught but didn't — reading/searching/composing/"
+            "multi-step. agent(text, working_dir?, add_dirs?) spawns the briefed CC session "
+            "and produces a phase-checkpoint card. (agent_continue / agent_kill are "
+            "orchestration-internal actions Cortex dispatches on user decisions; the "
+            "planner doesn't emit them.)"
         ),
     },
 }
