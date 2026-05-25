@@ -54,17 +54,41 @@ class ToolAgentServer:
     async def handle(self, ws: ServerConnection) -> None:
         log.info("cortex.connected", remote=ws.remote_address)
         self._cortex_conn = ws
+        # Each RPC runs in its OWN task so a long-running action (e.g.
+        # claude_code.agent that tails session.jsonl for 30-60s) doesn't
+        # block subsequent dispatches like send_keys (which mid-flight
+        # corrections rely on). Sequential awaits used to deadlock the
+        # cortex.feedback path.
+        inflight: set[asyncio.Task] = set()
+
+        async def _run_and_reply(msg: dict) -> None:
+            try:
+                result = await self._dispatch(msg)
+                await ws.send(json.dumps(result))
+            except Exception as e:
+                # _dispatch already turns adapter errors into {status:failure};
+                # this catch is only for transport-level issues (e.g. ws closed
+                # mid-reply). Don't crash the connection handler.
+                log.error("rpc.reply_failed", error=str(e), rpc_id=msg.get("id"))
+
         try:
             async for raw in ws:
                 msg = json.loads(raw)
                 if "tool" in msg and "action" in msg:
-                    result = await self._dispatch(msg)
-                    await ws.send(json.dumps(result))
+                    task = asyncio.create_task(_run_and_reply(msg))
+                    inflight.add(task)
+                    task.add_done_callback(inflight.discard)
                 else:
                     log.warning("unknown_message_shape", keys=list(msg.keys()))
         except websockets.exceptions.ConnectionClosed:
             log.info("cortex.disconnected")
         finally:
+            # Let in-flight tasks finish (or get cancelled by ws close).
+            # Cancelling here would interrupt long-running agents on
+            # reconnect; let them complete or fail naturally.
+            for t in inflight:
+                if not t.done():
+                    t.cancel()
             if self._cortex_conn is ws:
                 self._cortex_conn = None
 

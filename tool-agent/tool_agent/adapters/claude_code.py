@@ -749,19 +749,16 @@ class ClaudeCodeAdapter:
         except OSError:
             pass
 
-        # Append schema hint to brief if one was given (no --json-schema flag in TUI)
-        if output_schema_hint:
-            if isinstance(output_schema_hint, dict):
-                schema_block = json.dumps(output_schema_hint, ensure_ascii=False, indent=2)
-            else:
-                schema_block = str(output_schema_hint)
-            brief = (
-                f"{brief}\n\n"
-                f"=== REQUIRED OUTPUT ===\n"
-                f"Your FINAL message must be ONLY this JSON object (no prose, "
-                f"no ```json fence — just the raw object so it parses cleanly):\n\n"
-                f"Schema:\n{schema_block}"
-            )
+        # output_schema_hint signals "we expect JSON, parse + validate the
+        # final assistant text against this schema". Callers (Cortex's
+        # _assemble_agent_brief) are now responsible for INCLUDING the
+        # schema text inside the brief itself, in the right place (head)
+        # for max model attention. Adapter no longer auto-appends to avoid
+        # double-pasting and to give the caller full control of the layout.
+        # Older callers that pass schema_hint without inlining will still
+        # get "structured" parsing on the result; CC just may comply less
+        # consistently without the inline contract — that's the caller's
+        # responsibility now.
 
         # tmux session name is derived from cc_session_id; computed once + reused
         # so Cortex's feedback handler can route send-keys to the right session
@@ -937,16 +934,19 @@ async def _tail_jsonl_until_idle(
     idle_quiet_s: float,
     poll_s: float = 0.4,
 ) -> dict[str, Any]:
-    """Tail a CC session.jsonl until: (a) we've seen at least one assistant
-    message AND no new events for `idle_quiet_s`, OR (b) `timeout_s` elapses.
+    """Tail a CC session.jsonl until CC ends its turn (best signal) OR we
+    exceed quiet/timeout limits.
+
+    Completion ladder (preferred → fallback):
+      1. saw an assistant message with `stop_reason == "end_turn"`
+         (CC explicitly closed its response — the cleanest signal)
+      2. saw_assistant_text=True AND no new events for `idle_quiet_s`
+         (CC produced prose but didn't tag end_turn; common in cancelled or
+         partial outputs)
+      3. `timeout_s` hard limit hit
 
     Returns:
-      {
-        "events": [...all decoded events],
-        "last_assistant_text": str | None,
-        "n_tool_uses": int,
-        "terminate_reason": "idle_after_assistant" | "timeout" | "file_missing"
-      }
+      events, last_assistant_text, n_tool_uses, terminate_reason
     """
     started = asyncio.get_event_loop().time()
     deadline = started + timeout_s
@@ -956,13 +956,13 @@ async def _tail_jsonl_until_idle(
     n_tool_uses = 0
     last_change = started
     pos = 0  # byte offset into the jsonl file
-    saw_assistant = False
+    saw_assistant_text = False
+    saw_end_turn = False
     partial = ""
 
     while asyncio.get_event_loop().time() < deadline:
         if not path.exists():
             await asyncio.sleep(poll_s)
-            # If file still missing for > 10s, bail
             if asyncio.get_event_loop().time() - started > 10 and not events:
                 return {
                     "events": events, "last_assistant_text": None,
@@ -993,17 +993,23 @@ async def _tail_jsonl_until_idle(
                 events.append(ev)
                 last_change = asyncio.get_event_loop().time()
 
-                # Track assistant messages for completion detection
                 if ev.get("type") == "assistant":
                     msg = ev.get("message") or {}
-                    saw_assistant = True
+                    # Track stop_reason on the snapshot; the message ID can
+                    # appear in multiple events as content streams in, but
+                    # only the FINAL snapshot has stop_reason set to a
+                    # non-null value.
+                    if msg.get("stop_reason") == "end_turn":
+                        saw_end_turn = True
                     for c in msg.get("content") or []:
-                        if c.get("type") == "text" and c.get("text"):
+                        if not isinstance(c, dict):
+                            continue
+                        if c.get("type") == "text" and (c.get("text") or "").strip():
+                            saw_assistant_text = True
                             last_assistant_text = c["text"]
-                        if c.get("type") == "tool_use":
+                        elif c.get("type") == "tool_use":
                             n_tool_uses += 1
 
-                # Fire-and-forget the callback
                 coro = on_event(ev)
                 if coro is not None:
                     try:
@@ -1011,13 +1017,21 @@ async def _tail_jsonl_until_idle(
                     except Exception:
                         pass
 
-        # Completion: saw at least one assistant message AND no new events
-        # for idle_quiet_s seconds.
-        if saw_assistant and (asyncio.get_event_loop().time() - last_change) >= idle_quiet_s:
+        # ── Completion signals, in priority order ──
+        if saw_end_turn:
+            # Give one extra poll tick for any trailing event to settle
+            await asyncio.sleep(poll_s)
             return {
                 "events": events, "last_assistant_text": last_assistant_text,
-                "n_tool_uses": n_tool_uses, "terminate_reason": "idle_after_assistant",
+                "n_tool_uses": n_tool_uses, "terminate_reason": "end_turn",
             }
+
+        if saw_assistant_text and (asyncio.get_event_loop().time() - last_change) >= idle_quiet_s:
+            return {
+                "events": events, "last_assistant_text": last_assistant_text,
+                "n_tool_uses": n_tool_uses, "terminate_reason": "idle_after_text",
+            }
+
         await asyncio.sleep(poll_s)
 
     return {

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -382,31 +383,54 @@ def make_app(plane: ControlPlane) -> web.Application:
 
         async def _run_agent() -> None:
             try:
-                # Inject the canonical actions[] schema if caller didn't supply one
-                schema_hint = body.get("output_schema_hint") or {
-                    "type": "object", "required": ["actions"],
-                    "properties": {
-                        "actions": {
-                            "type": "array",
-                            "description": (
-                                "List of actions Cortex should execute after Zack confirms. "
-                                "Each item has a 'type' field; valid types are: email, reminder, "
-                                "calendar_event, imessage, fs_write, shortcut. Per-type fields "
-                                "follow the AGENT-ARCHITECTURE-V2 §4 schema."
-                            ),
-                            "items": {"type": "object", "required": ["type"]},
-                        },
-                        "summary": {"type": "string"},
-                        "notes": {"type": "string"},
-                    },
-                }
+                from .server import (
+                    _action_to_subtask, _render_actions_preview,
+                    _assemble_agent_brief, _CANONICAL_ACTIONS_SCHEMA,
+                )
+                from .router import select_twin_paths
 
+                # ── 1. Selector picks twin slices to inline into brief ──
+                #     (v0.5 selector logic; consumer is now CC, not v0.5 Router)
+                if plane.twin is not None:
+                    toc_entries = plane.twin.build_toc()
+                    toc_paths = {p for p, _ in toc_entries}
+                    toc_table = plane.twin.toc_as_table()
+                    picked_paths = await select_twin_paths(
+                        event=event,
+                        twin_toc_table=toc_table,
+                        toc_paths=toc_paths,
+                    )
+                    twin_slices = plane.twin.assemble_context_pack(picked_paths)
+                else:
+                    twin_slices = {}
+
+                # ── 2. Schema: caller's hint OR canonical actions[] ──
+                schema_hint = body.get("output_schema_hint") or _CANONICAL_ACTIONS_SCHEMA
+
+                # ── 3. Resolve add_dirs (Twin + Code + past CC sessions by default) ──
+                add_dirs = body.get("add_dirs") or [
+                    os.path.expanduser("~/constellation/twin"),
+                    os.path.expanduser("~/Code/Projects"),
+                    os.path.expanduser("~/.claude/projects"),
+                ]
+
+                # ── 4. Assemble brief per AGENT-ARCHITECTURE-V2 §5 ──
+                brief = _assemble_agent_brief(
+                    ask_text=text,
+                    now_iso=datetime.now(timezone.utc).astimezone().isoformat(),
+                    has_photo=False,
+                    twin_slices=twin_slices,
+                    output_schema=schema_hint,
+                    available_dirs=add_dirs,
+                )
+
+                # ── 5. Dispatch streaming agent ──
                 rpc = await plane.server._dispatch_to_tool({
                     "tool": "claude_code", "action": "agent",
                     "args": {
-                        "brief": text,
+                        "brief": brief,
                         "output_schema_hint": schema_hint,
-                        "add_dirs": body.get("add_dirs") or [],
+                        "add_dirs": add_dirs,
                         "working_dir": body.get("working_dir"),
                         "parent_event_id": event.id,
                         "timeout_s": float(body.get("timeout_s", 240)),
@@ -418,9 +442,6 @@ def make_app(plane: ControlPlane) -> web.Application:
                     return
 
                 from .schema import Command
-                from .server import (
-                    _action_to_subtask, _render_actions_preview,
-                )
 
                 rpc_result = rpc.result or {}
                 structured = rpc_result.get("structured") or {}

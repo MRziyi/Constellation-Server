@@ -17,6 +17,10 @@ import websockets
 from websockets.asyncio.server import ServerConnection
 
 from . import ids
+from .agent_brief import (
+    CANONICAL_ACTIONS_SCHEMA as _CANONICAL_ACTIONS_SCHEMA,
+    build_agent_brief as _assemble_agent_brief,
+)
 from .control_plane import ControlPlane
 from .schema import Command, Event, RPCDispatch, RPCResult
 from .router import available_tools_block, route, route_stub, select_twin_paths
