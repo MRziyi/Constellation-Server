@@ -1676,18 +1676,49 @@ class CortexServer:
                 await self._advance_task(original_event, task_history, src_evt)
 
     async def _execute_remaining(self, pending: dict[str, Any], src_evt: str) -> None:
-        """Run the `execute` subtasks after user SEND. Write receipt + CHANGELOG."""
+        """Run the `execute` subtasks after user SEND. Write receipt + CHANGELOG.
+
+        After all subtasks complete, emit a terminal `completed` progress
+        frame to Glass + log to the session. Without this the HUD's
+        ActivityPill stays stuck on whatever the last pre-card progress
+        was ("🎴 preparing preview_action"), giving the impression the
+        action didn't happen even though it did.
+        """
         plan = pending["plan"]
         results = list(pending["subtask_results"])
+        parent_event_id = (pending.get("event").id if pending.get("event") else None) or src_evt
+        sid = pending.get("session_id")
         for i, st in enumerate(plan["subtasks"]):
             if st["result_format"] == "execute":
+                # Emit per-subtask progress so the HUD shows "executing X.Y"
+                # instead of staying on the pre-card "preparing preview".
+                await self._emit_progress_to_glass(
+                    parent_event_id=parent_event_id,
+                    stage="executing", icon="⚙️",
+                    detail=f"{st['tool']}.{st['action']}",
+                )
                 # Re-interpolate args against accumulated results (subtask N may reference N-1)
                 interpolated_args = self._interpolate_args(st.get("args", {}), results, plan=plan)
                 st_to_dispatch = {**st, "args": interpolated_args}
                 rpc_result = await self._dispatch_to_tool(st_to_dispatch)
                 results[i] = rpc_result.result
+                if sid:
+                    self.sessions.append(
+                        sid, "action_executed",
+                        tool=st["tool"], action=st["action"],
+                        result_brief=str(rpc_result.result)[:300] if rpc_result.result else None,
+                    )
 
         self._write_receipt(plan, results, src_evt)
+        # Terminal frame — ActivityPill hides on stage="completed", and the
+        # chat gets a final "✓ done" row so the user sees execution succeeded.
+        await self._emit_progress_to_glass(
+            parent_event_id=parent_event_id,
+            stage="completed", icon="✓",
+            detail=f"done — {plan.get('primary_intent', 'action')}",
+        )
+        if sid:
+            self.sessions.append(sid, "turn_complete", primary_intent=plan.get("primary_intent"))
 
     def _interpolate_args(self, args: Any, results: list[dict[str, Any]], plan: dict[str, Any] | None = None) -> Any:
         if isinstance(args, str):
