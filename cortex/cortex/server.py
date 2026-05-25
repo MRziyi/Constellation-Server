@@ -1362,6 +1362,15 @@ class CortexServer:
                 rpc_id=dispatch.id, tool=dispatch.tool, action=dispatch.action,
                 args=dispatch.args, result_format=dispatch.result_format,
             )
+        # Per-dispatch RPC timeout. Default 120s for fast adapter actions; for
+        # claude_code.agent / agent_continue (long-running CC sessions) read
+        # args.timeout_s and add 30s slack so the RPC outlasts the action's own
+        # internal cap. Otherwise the RPC times out mid-flight, cortex
+        # disconnects, and the still-running tmux session is orphaned.
+        rpc_timeout_s = 120.0
+        if dispatch.tool == "claude_code" and dispatch.action in ("agent", "agent_continue"):
+            inner_timeout = float(dispatch.args.get("timeout_s") or 300.0)
+            rpc_timeout_s = inner_timeout + 30.0
         loop = asyncio.get_event_loop()
         fut: asyncio.Future = loop.create_future()
         self._pending_rpcs[dispatch.id] = fut
@@ -1369,7 +1378,7 @@ class CortexServer:
         t0 = _time.monotonic()
         try:
             await self._tool_conn.send(dispatch.model_dump_json())
-            result = await asyncio.wait_for(fut, timeout=120.0)
+            result = await asyncio.wait_for(fut, timeout=rpc_timeout_s)
             if self.plane:
                 self.plane.record_dispatch_end(
                     rpc_id=dispatch.id,
@@ -1383,10 +1392,10 @@ class CortexServer:
             if self.plane:
                 self.plane.record_dispatch_end(
                     rpc_id=dispatch.id, status="error",
-                    result={"error": "timeout after 120s"},
+                    result={"error": f"timeout after {rpc_timeout_s:.0f}s"},
                     latency_ms=int((_time.monotonic() - t0) * 1000),
                 )
-            raise RuntimeError(f"RPC {dispatch.id} timed out after 120 s")
+            raise RuntimeError(f"RPC {dispatch.id} timed out after {rpc_timeout_s:.0f} s")
 
 
 async def serve(

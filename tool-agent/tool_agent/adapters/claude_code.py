@@ -794,7 +794,19 @@ class ClaudeCodeAdapter:
         # ── 2. Launch claude in tmux with our session UUID ──
         # (tmux_session computed above so the started progress event already
         # carries it; reuse here without re-derivation)
-        claude_cmd_parts = ["claude", "--session-id", cc_session_id]
+        #
+        # `--permission-mode bypassPermissions`: the agent path is for RESEARCH +
+        # COMPOSITION (per V2 SoT C-24). The brief tells CC to emit `actions[]`
+        # for side-effects — Cortex's executor pipeline is the side-effect gate
+        # (SoT C-9/C-10 preview-before-action). Without bypassPermissions, CC's
+        # interactive permission UI blocks every Bash call (mail/calendar
+        # AppleScript) and the jsonl stops advancing — symptom was 120s of
+        # heartbeats then RPC timeout with no real progress events.
+        agent_permission_mode = args.get("permission_mode", "bypassPermissions")
+        claude_cmd_parts = [
+            "claude", "--session-id", cc_session_id,
+            "--permission-mode", agent_permission_mode,
+        ]
         for d in add_dirs:
             claude_cmd_parts += ["--add-dir", os.path.expanduser(str(d))]
         # Quote each part for the shell command tmux will run
@@ -820,12 +832,40 @@ class ClaudeCodeAdapter:
             "state": "running",
         }
 
+        # Safety net (V2): even with bypassPermissions, CC may surface other
+        # blocking UIs (budget, model warnings, slash-command prompts). Start
+        # the reverse-wake watcher on the agent's tmux pane so any
+        # PERMISSION_PATTERNS hit fires a tool_reverse_wake event → Cortex
+        # renders a tool_card preview_action + push notification.
+        if self._event_pusher is not None:
+            self._start_watcher(tmux_session)
+
         try:
-            # Wait for CC to reach the prompt input area, then paste the brief.
-            # CC TUI typically renders the input prompt within 2-3s.
-            await asyncio.sleep(2.5)
-            # Send the brief: tmux paste-buffer is the cleanest way to handle
-            # multi-line text reliably (send-keys with newlines triggers send).
+            # ── 2a. Auto-dismiss the bypassPermissions safety prompt ──
+            # CC v2.1.150+ shows a "you accept responsibility" gate on
+            # bypassPermissions / --dangerously-skip-permissions launch:
+            #   ❯ 1. No, exit
+            #     2. Yes, I accept
+            # We must navigate to option 2 (Down) + Enter before the input
+            # prompt is reachable. Detect the screen by pane capture; only
+            # send keys if we actually see it (so other permission modes
+            # don't get a spurious Down+Enter on their normal input prompt).
+            await asyncio.sleep(2.0)
+            if agent_permission_mode in ("bypassPermissions",):
+                _, pane_out, _ = await _run(
+                    _tmux("capture-pane", "-t", tmux_session, "-p"), timeout=5,
+                )
+                if "Bypass Permissions" in pane_out and "Yes, I accept" in pane_out:
+                    await _run(_tmux("send-keys", "-t", tmux_session, "Down"), timeout=5)
+                    await asyncio.sleep(0.2)
+                    await _run(_tmux("send-keys", "-t", tmux_session, "Enter"), timeout=5)
+                    # CC needs a moment to clear the safety screen + draw the
+                    # input prompt.
+                    await asyncio.sleep(1.5)
+
+            # ── 2b. Paste the brief into CC's input prompt ──
+            # tmux paste-buffer is the cleanest way to handle multi-line text
+            # reliably (send-keys with newlines triggers send).
             buf_name = f"cb_{cc_session_id[:8]}"
             await _run(_tmux("set-buffer", "-b", buf_name, brief), timeout=5)
             await _run(_tmux("paste-buffer", "-b", buf_name, "-t", tmux_session), timeout=5)
@@ -891,6 +931,10 @@ class ClaudeCodeAdapter:
                 and bool((structured.get("next") or "").strip())
             )
             if not is_checkpoint:
+                # Final: stop watcher first, then kill tmux. Watcher attached
+                # in §2 above; without explicit stop it would keep polling a
+                # dead pane and emit a stream of capture-failure logs.
+                self._stop_watcher(tmux_session)
                 await _run(_tmux("kill-session", "-t", tmux_session), timeout=5)
                 self._tmux_sessions.pop(tmux_session, None)
             else:
@@ -932,6 +976,7 @@ class ClaudeCodeAdapter:
             }
         except Exception as e:
             # Best-effort cleanup
+            self._stop_watcher(tmux_session)
             await _run(_tmux("kill-session", "-t", tmux_session), timeout=5)
             self._tmux_sessions.pop(tmux_session, None)
             await _emit_progress({"stage": "error", "detail": f"agent: {type(e).__name__}: {e}"})
@@ -1111,6 +1156,7 @@ class ClaudeCodeAdapter:
         tmux_session = args.get("tmux_session")
         if not tmux_session:
             raise ValueError("claude_code.agent_kill: 'tmux_session' required")
+        self._stop_watcher(tmux_session)
         rc, _, _ = await _run(_tmux("kill-session", "-t", tmux_session), timeout=5)
         self._tmux_sessions.pop(tmux_session, None)
         return {"ok": rc == 0, "tmux_session": tmux_session}
