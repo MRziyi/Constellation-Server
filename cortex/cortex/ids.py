@@ -29,3 +29,8 @@ def receipt_id() -> str:
 
 def pulse_id() -> str:
     return _new("pulse")
+
+
+def session_id() -> str:
+    # HUD sessions (conversation threads). Persisted JSONL keyed by this id.
+    return _new("ses")

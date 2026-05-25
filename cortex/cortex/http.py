@@ -454,8 +454,169 @@ def make_app(plane: ControlPlane) -> web.Application:
             plane.unsubscribe(sub)
         return resp
 
+    # ── HUD sessions (conversation threads) ──
+    async def sessions_list(_request: web.Request) -> web.Response:
+        if plane.server is None or plane.server.sessions is None:
+            return _json({"sessions": []})
+        try:
+            return _json({"sessions": plane.server.sessions.list()})
+        except Exception as e:
+            return _err(f"sessions list failed: {e}", 500)
+
+    async def session_detail(request: web.Request) -> web.Response:
+        if plane.server is None or plane.server.sessions is None:
+            return _err("server not bound", 503)
+        sid = request.match_info["session_id"]
+        try:
+            records = list(plane.server.sessions.read(sid))
+            if not records:
+                return _err("session not found", 404)
+            return _json({"session_id": sid, "records": records})
+        except Exception as e:
+            return _err(f"session read failed: {e}", 500)
+
+    # ── Claude Code archive (every CC jsonl ever produced) ──
+    async def cc_archive_list(_request: web.Request) -> web.Response:
+        """List all CC sessions across all working-dir buckets, newest first.
+        Each entry: {session_id, working_dir, created_at, size_bytes, n_lines}.
+        """
+        from pathlib import Path as _P
+        root = _P.home() / ".claude" / "projects"
+        out: list[dict[str, Any]] = []
+        if root.exists():
+            for bucket in root.iterdir():
+                if not bucket.is_dir():
+                    continue
+                # bucket name is the sanitised working_dir
+                wdir = "/" + bucket.name.lstrip("-").replace("-", "/")
+                for jsonl in bucket.glob("*.jsonl"):
+                    try:
+                        st = jsonl.stat()
+                    except OSError:
+                        continue
+                    sid = jsonl.stem
+                    # Cheap line count
+                    try:
+                        with jsonl.open("rb") as f:
+                            n_lines = sum(1 for _ in f)
+                    except OSError:
+                        n_lines = -1
+                    out.append({
+                        "session_id": sid,
+                        "working_dir": wdir,
+                        "created_at": datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(),
+                        "size_bytes": st.st_size,
+                        "n_lines": n_lines,
+                        "bucket": bucket.name,
+                    })
+        out.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+        return _json({"cc_sessions": out[:200]})  # cap for HUD render
+
+    async def cc_archive_detail(request: web.Request) -> web.Response:
+        """Distilled timeline of one CC jsonl: tool_uses + assistant texts.
+
+        Returns: {session_id, working_dir, bucket, events: [{idx, kind, ...}]}
+        Heavy events (full tool_result bodies) are truncated.
+        """
+        from pathlib import Path as _P
+        sid = request.match_info["session_id"]
+        # Locate the jsonl by searching all buckets.
+        root = _P.home() / ".claude" / "projects"
+        match: _P | None = None
+        bucket = ""
+        if root.exists():
+            for b in root.iterdir():
+                cand = b / f"{sid}.jsonl"
+                if cand.exists():
+                    match = cand
+                    bucket = b.name
+                    break
+        if match is None:
+            return _err("CC session not found", 404)
+        events: list[dict[str, Any]] = []
+        try:
+            with match.open("r", encoding="utf-8") as f:
+                for i, line in enumerate(f):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    t = ev.get("type", "?")
+                    if t == "assistant":
+                        msg = ev.get("message") or {}
+                        sr = msg.get("stop_reason")
+                        for c in msg.get("content") or []:
+                            if not isinstance(c, dict):
+                                continue
+                            ct = c.get("type")
+                            if ct == "text" and (c.get("text") or "").strip():
+                                events.append({
+                                    "idx": i, "kind": "assistant_text",
+                                    "stop_reason": sr,
+                                    "text": (c.get("text") or "")[:1200],
+                                })
+                            elif ct == "tool_use":
+                                tin = c.get("input") or {}
+                                desc = ""
+                                if isinstance(tin, dict):
+                                    desc = (
+                                        tin.get("description")
+                                        or tin.get("command")
+                                        or tin.get("file_path")
+                                        or tin.get("pattern")
+                                        or ""
+                                    )
+                                    if not isinstance(desc, str):
+                                        desc = str(desc)
+                                events.append({
+                                    "idx": i, "kind": "tool_use",
+                                    "tool_name": c.get("name"),
+                                    "description": desc[:300],
+                                    "input": {k: (v if isinstance(v, (str, int, float, bool, type(None))) else str(v)[:400]) for k, v in (tin.items() if isinstance(tin, dict) else [])},
+                                })
+                            elif ct == "thinking":
+                                events.append({
+                                    "idx": i, "kind": "thinking",
+                                    "preview": (c.get("thinking") or "")[:300],
+                                })
+                    elif t == "user":
+                        msg = ev.get("message") or {}
+                        content = msg.get("content")
+                        if isinstance(content, list):
+                            for c in content:
+                                if isinstance(c, dict) and c.get("type") == "tool_result":
+                                    tc = c.get("content")
+                                    tx = tc if isinstance(tc, str) else (
+                                        " ".join(p.get("text", "") for p in tc if isinstance(p, dict)) if isinstance(tc, list) else ""
+                                    )
+                                    events.append({
+                                        "idx": i, "kind": "tool_result",
+                                        "tool_use_id": c.get("tool_use_id"),
+                                        "result": (tx or "")[:1200],
+                                        "is_error": bool(c.get("is_error")),
+                                    })
+                        elif isinstance(content, str):
+                            events.append({
+                                "idx": i, "kind": "user_text",
+                                "text": content[:1200],
+                            })
+        except OSError as e:
+            return _err(f"read failed: {e}", 500)
+        wdir = "/" + bucket.lstrip("-").replace("-", "/")
+        return _json({
+            "session_id": sid, "working_dir": wdir, "bucket": bucket,
+            "events": events,
+        })
+
     # ── route table ──
     app.router.add_get("/api/health", health)
+    app.router.add_get("/api/sessions", sessions_list)
+    app.router.add_get("/api/sessions/{session_id}", session_detail)
+    app.router.add_get("/api/cc-archive", cc_archive_list)
+    app.router.add_get("/api/cc-archive/{session_id}", cc_archive_detail)
 
     app.router.add_get("/api/cc/sessions", cc_sessions)
     app.router.add_get("/api/cc/pane", cc_pane)

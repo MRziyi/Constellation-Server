@@ -469,6 +469,17 @@ class CortexServer:
             }
         )
 
+        # HUD session store — file-backed JSONL conversation threads.
+        # Each user_invoke either starts a new session or extends an
+        # existing one (event.payload.session_id).
+        from .sessions import SessionStore
+        self.sessions = SessionStore(twin.root)
+        # parent_event_id → session_id mapping, used to annotate every
+        # progress frame the server emits with the session it belongs to.
+        # The client uses this to learn the server-minted session_id for
+        # fresh threads (when the user didn't supply one).
+        self._event_to_session: dict[str, str] = {}
+
         # Parse confirm-policies once at construction; reload on Twin write later (Phase 7).
         self._confirm_policies = _parse_confirm_policies(twin.root)
         log.info(
@@ -581,6 +592,7 @@ class CortexServer:
             "kind": "progress",
             "ts": datetime.now(timezone.utc).isoformat(),
             "parent_event_id": parent_event_id,
+            "session_id": self._event_to_session.get(parent_event_id or ""),
             "stage": payload.get("stage", "?"),
             "icon": payload.get("icon") or _default_icon_for_stage(payload.get("stage", "?")),
             "detail": payload.get("detail", "")[:200],
@@ -615,6 +627,7 @@ class CortexServer:
             "kind": "progress",
             "ts": datetime.now(timezone.utc).isoformat(),
             "parent_event_id": parent_event_id,
+            "session_id": self._event_to_session.get(parent_event_id or ""),
             "stage": stage,
             "icon": icon,
             "detail": (detail or "")[:200],
@@ -758,8 +771,10 @@ class CortexServer:
                 },
                 requires_confirm=True, ttl_ms=600_000,
             )
+            sid = (event.payload or {}).get("session_id")
             self._pending_previews[cmd.id] = {
                 "event": event,
+                "session_id": sid,
                 "plan": {
                     "primary_intent": "agent_checkpoint",
                     "subtasks": [], "reasoning": "phase checkpoint",
@@ -771,6 +786,12 @@ class CortexServer:
                 "agent_working_dir": working_dir,
                 "agent_timeout_s": timeout_s,
             }
+            if sid:
+                self.sessions.append(
+                    sid, "card_surfaced",
+                    cmd_id=cmd.id, kind="preview_action", is_checkpoint=True,
+                    title=cmd.payload["title"], body_excerpt=cmd.payload["body"][:400],
+                )
             if self._glass_conn:
                 await self._glass_conn.send(cmd.model_dump_json())
             return
@@ -798,8 +819,10 @@ class CortexServer:
             },
             requires_confirm=bool(subtasks), ttl_ms=300_000,
         )
+        sid = (event.payload or {}).get("session_id")
         self._pending_previews[cmd.id] = {
             "event": event,
+            "session_id": sid,
             "plan": {
                 "primary_intent": "agent_actions",
                 "subtasks": subtasks, "reasoning": "agent dispatch (resumed)",
@@ -810,6 +833,13 @@ class CortexServer:
             "from_agent": True,
             "agent_result": rpc_result,
         }
+        if sid:
+            self.sessions.append(
+                sid, "card_surfaced",
+                cmd_id=cmd.id, kind="preview_action", is_checkpoint=False,
+                title=cmd.payload["title"], body_excerpt=cmd.payload["body"][:400],
+                n_actions=len(subtasks),
+            )
         if self._glass_conn:
             await self._glass_conn.send(cmd.model_dump_json())
 
@@ -870,6 +900,13 @@ class CortexServer:
                 stage="dispatching_agent", icon="🤖",
                 detail="dispatching claude_code.agent",
             )
+            sid = (event.payload or {}).get("session_id")
+            if sid:
+                self.sessions.append(
+                    sid, "agent_dispatch",
+                    event_id=event.id, brief_chars=len(brief),
+                    add_dirs=add_dirs, timeout_s=timeout_s,
+                )
             rpc = await self._dispatch_to_tool({
                 "tool": "claude_code", "action": "agent",
                 "args": {
@@ -882,6 +919,17 @@ class CortexServer:
                 },
                 "result_format": "execute",
             })
+            # On RPC success, record the spawned CC session for the archive view.
+            if sid and rpc.result:
+                self.sessions.append(
+                    sid, "agent_completed",
+                    event_id=event.id,
+                    cc_session_id=rpc.result.get("session_id"),
+                    tmux_session=rpc.result.get("tmux_session"),
+                    n_tool_uses=rpc.result.get("n_tool_uses"),
+                    terminate_reason=rpc.result.get("terminate_reason"),
+                    is_checkpoint=rpc.result.get("is_checkpoint"),
+                )
         except Exception as e:
             log.error("agent_dispatch.failed", error=str(e), exc_info=True)
             if self._glass_conn:
@@ -1020,6 +1068,24 @@ class CortexServer:
             self._write_receipt(synthetic_plan, [], event.id)
 
     async def _handle_user_invoke(self, event: Event) -> None:
+        # Session linkage: every ask begins or extends a HUD session.
+        # event.payload.session_id (if set) ties this ask to an existing
+        # thread; otherwise we mint a new one. We stash it on the event for
+        # downstream code (_dispatch_complex_agent, _build_command,
+        # _handle_user_decision) to attribute records correctly.
+        payload = event.payload or {}
+        ask_text = (payload.get("text") or "").strip()
+        existing_sid = (payload.get("session_id") or "").strip() or None
+        session_id_for_turn = self.sessions.start_turn(
+            existing_session_id=existing_sid,
+            event_id=event.id, ask_text=ask_text,
+            has_image=bool(payload.get("image")),
+        )
+        # Attach to event payload for the rest of the pipeline.
+        # Pydantic Event is frozen=False so we can mutate payload in place.
+        event.payload["session_id"] = session_id_for_turn
+        self._event_to_session[event.id] = session_id_for_turn
+
         # Phase 5c — classify intent first; complex asks bypass the v0.5
         # Router entirely and go straight to the CC agent path. Simple
         # asks (single-step state queries or explicit one-action requests)
@@ -1034,6 +1100,10 @@ class CortexServer:
             try:
                 decision = await classify_intent(event)
                 why = str(decision.get("why") or "")[:80]
+                self.sessions.append(
+                    session_id_for_turn, "classifier",
+                    event_id=event.id, complex=bool(decision.get("complex")), why=why,
+                )
                 if decision.get("complex"):
                     log.info("intent.complex_via_agent", why=decision.get("why"))
                     await self._emit_progress_to_glass(
@@ -1126,12 +1196,22 @@ class CortexServer:
             detail=f"preparing {hud_kind}",
         )
         cmd = self._build_command(plan, subtask_results)
+        sid = (event.payload or {}).get("session_id")
         self._pending_previews[cmd.id] = {
             "event": event,  # full event kept so we can re-route on feedback / advance
+            "session_id": sid,
             "plan": plan,
             "subtask_results": subtask_results,
             "task_history": [],  # multi-step task history; empty on first round
         }
+        if sid:
+            self.sessions.append(
+                sid, "card_surfaced",
+                cmd_id=cmd.id, kind=cmd.kind, is_checkpoint=False,
+                title=cmd.payload.get("title", ""),
+                body_excerpt=(cmd.payload.get("body") or "")[:400],
+                primary_intent=plan.get("primary_intent"),
+            )
         if self._glass_conn:
             await self._glass_conn.send(cmd.model_dump_json())
         log.info(
@@ -1306,6 +1386,13 @@ class CortexServer:
         # signal (negative training data for learning_queue), no further work.
         if kind == "kill":
             self._pending_previews.pop(cmd_id, None)
+            sid = pending.get("session_id")
+            if sid:
+                self.sessions.append(
+                    sid, "decision",
+                    cmd_id=cmd_id, decision_kind="kill", text=None,
+                )
+                self.sessions.append(sid, "session_killed", cmd_id=cmd_id)
             _append_learning_signal(
                 self.twin, event=pending["event"], pending=pending,
                 decision_kind="kill", correction_text=None,
@@ -1352,6 +1439,13 @@ class CortexServer:
         # ── Multi-phase agent checkpoint: resume CC with the canonical outcome ──
         if pending.get("is_checkpoint") and pending.get("agent_result"):
             self._pending_previews.pop(cmd_id, None)
+            sid = pending.get("session_id")
+            if sid:
+                self.sessions.append(
+                    sid, "decision",
+                    cmd_id=cmd_id, decision_kind=kind, text=resolved_text,
+                    at_checkpoint=True,
+                )
             _append_learning_signal(
                 self.twin, event=pending["event"], pending=pending,
                 decision_kind=kind,
@@ -1362,6 +1456,14 @@ class CortexServer:
 
         # Commit: consume the pending entry now.
         self._pending_previews.pop(cmd_id, None)
+
+        sid = pending.get("session_id")
+        if sid:
+            self.sessions.append(
+                sid, "decision",
+                cmd_id=cmd_id, decision_kind=kind, text=resolved_text,
+                at_checkpoint=False,
+            )
 
         # Implicit-learning signal: append this decision to the learning
         # queue. Both Approve (positive signal) and Modify (correction
