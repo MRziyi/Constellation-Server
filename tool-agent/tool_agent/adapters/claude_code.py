@@ -763,6 +763,11 @@ class ClaudeCodeAdapter:
                 f"Schema:\n{schema_block}"
             )
 
+        # tmux session name is derived from cc_session_id; computed once + reused
+        # so Cortex's feedback handler can route send-keys to the right session
+        # without us having to coordinate state with it separately.
+        tmux_session = f"{TMUX_SESSION_PREFIX}agent-{cc_session_id[:8]}"
+
         # Helpers
         n_progress_emitted = 0
         async def _emit_progress(progress: dict[str, Any]) -> None:
@@ -775,19 +780,19 @@ class ClaudeCodeAdapter:
                 "payload": {
                     "parent_event_id": parent_event_id,
                     "agent_session_id": cc_session_id,
+                    "tmux_session": tmux_session,
                     **progress,
                 },
             })
             n_progress_emitted += 1
 
-        await _emit_progress({"stage": "started", "detail": "Agent spawning (tmux + subscription)…"})
+        await _emit_progress({"stage": "started", "icon": "🤖", "detail": "Agent online"})
 
         started_at = datetime.now(timezone.utc).isoformat()
 
         # ── 2. Launch claude in tmux with our session UUID ──
-        # Use a dedicated tmux session name (claude_code adapter's existing
-        # socket + prefix conventions).
-        tmux_session = f"{TMUX_SESSION_PREFIX}agent-{cc_session_id[:8]}"
+        # (tmux_session computed above so the started progress event already
+        # carries it; reuse here without re-derivation)
         claude_cmd_parts = ["claude", "--session-id", cc_session_id]
         for d in add_dirs:
             claude_cmd_parts += ["--add-dir", os.path.expanduser(str(d))]
@@ -828,7 +833,7 @@ class ClaudeCodeAdapter:
             await asyncio.sleep(0.3)
             await _run(_tmux("send-keys", "-t", tmux_session, "Enter"), timeout=5)
 
-            await _emit_progress({"stage": "brief_sent", "detail": "Brief delivered; agent thinking…"})
+            await _emit_progress({"stage": "brief_sent", "icon": "▶️", "detail": "task accepted, thinking…"})
 
             # ── 3. Tail the session.jsonl ──
             result = await _tail_jsonl_until_idle(
@@ -1042,16 +1047,24 @@ def _distill_jsonl_event(ev: dict[str, Any]) -> dict[str, Any] | None:
                 continue
             ct = c.get("type")
             if ct == "tool_use":
+                name = c.get("name", "tool")
+                icon, glance = _tool_glance(name, c.get("input") or {})
                 return {
                     "stage": "tool_call",
-                    "tool": c.get("name", "tool"),
-                    "detail": _tool_input_to_detail(c.get("name", "?"), c.get("input") or {}),
+                    "tool": name,
+                    "icon": icon,
+                    "detail": glance,           # HUD-friendly one-liner ≤ 80c
                 }
             if ct == "text":
                 text = (c.get("text") or "").strip()
                 if not text:
                     return None
-                return {"stage": "assistant_text", "detail": text[:400]}
+                # Keep assistant prose terse for HUD; show as a "thinking" line
+                return {
+                    "stage": "assistant_text",
+                    "icon": "💭",
+                    "detail": text[:120] + ("…" if len(text) > 120 else ""),
+                }
             if ct == "thinking":
                 return None
         return None
@@ -1071,10 +1084,11 @@ def _distill_jsonl_event(ev: dict[str, Any]) -> dict[str, Any] | None:
                             parts.append(str(x))
                     content = " ".join(parts)
                 is_err = bool(c.get("is_error"))
-                snippet = str(content).replace("\n", " ⏎ ")[:240]
+                summary = _summarise_tool_result(str(content), is_err)
                 return {
                     "stage": "tool_result",
-                    "detail": f"ERROR: {snippet}" if is_err else snippet,
+                    "icon": "✗" if is_err else "✓",
+                    "detail": summary,
                     "is_error": is_err,
                 }
         return None
@@ -1146,29 +1160,91 @@ def _distill_progress(ev: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def _tool_input_to_detail(tool: str, inp: dict[str, Any]) -> str:
-    """Best-effort one-line summary of a tool invocation for the HUD."""
+def _shorten(s: str, n: int = 70) -> str:
+    s = s.strip()
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _basename_path(p: str) -> str:
+    """Just show the filename or last 2 path components — HUD friendly."""
+    if not p:
+        return "?"
+    parts = p.split("/")
+    if len(parts) <= 2:
+        return p
+    return ".../" + "/".join(parts[-2:])
+
+
+def _tool_glance(tool: str, inp: dict[str, Any]) -> tuple[str, str]:
+    """Return (emoji, ≤70-char glanceable label) for one tool invocation.
+
+    Designed for AR-glass HUD where vertical space is ~5 lines and you must
+    grok the agent's action in <0.5s.  Prefer Anthropic's own short
+    `description` arg when CC provides it; else extract the essence.
+    """
+    # CC's Bash tool requires a `description` (5-10 word verb phrase). Prefer it.
     if tool == "Bash":
-        cmd = inp.get("command", "")
         desc = inp.get("description") or ""
-        return f"$ {cmd[:160]}" + (f"  ({desc[:60]})" if desc else "")
+        if desc:
+            return "🔧", _shorten(desc, 70)
+        cmd = inp.get("command", "")
+        # Pull leading executable for a hint
+        first = (cmd.split() or ["?"])[0]
+        return "🔧", _shorten(f"{first}: {cmd}", 70)
+
     if tool == "Read":
-        fp = inp.get("file_path") or inp.get("path") or "?"
-        return f"📖 read {fp}"
+        return "📖", "reading " + _basename_path(inp.get("file_path") or inp.get("path") or "?")
     if tool == "Write":
-        fp = inp.get("file_path") or inp.get("path") or "?"
-        return f"✍ write {fp}"
+        return "✍️", "writing " + _basename_path(inp.get("file_path") or inp.get("path") or "?")
     if tool == "Edit":
-        fp = inp.get("file_path") or inp.get("path") or "?"
-        return f"✎ edit {fp}"
+        return "📝", "editing " + _basename_path(inp.get("file_path") or inp.get("path") or "?")
+    if tool == "Glob":
+        return "🔍", _shorten(f"glob {inp.get('pattern','?')}", 70)
+    if tool == "Grep":
+        return "🔍", _shorten(f"grep '{inp.get('pattern') or inp.get('query') or '?'}'", 70)
     if tool == "WebFetch":
         url = inp.get("url") or "?"
-        return f"🌐 fetch {url[:100]}"
+        return "🌐", _shorten(f"fetching {url}", 70)
     if tool == "WebSearch":
-        return f"🔎 search: {(inp.get('query') or '?')[:120]}"
-    if tool in ("Glob", "Grep"):
-        return f"🔍 {tool}: {(inp.get('pattern') or inp.get('query') or '?')[:120]}"
+        return "🌐", _shorten(f"searching: {inp.get('query') or '?'}", 70)
     if tool == "TodoWrite":
-        return "📋 (CC updating its own todo list)"
-    # Generic fallback
-    return f"{tool}: {json.dumps(inp, ensure_ascii=False)[:180]}"
+        return "📋", "updating own todo list"
+    if tool == "TodoRead":
+        return "📋", "checking own todos"
+    if tool == "Task":
+        return "🧵", _shorten(f"spawning sub-agent: {inp.get('subagent_type','?')}", 70)
+    if tool == "StructuredOutput":
+        return "📦", "finalising structured result"
+
+    # MCP / extension tools — name has dots/colons
+    if "__" in tool or ":" in tool:
+        return "🔌", _shorten(tool, 70)
+
+    # Generic fallback — show tool name + first input value
+    if inp:
+        k, v = next(iter(inp.items()))
+        return "·", _shorten(f"{tool}({k}={v})", 70)
+    return "·", _shorten(tool, 70)
+
+
+def _summarise_tool_result(content: str, is_err: bool) -> str:
+    """Compress a tool result down to a glanceable line. Bash output is the
+    most variable — for short outputs show as-is, for long outputs show line
+    count + first line."""
+    if is_err:
+        return _shorten(content.replace("\n", " ⏎ "), 70)
+    text = content.strip()
+    if not text:
+        return "(no output)"
+    lines = text.split("\n")
+    if len(lines) == 1:
+        return _shorten(lines[0], 70)
+    if len(lines) <= 3:
+        return _shorten(" ⏎ ".join(lines), 70)
+    return _shorten(f"{len(lines)} lines · 1st: {lines[0]}", 70)
+
+
+# Legacy alias for the old -p path (kept until 5g cleanup retires it)
+def _tool_input_to_detail(tool: str, inp: dict[str, Any]) -> str:
+    icon, label = _tool_glance(tool, inp)
+    return f"{icon} {label}"

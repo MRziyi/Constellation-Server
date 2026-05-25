@@ -35,7 +35,12 @@ class Event(BaseModel):
 
     id: str | None = None
     ts: datetime
-    kind: Literal["user_invoke", "user_decision", "tool_reverse_wake", "self_pulse"]
+    kind: Literal[
+        "user_invoke", "user_decision", "tool_reverse_wake", "self_pulse",
+        # v2 agent runtime (per AGENT-ARCHITECTURE-V2.md):
+        "agent_progress",      # tool_agent → Cortex: CC mid-task event (non-blocking)
+        "progress_feedback",   # Glass → Cortex: user spoke in the feedback window
+    ]
     payload: dict[str, Any]
 
 

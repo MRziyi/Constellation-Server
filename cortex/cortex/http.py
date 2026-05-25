@@ -343,6 +343,96 @@ def make_app(plane: ControlPlane) -> web.Application:
         return _json({"ok": True, "event_id": event.id})
 
     # ── dev/test helpers ──
+    async def dev_agent_invoke(request: web.Request) -> web.Response:
+        """Dispatch an agentic task via claude_code.agent directly, bypassing
+        the Router. Used to test the streaming-progress + mid-flight-correction
+        pipeline before the full Router classifier (Phase 5c) lands.
+
+        POST body: {
+          "text": "<user ask>",                  # what Zack said
+          "output_schema_hint": <dict | str>?,   # optional shape for CC
+          "add_dirs": [paths]?,                  # optional --add-dir paths
+          "working_dir": "~/path"?,              # CC's cwd
+        }
+
+        Returns immediately with the synthesised parent_event_id; the agent
+        runs in the background, streaming progress to Glass. The final
+        preview card lands when CC finishes.
+        """
+        body = await request.json()
+        text = (body.get("text") or "").strip()
+        if not text:
+            return _err("text required")
+        if plane.server is None:
+            return _err("server not bound", 503)
+
+        # Synthesise an event so the agent's progress events have a
+        # parent_event_id; we record it into the events ring too so /api/trace
+        # picks it up.
+        event = Event(
+            id=ids.event_id(),
+            kind="user_invoke",
+            ts=datetime.now(timezone.utc),
+            payload={"text": text, "_via": "dev_agent_invoke"},
+        )
+        plane.record_event(
+            event_id=event.id, kind=event.kind,
+            payload=event.payload or {}, source="dev_endpoint",
+        )
+
+        async def _run_agent() -> None:
+            try:
+                rpc = await plane.server._dispatch_to_tool({
+                    "tool": "claude_code", "action": "agent",
+                    "args": {
+                        "brief": text,
+                        "output_schema_hint": body.get("output_schema_hint"),
+                        "add_dirs": body.get("add_dirs") or [],
+                        "working_dir": body.get("working_dir"),
+                        "parent_event_id": event.id,
+                        "timeout_s": float(body.get("timeout_s", 240)),
+                    },
+                    "result_format": "execute",
+                })
+                # When the agent completes, build a preview card from the
+                # structured output (if any) and push to Glass. Phase 5e will
+                # flesh out the actions[] rendering; v1 just shows the raw
+                # JSON in body so we can see end-to-end.
+                if plane.server._glass_conn:
+                    import json as _json
+                    structured = (rpc.result or {}).get("structured")
+                    body_md = (
+                        "```json\n" + _json.dumps(structured, ensure_ascii=False, indent=2) + "\n```"
+                        if structured else (rpc.result or {}).get("result_text", "(no output)")
+                    )
+                    from .schema import Command
+                    cmd = Command(
+                        id=ids.command_id(),
+                        ts=datetime.now(timezone.utc),
+                        kind="preview_action",
+                        payload={
+                            "title": "Agent finished — review",
+                            "body": body_md[:1500],
+                            "icon": "✦",
+                            "options": ["Send all", "Edit", "Cancel"],
+                        },
+                        requires_confirm=True, ttl_ms=300_000,
+                    )
+                    plane.server._pending_previews[cmd.id] = {
+                        "event": event, "plan": {
+                            "primary_intent": "agent_result",
+                            "subtasks": [], "reasoning": "agent dev endpoint",
+                            "hud_response": cmd.payload,
+                        },
+                        "subtask_results": [(rpc.result or {})],
+                    }
+                    await plane.server._glass_conn.send(cmd.model_dump_json())
+            except Exception as e:
+                log.error("dev_agent_invoke.failed", error=str(e), exc_info=True)
+
+        asyncio.create_task(_run_agent())
+        return _json({"ok": True, "event_id": event.id})
+
     async def dev_inject_wake(request: web.Request) -> web.Response:
         """Synthesise a tool_reverse_wake event (without going through Router)
         so end-to-end tests can verify the wake → tool_card → glass flow without
@@ -420,6 +510,7 @@ def make_app(plane: ControlPlane) -> web.Application:
 
     app.router.add_post("/api/test/invoke", test_invoke)
     app.router.add_post("/api/dev/inject_wake", dev_inject_wake)
+    app.router.add_post("/api/dev/agent_invoke", dev_agent_invoke)
     app.router.add_get("/api/trace/stream", trace_stream)
 
     return app

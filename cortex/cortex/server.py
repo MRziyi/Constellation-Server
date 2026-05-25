@@ -91,6 +91,25 @@ def _apply_confirm_policies(plan: dict[str, Any], rules: dict[str, str]) -> dict
 log = structlog.get_logger(__name__)
 
 
+# Default emoji per progress stage — adapter usually provides explicit `icon`
+# but we cover bases when it doesn't (e.g. a different adapter starts pushing
+# agent_progress in the future).
+_STAGE_DEFAULT_ICONS: dict[str, str] = {
+    "started":             "🤖",
+    "brief_sent":          "▶️",
+    "tool_call":           "🔧",
+    "tool_result":         "✓",
+    "assistant_text":      "💭",
+    "completed":           "🎯",
+    "error":               "✗",
+    "feedback_noted":      "👂",
+    "feedback_injected":   "💬",
+}
+
+def _default_icon_for_stage(stage: str) -> str:
+    return _STAGE_DEFAULT_ICONS.get(stage, "·")
+
+
 class CortexServer:
     """Single-process server holding the active Glass connection + Tool Agent connection."""
 
@@ -113,6 +132,10 @@ class CortexServer:
         # Pending RPC dispatches awaiting their RPCResult (rpc_id → Future).
         self._pending_rpcs: dict[str, asyncio.Future] = {}
         self._pending_previews: dict[str, dict[str, Any]] = {}
+        # v2 agent runtime — tracks active claude_code.agent dispatches so
+        # progress_feedback events from Glass can be routed to the right CC
+        # tmux session via send-keys. Keyed by parent_event_id.
+        self._active_agents: dict[str, dict[str, Any]] = {}
         # cmd_id → { event_id, plan, current_subtask_results, [wake_response_map] }
 
         # Available tools block for Router prompt + validation set.
@@ -172,8 +195,152 @@ class CortexServer:
             await self._handle_user_decision(event)
         elif event.kind == "tool_reverse_wake":
             await self._handle_tool_reverse_wake(event)
+        elif event.kind == "agent_progress":
+            # CC mid-task event from tool_agent — forward to Glass as non-
+            # blocking ticker frame, also keep latest agent metadata so
+            # `progress_feedback` knows which tmux session to inject into.
+            await self._handle_agent_progress(event)
+        elif event.kind == "progress_feedback":
+            # Glass-side user input within an agent's progress feedback window
+            await self._handle_progress_feedback(event)
         else:
             log.warning("unsupported_event_kind", kind=event.kind)
+
+    # ── v2 agent runtime: progress + feedback ─────────────────────────────
+
+    # Affirmations that match "user said nothing meaningful" — drop silently.
+    _AFFIRMATIONS = frozenset({
+        "ok", "okay", "k", "kk", "yes", "yep", "yeah", "sure", "go", "go on",
+        "continue", "good", "fine", "right", "uh huh",
+        "嗯", "嗯嗯", "好", "好的", "可以", "没问题", "行", "对", "对的",
+        ".", "..", "...", "",
+    })
+
+    @classmethod
+    def _is_substantive_feedback(cls, text: str) -> bool:
+        """True iff the user's words during a progress window deserve to be
+        injected into CC. Empty / affirmations / single-word OK = silent."""
+        if not text:
+            return False
+        t = text.strip().lower()
+        # Strip trailing punctuation that affirmations might have
+        t = t.rstrip("。，！？!?.,~")
+        if not t or t in cls._AFFIRMATIONS:
+            return False
+        # Very short non-affirmations like "no" / "不" / "wait" / "等" ARE
+        # substantive (they redirect). Anything ≥ 2 chars beyond an affirmation
+        # is in. Single-char "k" / "." caught by the set above.
+        return True
+
+    async def _handle_agent_progress(self, event: Event) -> None:
+        """tool_agent pushed an `agent_progress` event. Two jobs:
+          - maintain self._active_agents so progress_feedback can route to
+            the right CC tmux session
+          - forward to Glass as a non-blocking `progress` frame
+        """
+        payload = event.payload or {}
+        parent_event_id = payload.get("parent_event_id")
+        stage = payload.get("stage", "?")
+        tmux_session = payload.get("tmux_session")
+        cc_session_id = payload.get("agent_session_id")
+
+        # Lifecycle: first event registers; completed/error unregister
+        if parent_event_id:
+            if stage == "started" and tmux_session:
+                self._active_agents[parent_event_id] = {
+                    "tmux_session": tmux_session,
+                    "cc_session_id": cc_session_id,
+                    "started_at": datetime.now(timezone.utc).isoformat(),
+                    "last_progress_at": datetime.now(timezone.utc).isoformat(),
+                }
+            elif stage in ("completed", "error"):
+                self._active_agents.pop(parent_event_id, None)
+            elif parent_event_id in self._active_agents:
+                self._active_agents[parent_event_id]["last_progress_at"] = datetime.now(timezone.utc).isoformat()
+
+        if not self._glass_conn:
+            return  # nobody to tell; skip
+
+        # Frame shape — see AGENT-ARCHITECTURE-V2 §3. id starts with "prog_"
+        # so the Glass client can distinguish from Command (which uses "cmd_").
+        frame = {
+            "id": f"prog_{ids.event_id()[4:]}",  # reuse event_id format minus "evt_" prefix
+            "kind": "progress",
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "parent_event_id": parent_event_id,
+            "stage": payload.get("stage", "?"),
+            "icon": payload.get("icon") or _default_icon_for_stage(payload.get("stage", "?")),
+            "detail": payload.get("detail", "")[:200],
+            # Cosmetic hints for HUD; client may ignore
+            "is_error": bool(payload.get("is_error")),
+            "tool": payload.get("tool"),
+        }
+        try:
+            await self._glass_conn.send(json.dumps(frame, ensure_ascii=False))
+        except Exception as e:
+            log.warning("progress.send_failed", error=str(e))
+
+    async def _handle_progress_feedback(self, event: Event) -> None:
+        """User typed/spoke something during a progress window. If substantive,
+        inject into the active CC tmux session via send-keys. Else drop."""
+        payload = event.payload or {}
+        parent_event_id = payload.get("in_reply_to_event")
+        text = (payload.get("feedback_text") or "").strip()
+        if not parent_event_id:
+            log.warning("progress_feedback.no_parent")
+            return
+        active = self._active_agents.get(parent_event_id)
+        if not active:
+            log.warning("progress_feedback.no_active_agent", parent=parent_event_id)
+            return
+
+        if not self._is_substantive_feedback(text):
+            log.info("progress_feedback.dropped_as_filler", text=text[:80])
+            # Optionally tell Glass that we noted but ignored — saves the user
+            # from wondering "did it hear me?"
+            if self._glass_conn:
+                await self._glass_conn.send(json.dumps({
+                    "id": f"prog_{ids.event_id()[4:]}",
+                    "kind": "progress",
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "parent_event_id": parent_event_id,
+                    "stage": "feedback_noted",
+                    "icon": "👂",
+                    "detail": f"heard \"{text[:40]}\" — continuing",
+                }, ensure_ascii=False))
+            return
+
+        # Substantive: inject into CC via tmux send-keys + paste-buffer
+        tmux_session = active["tmux_session"]
+        try:
+            await self._inject_feedback_into_agent(tmux_session, text)
+            log.info("progress_feedback.injected", parent=parent_event_id, text=text[:80])
+            if self._glass_conn:
+                await self._glass_conn.send(json.dumps({
+                    "id": f"prog_{ids.event_id()[4:]}",
+                    "kind": "progress",
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "parent_event_id": parent_event_id,
+                    "stage": "feedback_injected",
+                    "icon": "💬",
+                    "detail": f"correction sent: \"{text[:60]}\"",
+                }, ensure_ascii=False))
+        except Exception as e:
+            log.error("progress_feedback.inject_failed", error=str(e), exc_info=True)
+
+    async def _inject_feedback_into_agent(self, tmux_session: str, text: str) -> None:
+        """Use the existing claude_code tmux machinery to paste user feedback
+        into the active CC session. Dispatched via the tool-agent so the same
+        socket / set-buffer / paste-buffer logic is shared."""
+        # Reuse claude_code adapter via the tool RPC. send_keys with literal
+        # text + trailing Enter mimics how the user typing in the TUI works.
+        # (paste-buffer is more reliable for multi-line; but most feedbacks are
+        # one line, so send_keys with explicit Enter is fine.)
+        await self._dispatch_to_tool({
+            "tool": "claude_code", "action": "send_keys",
+            "args": {"session_id": tmux_session, "keys": text + "\n", "literal": True},
+            "result_format": "execute",
+        })
 
     async def _handle_tool_reverse_wake(self, event: Event) -> None:
         """A Tool Agent adapter pushed a wake event (e.g. claude_code permission prompt).
