@@ -342,6 +342,23 @@ def make_app(plane: ControlPlane) -> web.Application:
         asyncio.create_task(plane.server._process_event(event))
         return _json({"ok": True, "event_id": event.id})
 
+    # ── dev/test helpers ──
+    async def dev_inject_wake(request: web.Request) -> web.Response:
+        """Synthesise a tool_reverse_wake event (without going through Router)
+        so end-to-end tests can verify the wake → tool_card → glass flow without
+        spawning a real Claude Code session.
+        """
+        if plane.server is None:
+            return _err("server not bound", 503)
+        try:
+            rpc = await plane.server._dispatch_to_tool({
+                "tool": "claude_code", "action": "__test_inject_wake__",
+                "args": {}, "result_format": "execute",
+            })
+            return _json({"injected": True, "result": rpc.result})
+        except Exception as e:
+            return _err(f"inject failed: {e}", 500)
+
     # ── SSE trace stream ──
     async def trace_stream(request: web.Request) -> web.StreamResponse:
         resp = web.StreamResponse(
@@ -402,6 +419,7 @@ def make_app(plane: ControlPlane) -> web.Application:
     app.router.add_get("/api/system/status", system_status)
 
     app.router.add_post("/api/test/invoke", test_invoke)
+    app.router.add_post("/api/dev/inject_wake", dev_inject_wake)
     app.router.add_get("/api/trace/stream", trace_stream)
 
     return app
