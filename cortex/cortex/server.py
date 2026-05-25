@@ -281,6 +281,15 @@ class CortexServer:
         plan = await self._route(event)
         log.info("plan.generated", primary_intent=plan["primary_intent"])
 
+        # Router occasionally slips kind="tool_card" for normal user_invoke; that
+        # kind is reserved for reverse-wake (see _handle_tool_reverse_wake which
+        # builds Commands directly). Normalize to preview_action so the SEND
+        # gate still applies and confirm-policies fire below.
+        hud = plan.get("hud_response", {})
+        if hud.get("kind") == "tool_card":
+            log.warning("router.tool_card_normalized_to_preview", primary_intent=plan["primary_intent"])
+            hud["kind"] = "preview_action"
+
         plan = _apply_confirm_policies(plan, self._confirm_policies)
 
         # Any subtask blocked by `deny` policy aborts the plan with an error card

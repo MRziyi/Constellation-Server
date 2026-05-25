@@ -78,12 +78,15 @@ fence (Cortex parses only the fence):
     }
   ],
   "hud_response": {
-    "kind":  "preview_action" | "hud_show" | "tool_card",
+    "kind":  "preview_action" | "hud_show",
     "icon":  "one of ✉ ⌖ ⚙ ✦ ✓",
     "title": "short, specific",
     "body_template": "markdown; supports {{subtasks[i].result.field}} interpolation",
     "options": ["1–4 button labels"]
   },
+  // NOTE: never emit kind="tool_card". That kind is reserved for the reverse-wake
+  // path which Cortex builds directly without invoking you. For user-initiated
+  // side-effecting actions use preview_action; for pure info use hud_show.
   "reasoning": "one sentence",
   "task_continues": true | false,
   "next_step_hint": "(optional) free-text hint to FUTURE-YOU"
@@ -232,8 +235,10 @@ def _build_user_prompt(
 
 
 def _validate_plan(plan: dict[str, Any], allowed_tools: set[str]) -> None:
-    """Raises ValueError on any schema violation."""
-    for key in ("primary_intent", "subtasks", "hud_response", "reasoning"):
+    """Raises ValueError on any schema violation. Soft-defaults missing-but-cheap fields."""
+    # reasoning is documentation-only; default it instead of crashing the whole plan
+    plan.setdefault("reasoning", "(none)")
+    for key in ("primary_intent", "subtasks", "hud_response"):
         if key not in plan:
             raise ValueError(f"missing required key: {key}")
     if not isinstance(plan["subtasks"], list):
@@ -393,9 +398,11 @@ AVAILABLE_TOOLS: dict[str, dict[str, str]] = {
     "fs": {
         "actions": "read, write, append, grep, list, delete",
         "description": (
-            "Local filesystem. Reads anywhere; writes under ~/constellation/, "
-            "~/Code/Projects/, /tmp/; deletes only under ~/constellation/twin/. "
-            "grep auto-excludes .venv, node_modules, .git, etc."
+            "Local filesystem. read(path), write(path, content, mode?='overwrite'|'create_only'), "
+            "append(path, content), delete(path), list(path), grep(pattern, path, include_vendored?). "
+            "Args use 'content' for the bytes to write (NOT 'text'/'body'/'data'). "
+            "Reads anywhere; writes under ~/constellation/, ~/Code/Projects/, /tmp/; deletes only "
+            "under ~/constellation/twin/. grep auto-excludes .venv, node_modules, .git, etc."
         ),
     },
     "apple_notes": {

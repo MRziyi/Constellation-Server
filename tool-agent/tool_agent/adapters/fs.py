@@ -228,7 +228,11 @@ class FsAdapter:
 
     async def _write(self, args: dict[str, Any]) -> dict[str, Any]:
         path_str = args.get("path")
+        # Accept 'content' (canonical) or 'text'/'body' (Router sometimes
+        # generates these aliases). Same for append().
         content = args.get("content")
+        if content is None:
+            content = args.get("text") or args.get("body")
         if not path_str or content is None:
             raise ValueError("fs.write: 'path' and 'content' required")
         mode = args.get("mode", "overwrite")
