@@ -45,7 +45,7 @@ class Event(BaseModel):
 class Command(BaseModel):
     id: str
     ts: datetime
-    kind: Literal["hud_show", "preview_action", "hud_update", "hud_dismiss"]
+    kind: Literal["hud_show", "preview_action", "tool_card", "hud_update", "hud_dismiss"]
     payload: dict[str, Any]
     requires_confirm: bool = False
     ttl_ms: int = 30_000
