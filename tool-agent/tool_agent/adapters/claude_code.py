@@ -803,9 +803,19 @@ class ClaudeCodeAdapter:
         # AppleScript) and the jsonl stops advancing — symptom was 120s of
         # heartbeats then RPC timeout with no real progress events.
         agent_permission_mode = args.get("permission_mode", "bypassPermissions")
+        # Curated MCP config — pinned to agent_mcp.json next to this file.
+        # `--strict-mcp-config` makes CC ignore its global + plugin MCP
+        # registrations and use ONLY what's in our file. We exclude
+        # claude.ai Gmail / Google Calendar / Google Drive (they conflict
+        # with the Apple ecosystem; Apple Mail / Calendar / iCloud are not
+        # the same accounts and need OAuth we don't want); we keep
+        # chrome-devtools (no overlap with anything Cortex does).
+        agent_mcp_config = str(Path(__file__).parent / "agent_mcp.json")
         claude_cmd_parts = [
             "claude", "--session-id", cc_session_id,
             "--permission-mode", agent_permission_mode,
+            "--strict-mcp-config",
+            "--mcp-config", agent_mcp_config,
         ]
         for d in add_dirs:
             claude_cmd_parts += ["--add-dir", os.path.expanduser(str(d))]

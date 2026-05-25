@@ -202,6 +202,43 @@ def build_agent_brief(
             L.append(f"  {d}")
         L.append("")
 
+    # 6b. Apple ecosystem access (READ ONLY here — writes go through actions[])
+    # Zack uses Apple Mail / Calendar / Reminders / Notes / Messages — NOT
+    # Gmail / Google Calendar / Drive (those MCPs are deliberately disabled).
+    # Query them via Bash + osascript. Examples:
+    L.append("== APPLE ECOSYSTEM (read-only via Bash + osascript) ==")
+    L.append("Zack lives in Apple's stack, not Google's. To search/read his stuff use")
+    L.append("Bash with osascript. Common one-liners (treat as starting templates):")
+    L.append("  # Recent Mail messages from / to / about someone")
+    L.append("  osascript -e 'tell application \"Mail\"")
+    L.append("    set cutoff to (current date) - (60 * days)")
+    L.append("    repeat with acc in every account")
+    L.append("      repeat with mb in every mailbox of acc")
+    L.append("        try")
+    L.append("          set msgs to (messages of mb whose date received > cutoff)")
+    L.append("          repeat with m in msgs")
+    L.append("            -- filter by sender, subject, recipient as needed")
+    L.append("          end repeat")
+    L.append("        end try")
+    L.append("      end repeat")
+    L.append("    end repeat")
+    L.append("  end tell'")
+    L.append("  # Today's calendar events")
+    L.append("  osascript -e 'tell application \"Calendar\" to return summary of every event of every")
+    L.append("    calendar whose start date ≥ (current date) and start date < ((current date) + days)'")
+    L.append("  # Reminders lists")
+    L.append("  osascript -e 'tell application \"Reminders\" to return name of every list'")
+    L.append("  # Active Safari tab")
+    L.append("  osascript -e 'tell application \"Safari\" to return URL of current tab of front window'")
+    L.append("")
+    L.append("Notes:")
+    L.append("- Mail.app may take a few seconds on the first query (TCC + cold AppleScript).")
+    L.append("- Mail's whose-clause filtering is faster than iterating then matching in shell.")
+    L.append("- These are READ ops only. To send mail / add reminder / add event / send iMessage,")
+    L.append("  EMIT an action in actions[] — Cortex executes after Zack confirms (R1).")
+    L.append("- Do NOT try Gmail / Google Calendar / Google Drive MCP — disabled by design.")
+    L.append("")
+
     # 7. Appendix — action shapes
     if output_schema is not None:
         L.append("== APPENDIX — action shapes ==")

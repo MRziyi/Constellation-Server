@@ -1,0 +1,9 @@
+{
+  "_comment": "Curated MCP server list visible to the agent path (claude_code.agent). Combined with --strict-mcp-config, this REPLACES all of CC's global/plugin MCP configs — so anything not listed here is invisible to CC during an agent dispatch. Rationale: CC's user-level cloud MCPs (claude.ai Gmail / Google Calendar / Google Drive) directly conflict with Zack's Apple ecosystem (Mail.app / Calendar.app / iCloud Drive), and require OAuth Zack doesn't want to grant. Apple-ecosystem reads go through Bash + osascript (already works); side effects go through Cortex's actions[] pipeline. Keep entries here ONLY when they don't overlap a Cortex/tool_agent capability.",
+  "mcpServers": {
+    "chrome-devtools": {
+      "command": "npx",
+      "args": ["chrome-devtools-mcp@latest"]
+    }
+  }
+}
