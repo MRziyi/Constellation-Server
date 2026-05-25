@@ -1246,6 +1246,7 @@ async def _tail_jsonl_impl(
     pos = start_pos  # byte offset into the jsonl file
     saw_assistant_text = False
     saw_end_turn = False
+    last_stop_reason: str | None = None
     partial = ""
 
     while loop.time() < deadline:
@@ -1287,7 +1288,10 @@ async def _tail_jsonl_impl(
                     # appear in multiple events as content streams in, but
                     # only the FINAL snapshot has stop_reason set to a
                     # non-null value.
-                    if msg.get("stop_reason") == "end_turn":
+                    sr = msg.get("stop_reason")
+                    if sr is not None:
+                        last_stop_reason = sr
+                    if sr == "end_turn":
                         saw_end_turn = True
                     for c in msg.get("content") or []:
                         if not isinstance(c, dict):
@@ -1314,7 +1318,21 @@ async def _tail_jsonl_impl(
                 "n_tool_uses": n_tool_uses, "terminate_reason": "end_turn",
             }
 
-        if saw_assistant_text and (loop.time() - last_change) >= idle_quiet_s:
+        # Idle-after-text is a SAFETY NET for cases where CC emits text but
+        # never tags end_turn. It must NOT fire when the most recent assistant
+        # message ended with stop_reason="tool_use" — that means CC explicitly
+        # said "I'm about to call a tool" and is mid-turn. Opus extended
+        # thinking between tool_result and the next assistant turn can be
+        # 10-30s of jsonl silence; the 6s default would kill the agent there.
+        # Only treat idle-as-done when last_stop_reason is "end_turn" (already
+        # handled above) or None / "max_tokens" / "stop_sequence" (CC really
+        # stopped without tagging end_turn). For "tool_use", keep waiting up
+        # to the overall timeout; the heartbeat below covers HUD opacity.
+        if (
+            saw_assistant_text
+            and last_stop_reason not in ("tool_use",)
+            and (loop.time() - last_change) >= idle_quiet_s
+        ):
             return {
                 "events": events, "last_assistant_text": last_assistant_text,
                 "n_tool_uses": n_tool_uses, "terminate_reason": "idle_after_text",
