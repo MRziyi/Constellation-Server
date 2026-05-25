@@ -1589,9 +1589,23 @@ class CortexServer:
         Router sees PRIOR TASK HISTORY (always) + USER FEEDBACK (if present) and decides
         the next plan. This includes deciding whether to redo, advance, skip, or inject
         info per the FREE-FORM FEEDBACK INTERPRETATION section of the system prompt.
+
+        Emits progress to Glass at every step — _advance_task can take 10-20s
+        (selector + router LLM calls). Without these emits the HUD just sat
+        on the previous frame (per Zack 2026-05-25 "no response" complaint).
         """
         round_n = len(task_history)
         log.info("task.advance.start", round=round_n, has_feedback=bool(feedback_text))
+
+        await self._emit_progress_to_glass(
+            parent_event_id=original_event.id,
+            stage="re_planning", icon="✍️",
+            detail=(
+                f"re-planning with your correction (round {round_n + 1})"
+                if feedback_text
+                else f"advancing to round {round_n + 1}"
+            ),
+        )
 
         if round_n >= self.MAX_TASK_ROUNDS:
             log.warning("task.max_rounds_reached", rounds=round_n)
@@ -1624,6 +1638,11 @@ class CortexServer:
                 ),
             }
 
+        await self._emit_progress_to_glass(
+            parent_event_id=original_event.id,
+            stage="planning", icon="🧠",
+            detail="re-running planner with your feedback",
+        )
         next_plan = await self._route(
             original_event,
             feedback_iteration=feedback_iteration,
@@ -1636,25 +1655,55 @@ class CortexServer:
             primary_intent=next_plan["primary_intent"],
             task_continues=bool(next_plan.get("task_continues")),
         )
+        await self._emit_progress_to_glass(
+            parent_event_id=original_event.id,
+            stage="planned", icon="🎯",
+            detail=f"plan: {next_plan['primary_intent']} · {len(next_plan.get('subtasks', []))} subtasks",
+        )
 
         # Same dispatch flow as _handle_user_invoke
         hud_kind = next_plan["hud_response"]["kind"]
         subtask_results: list[dict[str, Any]] = []
-        for st in next_plan["subtasks"]:
+        for i, st in enumerate(next_plan["subtasks"]):
             if st["result_format"] in ("draft", "query") or hud_kind == "hud_show":
+                await self._emit_progress_to_glass(
+                    parent_event_id=original_event.id,
+                    stage="dispatch", icon="🔧",
+                    detail=f"{st['tool']}.{st['action']} · subtask {i+1}/{len(next_plan['subtasks'])}",
+                )
                 args = self._interpolate_args(st.get("args", {}), subtask_results, plan=next_plan)
                 rpc_result = await self._dispatch_to_tool({**st, "args": args})
                 subtask_results.append(rpc_result.result)
             else:
                 subtask_results.append({})
 
+        await self._emit_progress_to_glass(
+            parent_event_id=original_event.id,
+            stage="preparing_card", icon="🎴",
+            detail=f"preparing {hud_kind}",
+        )
         cmd = self._build_command(next_plan, subtask_results)
+        # Carry session_id forward so downstream decisions land in the
+        # right session log. Without this, follow-up Approve/Modify on
+        # the new card hit pending.get("session_id") == None and the
+        # session log loses the rest of the conversation.
+        sid = (original_event.payload or {}).get("session_id")
         self._pending_previews[cmd.id] = {
             "event": original_event,
+            "session_id": sid,
             "plan": next_plan,
             "subtask_results": subtask_results,
             "task_history": task_history,  # carry forward
         }
+        if sid:
+            self.sessions.append(
+                sid, "card_surfaced",
+                cmd_id=cmd.id, cmd_kind=cmd.kind, is_checkpoint=False,
+                title=cmd.payload.get("title", ""),
+                body_excerpt=(cmd.payload.get("body") or "")[:400],
+                primary_intent=next_plan.get("primary_intent"),
+                round=round_n,
+            )
         if self._glass_conn:
             await self._glass_conn.send(cmd.model_dump_json())
         log.info(
