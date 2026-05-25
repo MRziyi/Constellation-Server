@@ -58,30 +58,36 @@ def build_agent_brief(
     output_schema: dict[str, Any] | str | None = None,
     available_dirs: list[str] | None = None,
 ) -> str:
-    """Assemble the CC agent brief. Tight; ~600-900 tokens typical.
+    """Assemble the CC agent brief — v2.5, informed by code.claude.com best practices.
 
-    Args:
-      ask_text:        what Zack just said, verbatim
-      now_iso:         ISO timestamp (caller injects; keeps prompt deterministic)
-      has_photo:       Glass camera attached an image
-      twin_slices:     {path: content} from v0.5 selector — empty/None = none
-      output_schema:   dict (rendered as JSON) OR str (rendered as-is) OR None
-                       (no JSON contract — CC's final text is free-form)
-      available_dirs:  paths CC has --add-dir on (just for awareness)
+    Design discipline (per Anthropic Claude Code docs):
+      - CLAUDE.md test: "Would removing this cause Claude to make mistakes?"
+        If no — cut it. Long files get rules lost.
+      - "YOU MUST" / "IMPORTANT" emphasis on hard rules (improves adherence).
+      - Don't teach Claude its own tools (it knows shell, osascript, etc).
+      - Provide verification criteria (schema = self-check).
+      - Avoid infinite exploration; bound the research scope.
+
+    What we DROPPED from v2:
+      - Long role preamble ("You're the agent backend for Zack's hands-free AI")
+      - ENVIRONMENT section (CC knows what its tools are)
+      - HUD STYLE section (subsumed into R3 and won't change CC behaviour
+        beyond what the rules already do).
+
+    What we STRENGTHENED:
+      - "YOU MUST" caps on the two non-negotiable rules
+      - Explicit token-limit handling in R2 (this was the Kao stall)
+      - Self-check checklist right after schema
+      - R3 softened — best-effort mid-stream listening, since send_keys
+        often doesn't land during extended thinking (per Zack 2026-05-25)
     """
     twin_slices = twin_slices or {}
     available_dirs = available_dirs or []
 
     L: list[str] = []
 
-    # 1. Role + the ask (top of attention)
-    L.append(
-        "You're the agent backend for Zack's hands-free AI on AR glasses. He just"
-        " spoke; you research, then emit ONE JSON object as your final message."
-        " Cortex's HITL gate runs on that JSON — you do NOT execute side effects."
-    )
-    L.append("")
-    L.append("== ASK ==")
+    # 1. TASK — first thing CC sees
+    L.append("== TASK ==")
     L.append(f'Zack: "{ask_text}"')
     if now_iso:
         L.append(f"NOW: {now_iso}")
@@ -89,60 +95,74 @@ def build_agent_brief(
         L.append("PHOTO: attached (glass camera)")
     L.append("")
 
-    # 2. Output contract (BEFORE rules; CC sees the shape it must produce)
+    # 2. Output contract — front-loaded with YOU MUST + verification step
     if output_schema is not None:
         if isinstance(output_schema, dict):
             schema_text = json.dumps(output_schema, ensure_ascii=False, indent=2)
         else:
             schema_text = str(output_schema)
-        L.append("== OUTPUT (your final message MUST be ONLY this JSON, no fence, no prose) ==")
+        L.append("== YOU MUST OUTPUT EXACTLY THIS JSON AS YOUR FINAL MESSAGE ==")
+        L.append("(no prose around it · no markdown fence · just the raw object)")
+        L.append("")
         L.append(schema_text)
         L.append("")
         L.append("Action `type` values: email | reminder | calendar_event | imessage | fs_write | shortcut")
-        L.append("Per-type fields in APPENDIX (bottom).")
+        L.append("Per-type fields: see APPENDIX (bottom).")
+        L.append("")
+        L.append("BEFORE you emit, self-check:")
+        L.append("  ✓ JSON parses cleanly (paste into a parser mentally)")
+        L.append("  ✓ each action has its required fields")
+        L.append("  ✓ all times are ISO 8601 WITH timezone offset (e.g. 2026-05-27T14:00:00-05:00)")
         L.append("")
     else:
         L.append("== OUTPUT ==")
-        L.append("Free-form text. Be terse — Zack reads on a HUD.")
+        L.append("Free-form text. Terse — Zack reads on a HUD.")
         L.append("")
 
-    # 3. Three rules (canonical for v2; tight one-liners)
+    # 3. Rules — YOU MUST emphasis on the criticals; ≤3 to keep them salient
     L.append("== RULES ==")
-    L.append("R1  Propose, don't execute. Cortex fires actions[] only after Zack confirms.")
-    L.append("R2  Never bail. Token limit / permission denied / ambiguity → emit actions[] from")
-    L.append("    what you DO know; if truly stuck, return actions:[] + put the blocker in `notes`.")
-    L.append("R3  Listen mid-task. New `user` messages mid-conversation = Zack correcting live.")
-    L.append("    Integrate BEFORE final JSON; don't ask him to repeat.")
+    L.append("R1  YOU MUST NOT execute side effects yourself. SEND mail, ADD reminder,")
+    L.append("    ADD calendar, SEND imessage, fs.write outside /tmp — all of these are")
+    L.append("    forbidden. Propose them in actions[] only; Cortex executes after Zack")
+    L.append("    confirms a preview. Read ops on any of those apps are fine.")
+    L.append("")
+    L.append("R2  YOU MUST emit actions[] even with partial info. If a Read fails with")
+    L.append("    \"file too large\" or any token limit, STOP retrying that file — move on")
+    L.append("    with what you already have. If truly nothing to propose, emit")
+    L.append("    actions:[] + explain in notes:. Never go silent.")
+    L.append("")
+    L.append("R3  If a new \"user\" message appears in your conversation mid-task, it's")
+    L.append("    Zack speaking live. Integrate before emitting JSON, best-effort. If you")
+    L.append("    miss it (deep in thinking), that's OK — he'll correct at the preview.")
     L.append("")
 
-    # 4. Twin slices the selector picked (only what's relevant)
+    # 4. Bounded approach — soft budget; Claude Code docs warn about "infinite exploration"
+    L.append("== APPROACH ==")
+    L.append("Plan briefly in your thinking block, then act. Aim for ≤8 tool calls before")
+    L.append("committing. If you find yourself at 6+ calls without a clear path, COMMIT")
+    L.append("with what you have and use notes: to explain what's incomplete.")
+    L.append("")
+
+    # 5. Twin slices the selector picked (only what's relevant)
     if twin_slices:
-        L.append("== ZACK'S DIGITAL TWIN (selector-picked) ==")
+        L.append("== ZACK'S TWIN (selector-picked, already loaded) ==")
         for path, content in twin_slices.items():
             L.append(f"=== {path} ===")
             L.append(content.rstrip())
             L.append("")
     else:
-        L.append("== ZACK'S DIGITAL TWIN ==")
-        L.append("(none pre-loaded; if you need style or contacts, read ~/constellation/twin/)")
+        L.append("== ZACK'S TWIN ==")
+        L.append("(none pre-loaded; read ~/constellation/twin/ if needed)")
         L.append("")
 
-    # 5. Environment (terse — CC knows what shells + osascript are)
-    L.append("== ENVIRONMENT ==")
-    L.append("Read-anywhere via shell + osascript (Mail / Reminders / Calendar / Messages / Notes / Shortcuts).")
+    # 6. Available scopes — just paths, no lecture on tools
     if available_dirs:
-        L.append("Granted --add-dir paths:")
+        L.append("== AVAILABLE PATHS (--add-dir granted) ==")
         for d in available_dirs:
-            L.append(f"  - {d}")
-    L.append("")
+            L.append(f"  {d}")
+        L.append("")
 
-    # 6. Style note for HUD live ticker
-    L.append("== HUD STYLE ==")
-    L.append("Your Bash `description` + assistant text stream live to Zack's HUD as 1-line tickers.")
-    L.append("Short `description` (3-8 words, verb-led) = good. Long prose between tool calls = bad.")
-    L.append("")
-
-    # 7. Appendix
+    # 7. Appendix — action shapes
     if output_schema is not None:
         L.append("== APPENDIX — action shapes ==")
         L.append(_ACTION_APPENDIX)

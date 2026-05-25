@@ -104,6 +104,7 @@ _STAGE_DEFAULT_ICONS: dict[str, str] = {
     "tool_call":           "🔧",
     "tool_result":         "✓",
     "assistant_text":      "💭",
+    "thinking":            "💭",   # extended-thinking heartbeat (Opus is silent on disk)
     "completed":           "🎯",
     "error":               "✗",
     "feedback_noted":      "👂",

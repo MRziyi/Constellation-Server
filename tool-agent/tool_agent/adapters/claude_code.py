@@ -833,6 +833,13 @@ class ClaudeCodeAdapter:
             await _emit_progress({"stage": "brief_sent", "icon": "▶️", "detail": "task accepted, thinking…"})
 
             # ── 3. Tail the session.jsonl ──
+            async def _heartbeat(msg: str) -> None:
+                await _emit_progress({
+                    "stage": "thinking",
+                    "icon": "💭",
+                    "detail": msg,
+                })
+
             result = await _tail_jsonl_until_idle(
                 session_jsonl,
                 on_event=lambda ev: self._handle_jsonl_event(
@@ -840,6 +847,7 @@ class ClaudeCodeAdapter:
                 ),
                 timeout_s=timeout_s,
                 idle_quiet_s=idle_quiet_s,
+                emit_heartbeat=_heartbeat,
             )
 
             last_assistant_text = result["last_assistant_text"]
@@ -933,6 +941,8 @@ async def _tail_jsonl_until_idle(
     timeout_s: float,
     idle_quiet_s: float,
     poll_s: float = 0.4,
+    heartbeat_s: float = 8.0,    # emit "still thinking…" after this much silence
+    emit_heartbeat=None,         # async (msg: str) -> None
 ) -> dict[str, Any]:
     """Tail a CC session.jsonl until CC ends its turn (best signal) OR we
     exceed quiet/timeout limits.
@@ -945,25 +955,33 @@ async def _tail_jsonl_until_idle(
          partial outputs)
       3. `timeout_s` hard limit hit
 
+    Heartbeat: Opus extended-thinking does NOT stream thinking deltas to the
+    session.jsonl file — CC writes nothing while thinking. To the HUD this
+    looks like a stall. If `emit_heartbeat` is given, this loop calls it
+    every `heartbeat_s` of jsonl silence so the HUD can show "still thinking"
+    instead of going dead.
+
     Returns:
       events, last_assistant_text, n_tool_uses, terminate_reason
     """
-    started = asyncio.get_event_loop().time()
+    loop = asyncio.get_event_loop()
+    started = loop.time()
     deadline = started + timeout_s
 
     events: list[dict[str, Any]] = []
     last_assistant_text: str | None = None
     n_tool_uses = 0
     last_change = started
+    last_heartbeat_at = started
     pos = 0  # byte offset into the jsonl file
     saw_assistant_text = False
     saw_end_turn = False
     partial = ""
 
-    while asyncio.get_event_loop().time() < deadline:
+    while loop.time() < deadline:
         if not path.exists():
             await asyncio.sleep(poll_s)
-            if asyncio.get_event_loop().time() - started > 10 and not events:
+            if loop.time() - started > 10 and not events:
                 return {
                     "events": events, "last_assistant_text": None,
                     "n_tool_uses": 0, "terminate_reason": "file_missing",
@@ -1026,11 +1044,29 @@ async def _tail_jsonl_until_idle(
                 "n_tool_uses": n_tool_uses, "terminate_reason": "end_turn",
             }
 
-        if saw_assistant_text and (asyncio.get_event_loop().time() - last_change) >= idle_quiet_s:
+        if saw_assistant_text and (loop.time() - last_change) >= idle_quiet_s:
             return {
                 "events": events, "last_assistant_text": last_assistant_text,
                 "n_tool_uses": n_tool_uses, "terminate_reason": "idle_after_text",
             }
+
+        # ── Heartbeat: extended-thinking opacity ──
+        # Opus doesn't stream thinking deltas to disk while thinking. If we've
+        # been quiet for `heartbeat_s`, emit a "still thinking" beacon so the
+        # HUD doesn't look like the agent died. Subsequent heartbeats every
+        # `heartbeat_s` seconds until something else happens.
+        now = loop.time()
+        if (
+            emit_heartbeat is not None
+            and (now - last_change) >= heartbeat_s
+            and (now - last_heartbeat_at) >= heartbeat_s
+        ):
+            elapsed_quiet = int(now - last_change)
+            try:
+                await emit_heartbeat(f"still thinking… ({elapsed_quiet}s quiet)")
+            except Exception:
+                pass
+            last_heartbeat_at = now
 
         await asyncio.sleep(poll_s)
 
