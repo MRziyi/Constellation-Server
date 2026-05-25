@@ -269,6 +269,10 @@ class ClaudeCodeAdapter:
         # v2 streaming agent (per AGENT-ARCHITECTURE-V2.md Phase 5a)
         if action == "agent":
             return await self._agent(args)
+        if action == "agent_continue":
+            return await self._agent_continue(args)
+        if action == "agent_kill":
+            return await self._agent_kill(args)
 
         raise ValueError(f"claude_code: unknown action '{action}'")
 
@@ -880,15 +884,33 @@ class ClaudeCodeAdapter:
                         parse_err = f"json parse failed: {e}"
                         continue
 
-            # ── 5. Kill the tmux session (CC's session is persisted on disk) ──
-            await _run(_tmux("kill-session", "-t", tmux_session), timeout=5)
-            self._tmux_sessions.pop(tmux_session, None)
+            # ── 5. Checkpoint detection — KEEP tmux alive if more phases follow ──
+            is_checkpoint = (
+                isinstance(structured, dict)
+                and bool(structured.get("phase_done"))
+                and bool((structured.get("next") or "").strip())
+            )
+            if not is_checkpoint:
+                await _run(_tmux("kill-session", "-t", tmux_session), timeout=5)
+                self._tmux_sessions.pop(tmux_session, None)
+            else:
+                # Mark the session as paused so /api/cc/sessions surfaces it
+                self._tmux_sessions[tmux_session] = {
+                    **(self._tmux_sessions.get(tmux_session) or {}),
+                    "state": "paused_at_checkpoint",
+                    "phase_summary": str(structured.get("summary") or "")[:200],
+                }
 
             finished_at = datetime.now(timezone.utc).isoformat()
 
             await _emit_progress({
-                "stage": "completed",
-                "detail": f"Agent done ({terminate_reason}); {n_tool_uses} tool uses, {len(result['events'])} events.",
+                "stage": "checkpoint" if is_checkpoint else "completed",
+                "icon": "⏸" if is_checkpoint else "🎯",
+                "detail": (
+                    f"Phase pause — {(structured.get('summary') or 'phase done')[:80]}"
+                    if is_checkpoint
+                    else f"Agent done ({terminate_reason}); {n_tool_uses} tool uses, {len(result['events'])} events."
+                ),
                 "n_tool_uses": n_tool_uses,
             })
 
@@ -906,6 +928,7 @@ class ClaudeCodeAdapter:
                 "result_text": last_assistant_text,
                 "structured": structured,
                 "parse_error": parse_err,
+                "is_checkpoint": is_checkpoint,   # True ⇒ caller must claude_code.agent_continue
             }
         except Exception as e:
             # Best-effort cleanup
@@ -931,8 +954,190 @@ class ClaudeCodeAdapter:
             return emit(progress)
         return None
 
+    # ── Multi-phase resume + cleanup (Phase 5 v2.6) ─────────────────────────
+
+    async def _agent_continue(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Resume a paused agent: send the user's response into its tmux pane
+        and tail until the next end_turn / checkpoint.
+
+        Args:
+          tmux_session:        the tmux session name from a prior _agent return
+          cc_session_id:       (optional, redundant) session UUID; used to
+                               re-derive the jsonl path if not passed
+          user_text:           what to send to CC. "continue" / "go" / "yes"
+                               are normal proceed signals; anything else is a
+                               redirection CC will integrate.
+          parent_event_id:     same as _agent — for progress routing
+          working_dir:         needed to derive jsonl path; same as the
+                               original _agent call
+          timeout_s, idle_quiet_s: same semantics as _agent
+        """
+        tmux_session = args.get("tmux_session")
+        if not tmux_session:
+            raise ValueError("claude_code.agent_continue: 'tmux_session' required")
+        cc_session_id = args.get("cc_session_id") or args.get("session_id")
+        if not cc_session_id:
+            # Derive from tmux_session name (cc-agent-<first 8 of uuid>) — works
+            # only if Cortex provided the original session_id back to us
+            raise ValueError("claude_code.agent_continue: 'cc_session_id' required")
+        user_text = args.get("user_text") or args.get("text") or "continue"
+        parent_event_id = args.get("parent_event_id") or args.get("_event_id")
+        working_dir = args.get("working_dir") or os.path.expanduser("~")
+        timeout_s = float(args.get("timeout_s", 300.0))
+        idle_quiet_s = float(args.get("idle_quiet_s", 6.0))
+
+        # Re-derive jsonl path (same logic as _agent)
+        real_cwd = Path(os.path.expanduser(working_dir)).resolve()
+        sanitized = str(real_cwd).replace("/", "-")
+        session_jsonl = Path.home() / ".claude" / "projects" / sanitized / f"{cc_session_id}.jsonl"
+
+        # Verify session still alive
+        rc, _, _ = await _run(_tmux("has-session", "-t", tmux_session), timeout=5)
+        if rc != 0:
+            return {"ok": False, "error": f"tmux session {tmux_session} no longer exists",
+                    "session_id": cc_session_id, "tmux_session": tmux_session}
+
+        n_progress_emitted = 0
+        async def _emit_progress(progress: dict[str, Any]) -> None:
+            nonlocal n_progress_emitted
+            if not self._event_pusher or not parent_event_id:
+                return
+            await self._event_pusher({
+                "kind": "agent_progress",
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "payload": {
+                    "parent_event_id": parent_event_id,
+                    "agent_session_id": cc_session_id,
+                    "tmux_session": tmux_session,
+                    **progress,
+                },
+            })
+            n_progress_emitted += 1
+
+        await _emit_progress({
+            "stage": "resumed", "icon": "▶️",
+            "detail": f'resuming with: "{user_text[:80]}"',
+        })
+
+        # Find current jsonl size so we don't re-replay events from prior phase
+        try:
+            start_pos = session_jsonl.stat().st_size if session_jsonl.exists() else 0
+        except OSError:
+            start_pos = 0
+
+        # Inject user_text via tmux paste-buffer (more reliable than send-keys
+        # for multi-line) then Enter
+        import shlex as _shlex  # noqa
+        buf = f"cb_resume_{cc_session_id[:8]}"
+        await _run(_tmux("set-buffer", "-b", buf, user_text), timeout=5)
+        await _run(_tmux("paste-buffer", "-b", buf, "-t", tmux_session), timeout=5)
+        await _run(_tmux("delete-buffer", "-b", buf), timeout=5)
+        await asyncio.sleep(0.3)
+        await _run(_tmux("send-keys", "-t", tmux_session, "Enter"), timeout=5)
+
+        # Tail from current position
+        async def _heartbeat(msg: str) -> None:
+            await _emit_progress({"stage": "thinking", "icon": "💭", "detail": msg})
+
+        result = await _tail_jsonl_until_idle_from(
+            session_jsonl, start_pos=start_pos,
+            on_event=lambda ev: self._handle_jsonl_event(ev, _emit_progress, cc_session_id),
+            timeout_s=timeout_s, idle_quiet_s=idle_quiet_s,
+            emit_heartbeat=_heartbeat,
+        )
+
+        # Parse structured output
+        structured: Any = None
+        parse_err: str | None = None
+        last_text = result["last_assistant_text"] or ""
+        if last_text.strip():
+            import re as _re
+            candidates = [last_text.strip()]
+            fence_m = _re.search(r"```(?:json)?\s*\n?(.*?)```", last_text, _re.DOTALL)
+            if fence_m:
+                candidates.append(fence_m.group(1).strip())
+            brace_m = _re.search(r"(\{.*\})", last_text, _re.DOTALL)
+            if brace_m:
+                candidates.append(brace_m.group(1).strip())
+            for candidate in candidates:
+                try:
+                    structured = json.loads(candidate)
+                    parse_err = None
+                    break
+                except json.JSONDecodeError as e:
+                    parse_err = f"json parse failed: {e}"
+
+        is_checkpoint = (
+            isinstance(structured, dict)
+            and bool(structured.get("phase_done"))
+            and bool((structured.get("next") or "").strip())
+        )
+        if not is_checkpoint:
+            await _run(_tmux("kill-session", "-t", tmux_session), timeout=5)
+            self._tmux_sessions.pop(tmux_session, None)
+        else:
+            self._tmux_sessions[tmux_session] = {
+                **(self._tmux_sessions.get(tmux_session) or {}),
+                "state": "paused_at_checkpoint",
+                "phase_summary": str((structured or {}).get("summary") or "")[:200],
+            }
+
+        await _emit_progress({
+            "stage": "checkpoint" if is_checkpoint else "completed",
+            "icon": "⏸" if is_checkpoint else "🎯",
+            "detail": (
+                f"Phase pause — {((structured or {}).get('summary') or 'phase done')[:80]}"
+                if is_checkpoint
+                else f"Agent done ({result['terminate_reason']}); {result['n_tool_uses']} tool uses."
+            ),
+            "n_tool_uses": result["n_tool_uses"],
+        })
+
+        return {
+            "ok": parse_err is None,
+            "session_id": cc_session_id,
+            "tmux_session": tmux_session,
+            "n_tool_uses": result["n_tool_uses"],
+            "n_progress_emitted": n_progress_emitted,
+            "terminate_reason": result["terminate_reason"],
+            "result_text": last_text,
+            "structured": structured,
+            "parse_error": parse_err,
+            "is_checkpoint": is_checkpoint,
+        }
+
+    async def _agent_kill(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Explicitly tear down a paused agent's tmux session (user cancelled)."""
+        tmux_session = args.get("tmux_session")
+        if not tmux_session:
+            raise ValueError("claude_code.agent_kill: 'tmux_session' required")
+        rc, _, _ = await _run(_tmux("kill-session", "-t", tmux_session), timeout=5)
+        self._tmux_sessions.pop(tmux_session, None)
+        return {"ok": rc == 0, "tmux_session": tmux_session}
+
 
 # ── Session.jsonl tail + distillation (module-level helpers) ──────────────
+
+async def _tail_jsonl_until_idle_from(
+    path: Path,
+    *,
+    start_pos: int = 0,
+    on_event,
+    timeout_s: float,
+    idle_quiet_s: float,
+    poll_s: float = 0.4,
+    heartbeat_s: float = 8.0,
+    emit_heartbeat=None,
+) -> dict[str, Any]:
+    """Same as _tail_jsonl_until_idle but seeks to `start_pos` first. Used
+    by agent_continue() so we only tail events emitted AFTER the resume
+    point, not replay the prior phase's events."""
+    return await _tail_jsonl_impl(
+        path, start_pos=start_pos, on_event=on_event,
+        timeout_s=timeout_s, idle_quiet_s=idle_quiet_s, poll_s=poll_s,
+        heartbeat_s=heartbeat_s, emit_heartbeat=emit_heartbeat,
+    )
+
 
 async def _tail_jsonl_until_idle(
     path: Path,
@@ -943,6 +1148,25 @@ async def _tail_jsonl_until_idle(
     poll_s: float = 0.4,
     heartbeat_s: float = 8.0,    # emit "still thinking…" after this much silence
     emit_heartbeat=None,         # async (msg: str) -> None
+) -> dict[str, Any]:
+    """Original entry — tails from start of file. Convenience wrapper."""
+    return await _tail_jsonl_impl(
+        path, start_pos=0, on_event=on_event,
+        timeout_s=timeout_s, idle_quiet_s=idle_quiet_s, poll_s=poll_s,
+        heartbeat_s=heartbeat_s, emit_heartbeat=emit_heartbeat,
+    )
+
+
+async def _tail_jsonl_impl(
+    path: Path,
+    *,
+    start_pos: int = 0,
+    on_event,
+    timeout_s: float,
+    idle_quiet_s: float,
+    poll_s: float = 0.4,
+    heartbeat_s: float = 8.0,
+    emit_heartbeat=None,
 ) -> dict[str, Any]:
     """Tail a CC session.jsonl until CC ends its turn (best signal) OR we
     exceed quiet/timeout limits.
@@ -973,7 +1197,7 @@ async def _tail_jsonl_until_idle(
     n_tool_uses = 0
     last_change = started
     last_heartbeat_at = started
-    pos = 0  # byte offset into the jsonl file
+    pos = start_pos  # byte offset into the jsonl file
     saw_assistant_text = False
     saw_end_turn = False
     partial = ""

@@ -21,6 +21,11 @@ from typing import Any
 # Default schema Cortex enforces when caller doesn't supply one. Tracks
 # AGENT-ARCHITECTURE-V2 §4 and the executor mapping in
 # cortex.server._action_to_subtask.
+#
+# v2.6: added optional `phase_done`/`next` for multi-phase checkpointing.
+# When `phase_done=true` AND `next` is non-empty, Cortex treats the output
+# as a CHECKPOINT (blocking preview for user approval before next phase).
+# Otherwise the output is FINAL and `actions[]` is what Cortex will preview.
 CANONICAL_ACTIONS_SCHEMA: dict[str, Any] = {
     "type": "object",
     "required": ["actions"],
@@ -29,12 +34,15 @@ CANONICAL_ACTIONS_SCHEMA: dict[str, Any] = {
             "type": "array",
             "description": (
                 "0+ side-effecting actions for Cortex to execute AFTER Zack "
-                "confirms a preview. Each item has a `type` discriminator."
+                "confirms a preview. Empty for checkpoint outputs."
             ),
             "items": {"type": "object", "required": ["type"]},
         },
-        "summary": {"type": "string", "description": "one HUD line"},
-        "notes":   {"type": "string", "description": "info NOT requiring action"},
+        "summary":    {"type": "string", "description": "one HUD line"},
+        "notes":      {"type": "string", "description": "info NOT requiring action"},
+        # Phase fields (only set at checkpoints):
+        "phase_done": {"type": "boolean", "description": "true → just finished a phase; pause for Zack"},
+        "next":       {"type": "string",  "description": "one-line plan for the next phase"},
     },
 }
 
@@ -141,6 +149,38 @@ def build_agent_brief(
     L.append("Plan briefly in your thinking block, then act. Aim for ≤8 tool calls before")
     L.append("committing. If you find yourself at 6+ calls without a clear path, COMMIT")
     L.append("with what you have and use notes: to explain what's incomplete.")
+    L.append("")
+
+    # 5. Phase checkpoints — the multi-step blocking control loop (v2.6)
+    L.append("== PHASES (when to checkpoint vs go straight to final) ==")
+    L.append("If your work has 2+ distinct phases (e.g. \"check emails THEN find dir THEN")
+    L.append("draft reply\"), CHECKPOINT between phases instead of running straight through.")
+    L.append("This lets Zack confirm or redirect before each phase — critical for sensitive")
+    L.append("operations or when a wrong keyword could send research the wrong direction.")
+    L.append("")
+    L.append("AT A CHECKPOINT, your final JSON for THIS turn must be:")
+    L.append("  {")
+    L.append('    "phase_done": true,')
+    L.append('    "summary":    "<what you just finished, 1 line for HUD>",')
+    L.append('    "found":      "<key findings, ≤3 sentences>",         // optional')
+    L.append('    "next":       "<concrete one-line plan for next phase>",')
+    L.append('    "actions":    []')
+    L.append("  }")
+    L.append("Then END YOUR TURN and wait. Zack will reply with one of:")
+    L.append("  - \"continue\" / \"go\" / \"yes\" → proceed with next as stated")
+    L.append("  - free-form text → redirect; integrate before next phase")
+    L.append("  - \"cancel\" / \"stop\" → abandon; emit actions:[] + notes on next turn")
+    L.append("")
+    L.append("CHECKPOINT BEFORE: searching a directory you guessed at · acting on parsed")
+    L.append("data that might be ambiguous · any keyword search where wrong terms waste")
+    L.append("time · before drafting a sensitive reply.")
+    L.append("")
+    L.append("SKIP CHECKPOINT WHEN: the entire task is one bounded mechanical step")
+    L.append("(\"remind me to X\", \"write Y to file Z\"). Go straight to final actions[].")
+    L.append("")
+    L.append("FINAL OUTPUT (only when truly done; no more phases) must have phase_done")
+    L.append("absent or false, AND actions[] populated (or empty with notes explaining why).")
+    L.append("That's how Cortex knows to stop calling you.")
     L.append("")
 
     # 5. Twin slices the selector picked (only what's relevant)

@@ -98,6 +98,14 @@ log = structlog.get_logger(__name__)
 # Default emoji per progress stage — adapter usually provides explicit `icon`
 # but we cover bases when it doesn't (e.g. a different adapter starts pushing
 # agent_progress in the future).
+def _is_checkpoint(structured: Any) -> bool:
+    """True if CC's structured output indicates a phase checkpoint (more to come).
+    See AGENT-ARCHITECTURE-V2 §6 multi-phase pattern."""
+    if not isinstance(structured, dict):
+        return False
+    return bool(structured.get("phase_done")) and bool((structured.get("next") or "").strip())
+
+
 _STAGE_DEFAULT_ICONS: dict[str, str] = {
     "started":             "🤖",
     "brief_sent":          "▶️",
@@ -467,6 +475,143 @@ class CortexServer:
         except Exception as e:
             log.error("progress_feedback.inject_failed", error=str(e), exc_info=True)
 
+    async def _resume_agent_phase(
+        self, pending: dict[str, Any], decision: str, feedback_text: str | None, event: Event,
+    ) -> None:
+        """Continue a paused multi-phase agent. Decision routes are:
+          - "send" / "continue" → "continue" (CC proceeds as proposed in next:)
+          - "feedback" + feedback_text → use that text as redirection
+          - any other "option" pick (Adjust w/o text via Glass options) → treat as continue
+        After CC resumes, parse the next output and surface the next card
+        (could be another checkpoint or the final actions[] preview).
+        """
+        agent_result = pending["agent_result"]
+        tmux_session = agent_result.get("tmux_session")
+        cc_session_id = agent_result.get("session_id")
+        working_dir = pending.get("agent_working_dir")
+        timeout_s = float(pending.get("agent_timeout_s") or 240)
+        original_event = pending["event"]
+
+        if decision == "feedback" and (feedback_text or "").strip():
+            user_text = feedback_text.strip()
+        elif decision in ("send", "Continue", "continue", "Send"):
+            user_text = "continue"
+        elif decision == "Adjust":
+            user_text = feedback_text.strip() if (feedback_text or "").strip() else "continue"
+        else:
+            user_text = (feedback_text or decision or "continue").strip()
+
+        log.info("agent.resuming", tmux_session=tmux_session, user_text=user_text[:80])
+
+        try:
+            rpc = await self._dispatch_to_tool({
+                "tool": "claude_code", "action": "agent_continue",
+                "args": {
+                    "tmux_session": tmux_session,
+                    "cc_session_id": cc_session_id,
+                    "user_text": user_text,
+                    "working_dir": working_dir,
+                    "parent_event_id": original_event.id,
+                    "timeout_s": timeout_s,
+                },
+                "result_format": "execute",
+            })
+        except Exception as e:
+            log.error("agent_continue.failed", error=str(e), exc_info=True)
+            return
+
+        # Build + send the next card (could be checkpoint or final)
+        # We re-use the same helper as the initial dispatch; need to import
+        # locally to avoid a circular reference at module-import time.
+        from .http import make_app  # noqa: F401 — ensures the helper module is loaded
+        # The helper lives inside make_app's closure, so we recreate the logic
+        # here directly rather than digging through closure vars. Cheap dup.
+        rpc_result = rpc.result or {}
+        await self._send_agent_card_for_decision(rpc_result, original_event, working_dir, timeout_s)
+
+    async def _send_agent_card_for_decision(
+        self, rpc_result: dict, event: Event, working_dir: str | None, timeout_s: float,
+    ) -> None:
+        """Same card logic as http._send_agent_card. Kept here so the
+        user_decision path doesn't need to round-trip through http module."""
+        from .schema import Command
+        structured = rpc_result.get("structured") if isinstance(rpc_result.get("structured"), dict) else None
+        is_checkpoint = _is_checkpoint(structured) or bool(rpc_result.get("is_checkpoint"))
+
+        if is_checkpoint and structured is not None:
+            summary = (structured.get("summary") or "phase done").strip()
+            found = (structured.get("found") or "").strip()
+            nxt = (structured.get("next") or "").strip()
+            lines = [f"**⏸ Phase done:** {summary}"]
+            if found:
+                lines += ["", found]
+            lines += ["", f"**Next:** {nxt}"]
+            cmd = Command(
+                id=ids.command_id(), ts=datetime.now(timezone.utc),
+                kind="preview_action",
+                payload={
+                    "title": f"Phase pause — {summary[:60]}",
+                    "body": "\n".join(lines)[:2000],
+                    "icon": "⏸",
+                    "options": ["Continue", "Adjust", "Cancel"],
+                },
+                requires_confirm=True, ttl_ms=600_000,
+            )
+            self._pending_previews[cmd.id] = {
+                "event": event,
+                "plan": {
+                    "primary_intent": "agent_checkpoint",
+                    "subtasks": [], "reasoning": "phase checkpoint",
+                    "hud_response": cmd.payload, "task_continues": True,
+                },
+                "subtask_results": [], "task_history": [],
+                "from_agent": True, "is_checkpoint": True,
+                "agent_result": rpc_result,
+                "agent_working_dir": working_dir,
+                "agent_timeout_s": timeout_s,
+            }
+            if self._glass_conn:
+                await self._glass_conn.send(cmd.model_dump_json())
+            return
+
+        # FINAL
+        actions = (structured or {}).get("actions") if structured else None
+        if isinstance(actions, list) and actions:
+            subtasks = [_action_to_subtask(a) for a in actions]
+            subtasks = [s for s in subtasks if s is not None]
+            body_md = _render_actions_preview(
+                actions, summary=structured.get("summary"), notes=structured.get("notes"),
+            )
+            title = f"Agent ready — {len(subtasks)} action{'s' if len(subtasks) != 1 else ''}"
+        else:
+            subtasks = []
+            body_md = (rpc_result.get("result_text") or "(no actions proposed)")[:1500]
+            title = "Agent finished — no actions"
+
+        cmd = Command(
+            id=ids.command_id(), ts=datetime.now(timezone.utc),
+            kind="preview_action",
+            payload={
+                "title": title, "body": body_md[:2000], "icon": "✦",
+                "options": (["Send all", "Cancel"] if subtasks else ["OK"]),
+            },
+            requires_confirm=True, ttl_ms=300_000,
+        )
+        self._pending_previews[cmd.id] = {
+            "event": event,
+            "plan": {
+                "primary_intent": "agent_actions",
+                "subtasks": subtasks, "reasoning": "agent dispatch (resumed)",
+                "hud_response": cmd.payload, "task_continues": False,
+            },
+            "subtask_results": [{} for _ in subtasks],
+            "task_history": [],
+            "from_agent": True,
+            "agent_result": rpc_result,
+        }
+        if self._glass_conn:
+            await self._glass_conn.send(cmd.model_dump_json())
+
     async def _inject_feedback_into_agent(self, tmux_session: str, text: str) -> None:
         """Use the existing claude_code tmux machinery to paste user feedback
         into the active CC session. Dispatched via the tool-agent so the same
@@ -768,6 +913,23 @@ class CortexServer:
 
         if decision == "dismiss":
             log.info("dismissed")
+            # If this was a paused agent checkpoint, kill the tmux session
+            if pending.get("is_checkpoint") and pending.get("agent_result"):
+                tmux_session = pending["agent_result"].get("tmux_session")
+                if tmux_session:
+                    try:
+                        await self._dispatch_to_tool({
+                            "tool": "claude_code", "action": "agent_kill",
+                            "args": {"tmux_session": tmux_session},
+                            "result_format": "execute",
+                        })
+                    except Exception as e:
+                        log.warning("agent_kill.failed", error=str(e))
+            return
+
+        # ── Multi-phase agent checkpoint: resume CC with the user's input ──
+        if pending.get("is_checkpoint") and pending.get("agent_result"):
+            await self._resume_agent_phase(pending, decision, feedback_text, event)
             return
 
         plan = pending["plan"]
