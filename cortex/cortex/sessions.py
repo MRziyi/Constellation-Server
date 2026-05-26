@@ -101,12 +101,24 @@ class SessionStore:
 
     # ── Index ─────────────────────────────────────────────────────────
 
-    def list(self) -> list[dict[str, Any]]:
-        """Return ALL index entries (sorted by last_activity DESC).
+    # P2.1 — sessions older than this are tagged 'archived' in the list
+    # output. Default 7 days; the source of truth (JSONL files) is never
+    # touched — archival is a derived label so the user can filter the UI.
+    ARCHIVE_AFTER_DAYS = 7
+
+    def list(self, *, status: str | None = None) -> list[dict[str, Any]]:
+        """Return index entries (sorted by last_activity DESC).
 
         The index is append-only and may contain multiple records per
         session (each turn writes an update). We collapse to the latest
         per session_id at read time — simpler than rewriting the file.
+
+        P2.1: every entry is annotated with a derived `archived: bool`
+        (last_activity older than ARCHIVE_AFTER_DAYS). `status` filter:
+          - None / "all" → everything
+          - "active"     → non-killed AND not archived
+          - "archived"   → archived (including killed)
+          - "killed"     → killed only (regardless of age)
         """
         if not self.index_path.exists():
             return []
@@ -130,6 +142,24 @@ class SessionStore:
             log.warning("sessions.index_read_failed", error=str(e))
             return []
         out = list(latest.values())
+        # Annotate `archived`
+        now = datetime.now(timezone.utc)
+        cutoff = now - __import__("datetime").timedelta(days=self.ARCHIVE_AFTER_DAYS)
+        for r in out:
+            la = r.get("last_activity") or ""
+            try:
+                la_dt = datetime.fromisoformat(la)
+            except Exception:
+                la_dt = now
+            r["archived"] = la_dt < cutoff
+        # Apply filter
+        if status == "active":
+            out = [r for r in out if r.get("status") != "killed" and not r.get("archived")]
+        elif status == "archived":
+            out = [r for r in out if r.get("archived")]
+        elif status == "killed":
+            out = [r for r in out if r.get("status") == "killed"]
+        # else "all" / None → no filter
         out.sort(key=lambda r: r.get("last_activity") or "", reverse=True)
         return out
 

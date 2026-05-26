@@ -492,11 +492,16 @@ def make_app(plane: ControlPlane) -> web.Application:
         return resp
 
     # ── HUD sessions (conversation threads) ──
-    async def sessions_list(_request: web.Request) -> web.Response:
+    async def sessions_list(request: web.Request) -> web.Response:
         if plane.server is None or plane.server.sessions is None:
             return _json({"sessions": []})
+        # P2.1 — optional ?status=active|archived|killed|all (default: active)
+        status = request.query.get("status", "active")
         try:
-            return _json({"sessions": plane.server.sessions.list()})
+            return _json({
+                "sessions": plane.server.sessions.list(status=status),
+                "status_filter": status,
+            })
         except Exception as e:
             return _err(f"sessions list failed: {e}", 500)
 
