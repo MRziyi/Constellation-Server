@@ -515,6 +515,27 @@ class CortexServer:
     async def handle_glass(self, ws: ServerConnection) -> None:
         log.info("glass.connected", remote=ws.remote_address)
         self._glass_conn = ws
+        # P2.3 — surface any pending startup card (e.g. TCC denials caught
+        # before Glass was online). One-shot; clear after delivery.
+        pending_startup = getattr(self, "_pending_startup_card", None)
+        if pending_startup:
+            try:
+                cmd = Command(
+                    id=ids.command_id(), ts=datetime.now(timezone.utc),
+                    kind="hud_show",
+                    payload={
+                        "title": pending_startup["title"],
+                        "body": pending_startup["body"],
+                        "icon": pending_startup.get("icon", "⚠"),
+                        "options": [],
+                    },
+                    requires_confirm=False, ttl_ms=60_000,
+                )
+                await ws.send(cmd.model_dump_json())
+                log.info("startup_card.delivered", title=pending_startup["title"][:60])
+            except Exception as e:
+                log.warning("startup_card.send_failed", error=str(e))
+            self._pending_startup_card = None
         try:
             async for raw in ws:
                 event_data = json.loads(raw)
@@ -778,6 +799,34 @@ class CortexServer:
             )
             return None
         return entry
+
+    # P0.1 patch — proactive TTL eviction. Without this, a user who fires
+    # one invoke then walks away leaves the tmux alive forever (lazy lookup
+    # only fires on the next invoke in the same session). Sweeper scans
+    # every 5 min and kills entries past TTL.
+    _HUD_TMUX_SWEEPER_INTERVAL_S = 300.0
+
+    async def _hud_tmux_sweeper_loop(self) -> None:
+        """Background task. Periodically evicts stale tmux entries so they
+        don't pile up across days of run-time."""
+        while True:
+            try:
+                await asyncio.sleep(self._HUD_TMUX_SWEEPER_INTERVAL_S)
+            except asyncio.CancelledError:
+                return
+            try:
+                now = time.time()
+                stale: list[str] = []
+                for sid, entry in list(self._active_hud_session_tmux.items()):
+                    age = now - float(entry.get("last_activity") or 0)
+                    if age > self._HUD_TMUX_TTL_S:
+                        stale.append(sid)
+                if stale:
+                    log.info("hud_tmux.sweep", n_stale=len(stale))
+                for sid in stale:
+                    await self._hud_tmux_evict(sid, reason="ttl_sweeper")
+            except Exception as e:
+                log.warning("hud_tmux.sweep_failed", error=str(e), exc_info=True)
 
     async def _resume_agent_with_modify(
         self, pending: dict[str, Any], modify_text: str, event: Event,
@@ -2170,6 +2219,14 @@ async def serve(
     server.insight_engine = InsightEngine(server)
     register_default_providers(server.insight_engine)
     server.insight_engine.start()
+    # P0.1 patch — background TTL sweeper for the per-HUD-session tmux registry.
+    # Lazy eviction (in _hud_tmux_lookup) misses sessions whose owner never
+    # comes back — this loop is what guarantees the upper bound on process count.
+    server._hud_tmux_sweeper_task = asyncio.create_task(server._hud_tmux_sweeper_loop())
+    # P2.3 — TCC self-check. Runs in background; if any Apple app is denied,
+    # stash a hud_show that fires on the next Glass connect.
+    from .tcc_check import run_and_surface as _tcc_run_and_surface
+    asyncio.create_task(_tcc_run_and_surface(server))
     log.info("cortex.listening", host=host, port=port)
     async with websockets.serve(server.handle_glass, host, port):
         await asyncio.Future()  # run forever

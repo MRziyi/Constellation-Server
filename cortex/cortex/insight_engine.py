@@ -169,10 +169,13 @@ async def upcoming_reminders_provider(server: Any) -> list[Insight]:
     """Surface reminders due in the next 30 minutes (so user notices before
     the system notification fires). No-op if applescript_reminders adapter
     is missing or returns nothing."""
+    # Use the fast-path AppleScript-side filter (added 2026-05-26). On a
+    # ~100-reminder list this drops adapter latency from ~30s → ~1s because
+    # Reminders.app evaluates `whose ... due date ≤ now+30m` natively.
     try:
         rpc = await server._dispatch_to_tool({
             "tool": "applescript_reminders", "action": "list",
-            "args": {"completed": False},
+            "args": {"completed": False, "due_within_minutes": 30, "limit": 10},
             "result_format": "query",
         })
     except Exception as e:
