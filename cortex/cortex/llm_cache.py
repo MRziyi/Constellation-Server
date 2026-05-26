@@ -65,6 +65,16 @@ def set_call_observer(fn: Callable[[dict[str, Any]], None] | None) -> None:
 def _emit(**info: Any) -> None:
     if _CALL_OBSERVER is None:
         return
+    # P0.3 — attribute this LLM call to the HUD session in scope (if any).
+    # Imported lazily to avoid a circular import (sessions imports llm_cache
+    # is not the case, but keeping the dependency light just to be safe).
+    try:
+        from .sessions import current_session_id as _csid
+        sid = _csid.get()
+        if sid and "session_id" not in info:
+            info["session_id"] = sid
+    except Exception:
+        pass
     try:
         _CALL_OBSERVER(info)
     except Exception as e:

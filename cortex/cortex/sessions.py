@@ -34,9 +34,11 @@ Public surface:
 
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -44,6 +46,25 @@ from typing import Any, Iterable
 import structlog
 
 from . import ids
+
+
+# P0.3 — context-scoped HUD session id. LLM calls fired inside a turn
+# pick this up via _emit so cost/latency can be attributed to the right
+# session for the /sessions cost roll-up. Async-safe via ContextVar.
+current_session_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "current_session_id", default=None,
+)
+
+
+@contextmanager
+def in_session(session_id: str | None):
+    """Run a block with `current_session_id` set. LLM calls fired inside
+    will be attributed to this session."""
+    tok = current_session_id.set(session_id)
+    try:
+        yield
+    finally:
+        current_session_id.reset(tok)
 
 log = structlog.get_logger(__name__)
 
@@ -141,7 +162,13 @@ class SessionStore:
         except OSError as e:
             log.warning("sessions.session_append_failed", session_id=session_id, error=str(e))
         # For events that mark a meaningful update, bump the index.
-        if kind in ("turn_start", "decision", "turn_complete", "session_killed", "title_set"):
+        # P0.3 — added card_surfaced + agent_completed so cost/latency totals
+        # refresh as soon as each turn lands its card; llm_call also bumps so
+        # the running prompt_chars/latency are queryable mid-turn.
+        if kind in (
+            "turn_start", "decision", "turn_complete", "session_killed",
+            "title_set", "card_surfaced", "agent_completed", "llm_call",
+        ):
             self._bump_index(session_id, ts=ts)
 
     def _bump_index(self, session_id: str, *, ts: str | None = None) -> None:
@@ -169,14 +196,48 @@ class SessionStore:
                     decision_counts[dk] += 1
         killed = any(r.get("kind") == "session_killed" for r in recs)
         # LLM cost roll-up: sum prompt+completion chars across classifier/
-        # selector/router calls captured via SessionStore.append(... kind=
-        # "llm_call", ...). May be 0 if no LLM observer plumbed yet.
+        # selector/router calls captured via the cortex.main LLM observer.
+        # (LLM observer in main.py forwards to SessionStore.append(kind=
+        # "llm_call", ...) when current_session_id ContextVar is set.)
         llm_calls = [r for r in recs if r.get("kind") == "llm_call"]
         llm_total_chars = sum(
             int(r.get("prompt_chars", 0) or 0) + int(r.get("completion_chars", 0) or 0)
             for r in llm_calls
         )
+        llm_latency_ms = sum(int(r.get("latency_ms", 0) or 0) for r in llm_calls)
+        llm_by_purpose: dict[str, int] = {}
+        for r in llm_calls:
+            p = str(r.get("purpose") or "?")
+            llm_by_purpose[p] = llm_by_purpose.get(p, 0) + 1
         agent_dispatches = sum(1 for r in recs if r.get("kind") == "agent_dispatch")
+
+        # Per-turn wall-clock: from each turn_start to its next turn_start
+        # (or last record). Useful for "how long did this conversation feel?"
+        turn_wallclocks_ms: list[int] = []
+        cursor_ts: str | None = None
+        for r in recs:
+            if r.get("kind") == "turn_start":
+                if cursor_ts:
+                    pass  # close previous; computed below
+                cursor_ts = r.get("ts")
+            # find any subsequent record's ts to close a turn
+        # Simpler O(n): pair turn_start ts → (next turn_start ts | last ts)
+        starts = [r.get("ts") for r in recs if r.get("kind") == "turn_start" and r.get("ts")]
+        last_ts = recs[-1].get("ts") if recs else None
+        for i, s in enumerate(starts):
+            end = starts[i + 1] if i + 1 < len(starts) else last_ts
+            if s and end:
+                try:
+                    d = datetime.fromisoformat(end) - datetime.fromisoformat(s)
+                    turn_wallclocks_ms.append(int(d.total_seconds() * 1000))
+                except Exception:
+                    pass
+        total_wallclock_ms = sum(turn_wallclocks_ms)
+        # Agent tool uses across all agent_completed records
+        n_tool_uses = sum(
+            int(r.get("n_tool_uses", 0) or 0)
+            for r in recs if r.get("kind") == "agent_completed"
+        )
 
         self._append_index({
             "session_id": session_id,
@@ -188,6 +249,10 @@ class SessionStore:
             "decision_counts": decision_counts,
             "llm_call_count": len(llm_calls),
             "llm_total_chars": llm_total_chars,
+            "llm_latency_ms": llm_latency_ms,
+            "llm_by_purpose": llm_by_purpose,
+            "n_tool_uses": n_tool_uses,
+            "total_wallclock_ms": total_wallclock_ms,
             "status": "killed" if killed else "active",
         })
 

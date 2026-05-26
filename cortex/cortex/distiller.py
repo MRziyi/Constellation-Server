@@ -176,6 +176,16 @@ class Distiller:
                 return False
         return True
 
+    def force_run(self) -> dict[str, Any]:
+        """Bypass cooldown + threshold and dispatch immediately. Used by the
+        /api/dev/distill_now endpoint for testing and for the (rare) case
+        where the user wants to trigger distillation manually from the web
+        console."""
+        if self._in_flight:
+            return {"ok": False, "error": "distill already in flight"}
+        asyncio.create_task(self._run())
+        return {"ok": True, "queued": True}
+
     async def _run(self) -> None:
         """Dispatch a distiller agent. Surfaces a card if it proposes anything."""
         self._in_flight = True
@@ -225,6 +235,9 @@ class Distiller:
             )
             event.payload["session_id"] = sid
             self.server._event_to_session[event.id] = sid
+            # P0.3 — attribute LLM calls in this distill run to its session.
+            from .sessions import current_session_id as _csid
+            _csid.set(sid)
             self.server.sessions.append(
                 sid, "distiller_start",
                 unprocessed_modifies=self._unprocessed_modifies,
@@ -261,14 +274,26 @@ class Distiller:
             actions = structured.get("actions") if isinstance(structured.get("actions"), list) else []
 
             if not actions:
-                # No pattern found — log and stay silent. No HUD spam.
+                # No pattern found — emit a soft "I looked, nothing to do"
+                # progress frame (per Zack 2026-05-25: "整理完之后告诉我"),
+                # then drop. No card on HUD — would be spam.
+                notes = (structured.get("notes") or "").strip()
                 log.info(
                     "distiller.no_actions_proposed",
-                    notes=structured.get("notes") or "(none)",
+                    notes=notes or "(none)",
+                )
+                await self.server._emit_progress_to_glass(
+                    parent_event_id=event.id,
+                    stage="distiller_quiet", icon="🪞",
+                    detail=(
+                        f"Twin distiller looked at {len(filtered)} interactions — "
+                        f"nothing to update right now."
+                        + (f" ({notes[:80]})" if notes else "")
+                    )[:200],
                 )
                 self.server.sessions.append(
                     sid, "distiller_no_actions",
-                    notes=structured.get("notes") or "",
+                    notes=notes,
                 )
                 self._unprocessed_modifies = 0
                 self._last_distill_at = datetime.now(timezone.utc)
@@ -276,6 +301,11 @@ class Distiller:
 
             # We have something. Surface a card via the normal helper.
             log.info("distiller.proposing", n_actions=len(actions))
+            await self.server._emit_progress_to_glass(
+                parent_event_id=event.id,
+                stage="distiller_proposing", icon="🪞",
+                detail=f"Twin distiller proposes {len(actions)} update(s) — review on HUD",
+            )
             await self.server._send_agent_card_for_decision(
                 rpc_result, event,
                 working_dir=os.path.expanduser("~"),

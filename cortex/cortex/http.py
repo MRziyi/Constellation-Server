@@ -404,6 +404,20 @@ def make_app(plane: ControlPlane) -> web.Application:
         asyncio.create_task(_run_agent())
         return _json({"ok": True, "event_id": event.id})
 
+    async def dev_distill_now(request: web.Request) -> web.Response:
+        """Force the auto-distiller to dispatch RIGHT NOW, bypassing the
+        cooldown + min-modify threshold. Used to dogfood-test the distill
+        path; also useful as a user-facing 'review my Twin now' action.
+        Returns immediately; distillation runs in the background and
+        surfaces a card via HUD if it proposes anything.
+        """
+        if plane.server is None:
+            return _err("server not bound", 503)
+        if not getattr(plane.server, "distiller", None):
+            return _err("distiller not initialised", 503)
+        result = plane.server.distiller.force_run()
+        return _json(result)
+
     async def dev_inject_wake(request: web.Request) -> web.Response:
         """Synthesise a tool_reverse_wake event (without going through Router)
         so end-to-end tests can verify the wake → tool_card → glass flow without
@@ -643,6 +657,7 @@ def make_app(plane: ControlPlane) -> web.Application:
     app.router.add_post("/api/test/invoke", test_invoke)
     app.router.add_post("/api/dev/inject_wake", dev_inject_wake)
     app.router.add_post("/api/dev/agent_invoke", dev_agent_invoke)
+    app.router.add_post("/api/dev/distill_now", dev_distill_now)
     app.router.add_get("/api/trace/stream", trace_stream)
 
     return app

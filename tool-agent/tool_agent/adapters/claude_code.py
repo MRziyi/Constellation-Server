@@ -737,6 +737,11 @@ class ClaudeCodeAdapter:
         parent_event_id = args.get("parent_event_id") or args.get("_event_id")
         timeout_s = float(args.get("timeout_s", 300.0))
         idle_quiet_s = float(args.get("idle_quiet_s", 6.0))
+        # Phase 5 P0.1 — when set, the tmux is NOT torn down on FINAL so the
+        # caller (Cortex) can reuse it for the next user turn in the same HUD
+        # session via agent_continue (saves the 5-8s cold start). Caller is
+        # responsible for an eventual agent_kill (Kill button or TTL evict).
+        keep_alive_on_final = bool(args.get("keep_alive_on_final"))
 
         # ── 1. Choose session UUID ──
         # When `resume_cc_session_id` is provided, RESUME that session
@@ -1020,19 +1025,33 @@ class ClaudeCodeAdapter:
                 and bool(structured.get("phase_done"))
                 and bool((structured.get("next") or "").strip())
             )
-            if not is_checkpoint:
+            if not is_checkpoint and not keep_alive_on_final:
                 # Final: stop watcher first, then kill tmux. Watcher attached
                 # in §2 above; without explicit stop it would keep polling a
                 # dead pane and emit a stream of capture-failure logs.
                 self._stop_watcher(tmux_session)
                 await _run(_tmux("kill-session", "-t", tmux_session), timeout=5)
                 self._tmux_sessions.pop(tmux_session, None)
-            else:
+            elif is_checkpoint:
                 # Mark the session as paused so /api/cc/sessions surfaces it
                 self._tmux_sessions[tmux_session] = {
                     **(self._tmux_sessions.get(tmux_session) or {}),
                     "state": "paused_at_checkpoint",
                     "phase_summary": str(structured.get("summary") or "")[:200],
+                }
+            else:
+                # P0.1 — final + keep_alive: leave tmux alive for reuse.
+                # Stop the reverse-wake watcher (no incoming permission
+                # prompts while idle); next agent_continue will resume the
+                # jsonl tail directly.
+                self._stop_watcher(tmux_session)
+                self._tmux_sessions[tmux_session] = {
+                    **(self._tmux_sessions.get(tmux_session) or {}),
+                    "state": "idle_after_final",
+                    "phase_summary": (
+                        str((structured or {}).get("summary") or "")[:200]
+                        if isinstance(structured, dict) else ""
+                    ),
                 }
 
             finished_at = datetime.now(timezone.utc).isoformat()
@@ -1120,6 +1139,7 @@ class ClaudeCodeAdapter:
         working_dir = args.get("working_dir") or os.path.expanduser("~")
         timeout_s = float(args.get("timeout_s", 300.0))
         idle_quiet_s = float(args.get("idle_quiet_s", 6.0))
+        keep_alive_on_final = bool(args.get("keep_alive_on_final"))
 
         # Re-derive jsonl path (same logic as _agent)
         real_cwd = Path(os.path.expanduser(working_dir)).resolve()
@@ -1207,13 +1227,20 @@ class ClaudeCodeAdapter:
             and bool(structured.get("phase_done"))
             and bool((structured.get("next") or "").strip())
         )
-        if not is_checkpoint:
+        if not is_checkpoint and not keep_alive_on_final:
             await _run(_tmux("kill-session", "-t", tmux_session), timeout=5)
             self._tmux_sessions.pop(tmux_session, None)
-        else:
+        elif is_checkpoint:
             self._tmux_sessions[tmux_session] = {
                 **(self._tmux_sessions.get(tmux_session) or {}),
                 "state": "paused_at_checkpoint",
+                "phase_summary": str((structured or {}).get("summary") or "")[:200],
+            }
+        else:
+            # P0.1 — keep_alive on final: leave tmux for reuse.
+            self._tmux_sessions[tmux_session] = {
+                **(self._tmux_sessions.get(tmux_session) or {}),
+                "state": "idle_after_final",
                 "phase_summary": str((structured or {}).get("summary") or "")[:200],
             }
 

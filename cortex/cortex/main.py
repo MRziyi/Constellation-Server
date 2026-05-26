@@ -113,8 +113,30 @@ def cli(
 
     # Control plane wiring (Phase 3a.1): single in-memory state mirror, populated
     # by server + llm_cache observer, read by the HTTP management surface.
+    # P0.3 — also forward the LLM call to the session log so per-session
+    # cost/latency totals are queryable from /api/sessions.
     plane = get_plane()
-    set_call_observer(plane.record_llm_call)
+
+    def _on_llm_call(info: dict[str, object]) -> None:
+        plane.record_llm_call(info)
+        sid = info.get("session_id") if isinstance(info, dict) else None
+        srv = plane.server
+        if sid and srv is not None and getattr(srv, "sessions", None):
+            try:
+                srv.sessions.append(
+                    sid, "llm_call",
+                    purpose=info.get("purpose", "?"),
+                    model=info.get("model", "?"),
+                    provider=info.get("provider", "openai"),
+                    cache_hit=bool(info.get("cache_hit", False)),
+                    latency_ms=int(info.get("latency_ms", 0) or 0),
+                    prompt_chars=int(info.get("prompt_chars", 0) or 0),
+                    completion_chars=int(info.get("completion_chars", 0) or 0),
+                )
+            except Exception as e:
+                log.warning("session.llm_call_append_failed", error=str(e))
+
+    set_call_observer(_on_llm_call)
 
     http_bind = http_host or host
 

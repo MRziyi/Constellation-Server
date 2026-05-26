@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -460,6 +461,16 @@ class CortexServer:
         # progress_feedback events from Glass can be routed to the right CC
         # tmux session via send-keys. Keyed by parent_event_id.
         self._active_agents: dict[str, dict[str, Any]] = {}
+        # P0.1 — long-lived CC per HUD session. After an agent dispatch ends
+        # (FINAL with actions, checkpoint pause, or research-only), the tmux
+        # is kept alive (via tool-agent's keep_alive_on_final flag). The next
+        # invoke in the same HUD session reuses it via agent_continue
+        # (paste-buffer in 100-200ms) instead of spawning a fresh CC TUI
+        # (5-8s cold start + brief re-load).
+        #   key:    HUD session_id (ses_<hex>)
+        #   value:  {tmux_session, cc_session_id, working_dir, timeout_s,
+        #            last_activity (epoch s), last_summary?}
+        self._active_hud_session_tmux: dict[str, dict[str, Any]] = {}
         # cmd_id → { event_id, plan, current_subtask_results, [wake_response_map] }
 
         # Available tools block for Router prompt + validation set.
@@ -703,23 +714,92 @@ class CortexServer:
         except Exception as e:
             log.error("progress_feedback.inject_failed", error=str(e), exc_info=True)
 
+    # ── P0.1: HUD-session-scoped CC tmux registry ─────────────────────────
+    # TTL: a tmux idle for more than this is considered stale and gets
+    # evicted on the next reuse attempt (cold-start preferred over an
+    # attention-diluted long-running CC session). 30 min is plenty for an
+    # active conversation; longer and the user is likely on a new topic.
+    _HUD_TMUX_TTL_S = 1800.0
+
+    def _hud_tmux_register(
+        self, session_id: str | None, agent_result: dict[str, Any],
+        *, working_dir: str | None, timeout_s: float,
+    ) -> None:
+        """Stash the (tmux, cc_session_id) so the next invoke in the same
+        HUD session can reuse it via agent_continue. Caller must have
+        dispatched the agent with keep_alive_on_final=True."""
+        if not session_id:
+            return
+        tmux = agent_result.get("tmux_session")
+        cc_sid = agent_result.get("session_id")
+        if not tmux or not cc_sid:
+            return
+        self._active_hud_session_tmux[session_id] = {
+            "tmux_session": tmux,
+            "cc_session_id": cc_sid,
+            "working_dir": working_dir,
+            "timeout_s": float(timeout_s),
+            "last_activity": time.time(),
+            "last_summary": (
+                ((agent_result.get("structured") or {}).get("summary") or "")[:120]
+                if isinstance(agent_result.get("structured"), dict) else ""
+            ),
+        }
+        log.info(
+            "hud_tmux.registered",
+            session_id=session_id, tmux=tmux, cc_sid=cc_sid[:8],
+        )
+
+    async def _hud_tmux_evict(self, session_id: str, *, reason: str) -> None:
+        """Drop the entry and kill its tmux. Used on Kill, TTL eviction, or
+        when reuse fails (tmux gone, jsonl missing)."""
+        entry = self._active_hud_session_tmux.pop(session_id, None)
+        if not entry:
+            return
+        tmux = entry.get("tmux_session")
+        log.info("hud_tmux.evict", session_id=session_id, tmux=tmux, reason=reason)
+        if not tmux:
+            return
+        try:
+            await self._dispatch_to_tool({
+                "tool": "claude_code", "action": "agent_kill",
+                "args": {"tmux_session": tmux},
+                "result_format": "execute",
+            })
+        except Exception as e:
+            log.warning("hud_tmux.kill_failed", error=str(e), tmux=tmux)
+
+    def _hud_tmux_lookup(self, session_id: str | None) -> dict[str, Any] | None:
+        """Return the fresh entry, or None if absent / stale."""
+        if not session_id:
+            return None
+        entry = self._active_hud_session_tmux.get(session_id)
+        if not entry:
+            return None
+        if (time.time() - float(entry.get("last_activity") or 0)) > self._HUD_TMUX_TTL_S:
+            log.info(
+                "hud_tmux.stale_skipping",
+                session_id=session_id, tmux=entry.get("tmux_session"),
+            )
+            return None
+        return entry
+
     async def _resume_agent_with_modify(
         self, pending: dict[str, Any], modify_text: str, event: Event,
     ) -> None:
-        """Modify-on-FINAL routing (Zack 2026-05-25 v3):
+        """Modify-on-FINAL routing (Zack 2026-05-25 v3, P0.1 update):
 
-        When the user clicks Modify on an agent's FINAL preview card
-        (after the agent has already wrapped up and tmux has been killed),
-        we spawn a FRESH tmux but pass `--session-id <prior cc_session_id>`
-        so CC RESUMES the prior conversation. CC loads its own jsonl on
-        startup → it has all prior tool_use/tool_result/text events in
-        context — the user's correction becomes the next turn, and CC
-        produces a revised actions[] without losing research.
+        Preferred path: a live tmux exists for this HUD session (because
+        we now keep tmux alive on FINAL). Paste the user's modify text via
+        agent_continue — no spawn cost, no --resume jsonl scan.
 
-        Failure mode: if the prior jsonl is missing or CC fails to spawn,
-        `claude_code.agent` returns ok=False with resume_failed=True. We
-        fall back to the legacy v0.5 `_advance_task` path (re-plan with
-        feedback) so the user isn't stranded.
+        Fallback path: no live tmux (TTL evicted, or pre-P0.1 state) —
+        spawn a fresh CC with `--resume <prior cc_session_id>`. CC loads
+        its own jsonl on startup, our brief becomes the next user turn,
+        and CC produces a revised actions[] without losing research.
+
+        Failure of either path → raise ResumeFailed; caller falls back to
+        the legacy v0.5 `_advance_task` (re-plan with feedback).
         """
         from .agent_brief import build_modify_brief, CANONICAL_ACTIONS_SCHEMA
 
@@ -733,17 +813,67 @@ class CortexServer:
         if not cc_session_id:
             raise ResumeFailed("no cc_session_id on pending — can't resume")
 
-        await self._emit_progress_to_glass(
-            parent_event_id=original_event.id,
-            stage="resuming_agent", icon="✍️",
-            detail=f"resuming CC session {cc_session_id[:8]} with your correction",
-        )
         sid = pending.get("session_id")
         if sid:
             self.sessions.append(
                 sid, "modify_resume",
                 cc_session_id=cc_session_id, modify_text=modify_text[:300],
             )
+
+        # ── P0.1 preferred path: paste into live tmux via agent_continue ──
+        reuse_entry = self._hud_tmux_lookup(sid) if sid else None
+        if reuse_entry and reuse_entry.get("cc_session_id") == cc_session_id:
+            await self._emit_progress_to_glass(
+                parent_event_id=original_event.id,
+                stage="resuming_agent", icon="✍️",
+                detail=f"redirecting live CC session {cc_session_id[:8]} (no respawn)",
+            )
+            try:
+                rpc = await self._dispatch_to_tool({
+                    "tool": "claude_code", "action": "agent_continue",
+                    "args": {
+                        "tmux_session": reuse_entry["tmux_session"],
+                        "cc_session_id": cc_session_id,
+                        "user_text": modify_text,
+                        "working_dir": reuse_entry.get("working_dir") or working_dir,
+                        "parent_event_id": original_event.id,
+                        "timeout_s": timeout_s,
+                        "keep_alive_on_final": True,
+                    },
+                    "result_format": "execute",
+                })
+            except Exception as e:
+                log.warning("modify_resume.continue_failed", error=str(e), exc_info=True)
+                await self._hud_tmux_evict(sid, reason="modify_continue_failed")
+                reuse_entry = None
+            else:
+                rpc_result = rpc.result or {}
+                if rpc_result.get("error") or not rpc_result.get("ok"):
+                    log.warning(
+                        "modify_resume.continue_returned_error",
+                        error=rpc_result.get("error"),
+                    )
+                    await self._hud_tmux_evict(sid, reason="modify_continue_error")
+                    reuse_entry = None
+                else:
+                    self._hud_tmux_register(
+                        sid, rpc_result,
+                        working_dir=reuse_entry.get("working_dir") or working_dir,
+                        timeout_s=timeout_s,
+                    )
+                    await self._send_agent_card_for_decision(
+                        rpc_result, original_event,
+                        reuse_entry.get("working_dir") or working_dir,
+                        timeout_s,
+                    )
+                    return
+
+        # ── Fallback path: tmux gone, do the --resume spawn ──
+        await self._emit_progress_to_glass(
+            parent_event_id=original_event.id,
+            stage="resuming_agent", icon="✍️",
+            detail=f"resuming CC session {cc_session_id[:8]} with your correction",
+        )
 
         brief = build_modify_brief(
             prior_summary=prior_struct.get("summary"),
@@ -770,6 +900,7 @@ class CortexServer:
                     "parent_event_id": original_event.id,
                     "timeout_s": timeout_s,
                     "resume_cc_session_id": cc_session_id,
+                    "keep_alive_on_final": True,
                 },
                 "result_format": "execute",
             })
@@ -784,6 +915,12 @@ class CortexServer:
             raise ResumeFailed(
                 f"prior CC session {cc_session_id} could not be resumed "
                 f"(jsonl missing or CC spawn failed)"
+            )
+
+        if sid:
+            self._hud_tmux_register(
+                sid, rpc_result,
+                working_dir=working_dir, timeout_s=timeout_s,
             )
 
         await self._send_agent_card_for_decision(rpc_result, original_event, working_dir, timeout_s)
@@ -828,6 +965,7 @@ class CortexServer:
                     "working_dir": working_dir,
                     "parent_event_id": original_event.id,
                     "timeout_s": timeout_s,
+                    "keep_alive_on_final": True,
                 },
                 "result_format": "execute",
             })
@@ -842,6 +980,13 @@ class CortexServer:
         # The helper lives inside make_app's closure, so we recreate the logic
         # here directly rather than digging through closure vars. Cheap dup.
         rpc_result = rpc.result or {}
+        # Refresh the HUD-session registry — both checkpoint and final
+        # keep tmux alive now, so the next turn can paste into it.
+        sid = pending.get("session_id")
+        if sid:
+            self._hud_tmux_register(
+                sid, rpc_result, working_dir=working_dir, timeout_s=timeout_s,
+            )
         await self._send_agent_card_for_decision(rpc_result, original_event, working_dir, timeout_s)
 
     async def _send_agent_card_for_decision(
@@ -987,6 +1132,82 @@ class CortexServer:
             os.path.expanduser("~/.claude/projects"),
         ]
 
+        sid = (event.payload or {}).get("session_id")
+        # P0.1 — reuse a still-alive CC tmux from a previous turn in the
+        # same HUD session. agent_continue pastes the new ask into the
+        # existing CC TUI (no fresh spawn, no brief re-load). CC retains
+        # the system context (output schema, R1-R5 rules, twin skills,
+        # available_dirs) from the original brief.
+        reuse_entry = self._hud_tmux_lookup(sid) if sid else None
+        if reuse_entry:
+            await self._emit_progress_to_glass(
+                parent_event_id=event.id,
+                stage="reusing_agent", icon="♻️",
+                detail=(
+                    f"reusing CC session {reuse_entry['cc_session_id'][:8]} "
+                    f"(prior: {reuse_entry.get('last_summary') or 'idle'})"
+                ),
+            )
+            if sid:
+                self.sessions.append(
+                    sid, "agent_dispatch",
+                    event_id=event.id, reused=True,
+                    cc_session_id=reuse_entry["cc_session_id"],
+                    tmux_session=reuse_entry["tmux_session"],
+                )
+            try:
+                rpc = await self._dispatch_to_tool({
+                    "tool": "claude_code", "action": "agent_continue",
+                    "args": {
+                        "tmux_session": reuse_entry["tmux_session"],
+                        "cc_session_id": reuse_entry["cc_session_id"],
+                        "user_text": ask_text,
+                        "working_dir": reuse_entry.get("working_dir") or working_dir,
+                        "parent_event_id": event.id,
+                        "timeout_s": timeout_s,
+                        "keep_alive_on_final": True,
+                    },
+                    "result_format": "execute",
+                })
+            except Exception as e:
+                log.warning("hud_tmux.reuse_failed", error=str(e), exc_info=True)
+                await self._hud_tmux_evict(sid, reason="reuse_dispatch_failed")
+                reuse_entry = None
+            else:
+                rpc_result = rpc.result or {}
+                if not rpc_result.get("ok") or rpc_result.get("error"):
+                    # Tmux gone, jsonl missing, or other reuse failure.
+                    # Evict and fall through to fresh dispatch.
+                    log.warning(
+                        "hud_tmux.reuse_returned_error",
+                        error=rpc_result.get("error"),
+                    )
+                    await self._hud_tmux_evict(sid, reason="reuse_returned_error")
+                    reuse_entry = None
+                else:
+                    if sid:
+                        self.sessions.append(
+                            sid, "agent_completed",
+                            event_id=event.id, reused=True,
+                            cc_session_id=rpc_result.get("session_id"),
+                            tmux_session=rpc_result.get("tmux_session"),
+                            n_tool_uses=rpc_result.get("n_tool_uses"),
+                            terminate_reason=rpc_result.get("terminate_reason"),
+                            is_checkpoint=rpc_result.get("is_checkpoint"),
+                        )
+                    # Re-register (refresh last_activity + last_summary).
+                    self._hud_tmux_register(
+                        sid, rpc_result,
+                        working_dir=reuse_entry.get("working_dir") or working_dir,
+                        timeout_s=timeout_s,
+                    )
+                    await self._send_agent_card_for_decision(
+                        rpc_result, event,
+                        working_dir=reuse_entry.get("working_dir") or working_dir,
+                        timeout_s=timeout_s,
+                    )
+                    return
+
         brief = build_agent_brief(
             ask_text=ask_text,
             now_iso=datetime.now(timezone.utc).astimezone().isoformat(),
@@ -1009,7 +1230,6 @@ class CortexServer:
                 stage="dispatching_agent", icon="🤖",
                 detail="dispatching claude_code.agent",
             )
-            sid = (event.payload or {}).get("session_id")
             if sid:
                 self.sessions.append(
                     sid, "agent_dispatch",
@@ -1025,6 +1245,9 @@ class CortexServer:
                     "working_dir": working_dir,
                     "parent_event_id": event.id,
                     "timeout_s": timeout_s,
+                    # P0.1: leave tmux alive so the next turn in this HUD
+                    # session can paste into it via agent_continue.
+                    "keep_alive_on_final": True,
                 },
                 "result_format": "execute",
             })
@@ -1038,6 +1261,11 @@ class CortexServer:
                     n_tool_uses=rpc.result.get("n_tool_uses"),
                     terminate_reason=rpc.result.get("terminate_reason"),
                     is_checkpoint=rpc.result.get("is_checkpoint"),
+                )
+                # Register for reuse on next turn.
+                self._hud_tmux_register(
+                    sid, rpc.result,
+                    working_dir=working_dir, timeout_s=timeout_s,
                 )
         except Exception as e:
             log.error("agent_dispatch.failed", error=str(e), exc_info=True)
@@ -1194,6 +1422,12 @@ class CortexServer:
         # Pydantic Event is frozen=False so we can mutate payload in place.
         event.payload["session_id"] = session_id_for_turn
         self._event_to_session[event.id] = session_id_for_turn
+
+        # P0.3 — set the session-attribution ContextVar so every LLM call
+        # fired inside this turn (classifier, router, agent_brief, etc.)
+        # gets recorded against this session for cost roll-up.
+        from .sessions import current_session_id as _csid
+        _csid.set(session_id_for_turn)
 
         # Phase 5c — classify intent first; complex asks bypass the v0.5
         # Router entirely and go straight to the CC agent path. Simple
@@ -1463,17 +1697,9 @@ class CortexServer:
         if (decision or "").strip().lower() == "dismiss":
             self._pending_previews.pop(cmd_id, None)
             log.info("dismissed", cmd_id=cmd_id)
-            if pending.get("is_checkpoint") and pending.get("agent_result"):
-                tmux_session = pending["agent_result"].get("tmux_session")
-                if tmux_session:
-                    try:
-                        await self._dispatch_to_tool({
-                            "tool": "claude_code", "action": "agent_kill",
-                            "args": {"tmux_session": tmux_session},
-                            "result_format": "execute",
-                        })
-                    except Exception as e:
-                        log.warning("agent_kill.failed", error=str(e))
+            # Don't kill the tmux on dismiss — the card just timed out;
+            # the user may still want to continue the session. Only the
+            # explicit Kill button tears down the agent.
             return
 
         # Canonicalize: every blocking card has exactly three outcomes —
@@ -1517,6 +1743,10 @@ class CortexServer:
                     })
                 except Exception as e:
                     log.warning("agent_kill.failed", error=str(e))
+            # P0.1 — drop registry entry so the next invoke in this HUD
+            # session spawns fresh (Kill is an explicit reset signal).
+            if sid:
+                self._active_hud_session_tmux.pop(sid, None)
             if self._glass_conn:
                 await self._glass_conn.send(json.dumps({
                     "id": f"prog_{ids.event_id()[4:]}",
