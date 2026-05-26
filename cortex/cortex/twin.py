@@ -264,19 +264,14 @@ class Twin:
     # ── Receipts ──
 
     def receipt_append(self, body: str) -> None:
-        """Append today's receipt entry to receipts/{date}.md."""
+        """Append today's receipt entry to receipts/{date}.md.
+
+        No frontmatter — receipt files are a daily timeline of action records,
+        not knowledge documents. Filename carries the date, body carries the
+        events.
+        """
         date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         rel = f"receipts/{date}.md"
         if not self.exists(rel):
-            header = (
-                "---\n"
-                f"type: receipt\n"
-                f"created: {datetime.now(timezone.utc).isoformat()}\n"
-                f"date: {date}\n"
-                "share: none\n"
-                "confidence: 1.0\n"
-                "---\n\n"
-                f"# Receipts — {date}\n\n"
-            )
-            self.write_new(rel, header)
+            self.write_new(rel, f"# Receipts — {date}\n\n")
         self.append(rel, body + "\n")

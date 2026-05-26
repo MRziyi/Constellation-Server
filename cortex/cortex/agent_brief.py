@@ -150,14 +150,23 @@ def build_agent_brief(
     L.append("Aim ≤8 tool calls per phase. At 6+ with no clear path → COMMIT, don't loop.")
     L.append("")
 
-    # 5. Twin pointer — no pre-load. CC discovers .claude/skills/ + Reads on demand.
-    L.append("== ZACK'S TWIN ==")
-    L.append("Path: ~/constellation/twin/  (granted via --add-dir)")
-    L.append("- .claude/skills/    auto-discovered by you. Empty initially.")
-    L.append("- identity.md        Zack's preferred name, accounts. Read when needed.")
-    L.append("- people/core/<slug>.md  when Zack names someone, read for their email/style.")
-    L.append("- _system/TOC.md     index if you want to discover further files.")
-    L.append("Read on demand — never preemptively Read everything.")
+    # 5. Twin pointer — v2 redesign (2026-05-26). Four user-facing slots only.
+    L.append("== ZACK'S TWIN  (~/constellation/twin/  — granted via --add-dir) ==")
+    L.append("Layout (only these four slots — read ~/constellation/twin/README.md for the contract):")
+    L.append("  identity.md             Zack's archive (name, accounts, voice, taste). Read when relevant.")
+    L.append("  people/core/<slug>.md   one file per person; minimal frontmatter (aliases / relation /")
+    L.append("                          email); body is prose. Read when he names someone.")
+    L.append("  receipts/<date>.md      Cortex's daily action log (you don't need to read these).")
+    L.append("  .claude/skills/<n>/SKILL.md  auto-discovered by you (Anthropic Agent Skills format).")
+    L.append("                          Current: email-style, reminder-style, code-style.")
+    L.append("")
+    L.append("WRITING twin content via fs_write actions — FOLLOW the README contract:")
+    L.append("  new person → people/core/<kebab-slug>.md, frontmatter is JUST `aliases: / relation:")
+    L.append("    / email:` (only if known), no `type / created / share / confidence` bloat.")
+    L.append("  new skill → .claude/skills/<name>/SKILL.md, Anthropic format (`description:` only).")
+    L.append("  Don't invent top-level dirs. Don't seed placeholders.")
+    L.append("")
+    L.append("Read on demand — don't preemptively scan the whole Twin.")
     L.append("")
 
     # 6. Available scopes

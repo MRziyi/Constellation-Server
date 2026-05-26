@@ -29,7 +29,7 @@ from .twin import Twin
 
 
 def _parse_confirm_policies(twin_root: Any) -> dict[str, str]:
-    """Parse twin/skills/confirm-policies.md → {tool:action → policy}.
+    """Parse twin/_system/confirm-policies.md → {tool:action → policy}.
 
     Looks for the YAML block in the file, then extracts lines like:
       applescript_mail:send         : preview-always
@@ -39,7 +39,11 @@ def _parse_confirm_policies(twin_root: Any) -> dict[str, str]:
     """
     import re
     rules: dict[str, str] = {}
-    policy_file = twin_root / "skills" / "confirm-policies.md"
+    # New canonical location (Twin v2 redesign, 2026-05-26). Falls back to
+    # the legacy path if anyone hasn't migrated yet.
+    policy_file = twin_root / "_system" / "confirm-policies.md"
+    if not policy_file.exists():
+        policy_file = twin_root / "skills" / "confirm-policies.md"
     if not policy_file.exists():
         return rules
     text = policy_file.read_text(encoding="utf-8")
