@@ -40,6 +40,10 @@ class Event(BaseModel):
         # v2 agent runtime (per AGENT-ARCHITECTURE-V2.md):
         "agent_progress",      # tool_agent → Cortex: CC mid-task event (non-blocking)
         "progress_feedback",   # Glass → Cortex: user spoke in the feedback window
+        # Phase 3b — Glass client (see GLASS-CLIENT-DESIGN.md §4):
+        "audio_chunk",         # Glass → Cortex: ~250 ms base64 PCM frame
+        "audio_end",           # Glass → Cortex: end of utterance, run STT
+        "decision_voice",      # Glass → Cortex: InstructSdk fired for a CARD
     ]
     payload: dict[str, Any]
 
@@ -50,7 +54,15 @@ class Event(BaseModel):
 class Command(BaseModel):
     id: str
     ts: datetime
-    kind: Literal["hud_show", "preview_action", "tool_card", "hud_update", "hud_dismiss"]
+    kind: Literal[
+        "hud_show", "preview_action", "tool_card", "hud_update", "hud_dismiss",
+        # Phase 3b — Glass-shaped commands (additive; old clients ignore these):
+        "hud_state",       # live single-row status (THINKING) — styled_runs
+        "card",            # preview_action equivalent w/ title_runs + body_runs
+        "insight",         # proactive Insight Engine push w/ ttl_ms
+        "mic_open",        # tell Glass to open mic (auto-on at CARD entry)
+        "mic_close",       # explicit mic close
+    ]
     payload: dict[str, Any]
     requires_confirm: bool = False
     ttl_ms: int = 30_000
