@@ -258,6 +258,13 @@ def _render_actions_preview(actions: list[dict[str, Any]], summary: str | None =
     return "\n".join(lines).strip() or "(no actions)"
 
 
+class ResumeFailed(Exception):
+    """Raised when claude_code.agent resume fails (jsonl missing, CC spawn
+    error, etc.). Distinct from generic Exception so the caller can decide
+    whether to fall back to v0.5 (yes for this) vs just log (no for WSS
+    drops / delivery hiccups)."""
+
+
 # ── Three-option decision canonicalization (Zack 2026-05-25 v2) ───────────
 # Every blocking card has exactly three buttons: Approve / Modify / Kill.
 # Free-text on the feedback channel (typed in the composer, or spoken via
@@ -687,6 +694,91 @@ class CortexServer:
         except Exception as e:
             log.error("progress_feedback.inject_failed", error=str(e), exc_info=True)
 
+    async def _resume_agent_with_modify(
+        self, pending: dict[str, Any], modify_text: str, event: Event,
+    ) -> None:
+        """Modify-on-FINAL routing (Zack 2026-05-25 v3):
+
+        When the user clicks Modify on an agent's FINAL preview card
+        (after the agent has already wrapped up and tmux has been killed),
+        we spawn a FRESH tmux but pass `--session-id <prior cc_session_id>`
+        so CC RESUMES the prior conversation. CC loads its own jsonl on
+        startup → it has all prior tool_use/tool_result/text events in
+        context — the user's correction becomes the next turn, and CC
+        produces a revised actions[] without losing research.
+
+        Failure mode: if the prior jsonl is missing or CC fails to spawn,
+        `claude_code.agent` returns ok=False with resume_failed=True. We
+        fall back to the legacy v0.5 `_advance_task` path (re-plan with
+        feedback) so the user isn't stranded.
+        """
+        from .agent_brief import build_modify_brief, CANONICAL_ACTIONS_SCHEMA
+
+        agent_result = pending["agent_result"] or {}
+        cc_session_id = agent_result.get("session_id")
+        working_dir = pending.get("agent_working_dir")
+        timeout_s = float(pending.get("agent_timeout_s") or 240)
+        original_event = pending["event"]
+        prior_struct = pending.get("agent_structured") or {}
+
+        if not cc_session_id:
+            raise ResumeFailed("no cc_session_id on pending — can't resume")
+
+        await self._emit_progress_to_glass(
+            parent_event_id=original_event.id,
+            stage="resuming_agent", icon="✍️",
+            detail=f"resuming CC session {cc_session_id[:8]} with your correction",
+        )
+        sid = pending.get("session_id")
+        if sid:
+            self.sessions.append(
+                sid, "modify_resume",
+                cc_session_id=cc_session_id, modify_text=modify_text[:300],
+            )
+
+        brief = build_modify_brief(
+            prior_summary=prior_struct.get("summary"),
+            prior_actions=prior_struct.get("actions"),
+            prior_notes=prior_struct.get("notes"),
+            modify_text=modify_text,
+            now_iso=datetime.now(timezone.utc).astimezone().isoformat(),
+        )
+
+        add_dirs = [
+            os.path.expanduser("~/constellation/twin"),
+            os.path.expanduser("~/Code/Projects"),
+            os.path.expanduser("~/.claude/projects"),
+        ]
+
+        try:
+            rpc = await self._dispatch_to_tool({
+                "tool": "claude_code", "action": "agent",
+                "args": {
+                    "brief": brief,
+                    "output_schema_hint": CANONICAL_ACTIONS_SCHEMA,
+                    "add_dirs": add_dirs,
+                    "working_dir": working_dir,
+                    "parent_event_id": original_event.id,
+                    "timeout_s": timeout_s,
+                    "resume_cc_session_id": cc_session_id,
+                },
+                "result_format": "execute",
+            })
+        except Exception as e:
+            log.error("modify_resume.dispatch_failed", error=str(e), exc_info=True)
+            raise
+
+        rpc_result = rpc.result or {}
+        # If resume failed (jsonl gone, CC crashed at spawn) → raise so
+        # the caller falls back to v0.5 _advance_task.
+        if rpc_result.get("resume_failed"):
+            raise ResumeFailed(
+                f"prior CC session {cc_session_id} could not be resumed "
+                f"(jsonl missing or CC spawn failed)"
+            )
+
+        await self._send_agent_card_for_decision(rpc_result, original_event, working_dir, timeout_s)
+
     async def _resume_agent_phase(
         self, pending: dict[str, Any], decision: str, feedback_text: str | None, event: Event,
     ) -> None:
@@ -831,7 +923,15 @@ class CortexServer:
             "subtask_results": [{} for _ in subtasks],
             "task_history": [],
             "from_agent": True,
+            # from_agent_final routes Modify back through CC via --session-id
+            # resume (instead of falling through to v0.5 planner). Carries
+            # the structured output so build_modify_brief can show CC what
+            # it previously proposed.
+            "from_agent_final": True,
             "agent_result": rpc_result,
+            "agent_structured": (rpc_result or {}).get("structured"),
+            "agent_working_dir": working_dir,
+            "agent_timeout_s": timeout_s,
         }
         if sid:
             self.sessions.append(
@@ -1453,6 +1553,48 @@ class CortexServer:
             )
             await self._resume_agent_phase(pending, decision, feedback_text, event)
             return
+
+        # ── Modify-on-FINAL agent card: resume the same CC session via
+        # --session-id (preserves CC's prior research context) instead of
+        # falling through to v0.5 planner. Only fires on MODIFY; APPROVE
+        # on FINAL still executes actions[] normally.
+        if (
+            kind == "modify"
+            and resolved_text
+            and pending.get("from_agent_final")
+            and pending.get("agent_result")
+        ):
+            self._pending_previews.pop(cmd_id, None)
+            sid = pending.get("session_id")
+            if sid:
+                self.sessions.append(
+                    sid, "decision",
+                    cmd_id=cmd_id, decision_kind=kind, text=resolved_text,
+                    at_agent_final=True,
+                )
+            _append_learning_signal(
+                self.twin, event=pending["event"], pending=pending,
+                decision_kind=kind,
+                correction_text=resolved_text,
+            )
+            try:
+                await self._resume_agent_with_modify(pending, resolved_text, event)
+                return
+            except ResumeFailed as e:
+                # Genuine resume-failure (CC couldn't load the prior jsonl,
+                # spawn failed, etc.). Fall through to v0.5 _advance_task —
+                # not as good (loses CC's research context) but better than
+                # nothing.
+                log.warning("modify_resume.failed_falling_back_to_v05", error=str(e))
+                self._pending_previews[cmd_id] = pending
+            except Exception as e:
+                # Anything else (WSS dropped mid-card-send, transient IO,
+                # etc.) is NOT a "resume failed" — the CC work happened OK,
+                # only the delivery hiccuped. Don't double-do the work via
+                # the legacy path; just log + return. The HUD will reconnect
+                # and the user can re-issue if needed.
+                log.warning("modify_resume.delivery_error_no_fallback", error=str(e))
+                return
 
         # Commit: consume the pending entry now.
         self._pending_previews.pop(cmd_id, None)

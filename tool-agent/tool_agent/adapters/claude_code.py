@@ -738,14 +738,36 @@ class ClaudeCodeAdapter:
         timeout_s = float(args.get("timeout_s", 300.0))
         idle_quiet_s = float(args.get("idle_quiet_s", 6.0))
 
-        # ── 1. Pre-allocate a session UUID so we know the jsonl path upfront ──
-        cc_session_id = str(uuid.uuid4())
+        # ── 1. Choose session UUID ──
+        # When `resume_cc_session_id` is provided, RESUME that session
+        # instead of minting a fresh one. CC's --session-id with an
+        # existing uuid means "continue that conversation" — the jsonl
+        # already exists, CC loads all prior tool_use/tool_result/text
+        # events as context, and our new brief becomes the next user
+        # turn. This is how Modify-on-agent-final works (Zack 2026-05-25):
+        # the user's correction lands as a follow-up in the same CC
+        # conversation, so CC's prior research isn't thrown away.
+        cc_session_id = args.get("resume_cc_session_id") or str(uuid.uuid4())
+        resuming = bool(args.get("resume_cc_session_id"))
         # CC names project dirs from the REAL path (follows symlinks). On macOS
         # /tmp is symlinked to /private/tmp, so resolve before sanitising.
         real_cwd = Path(os.path.expanduser(working_dir)).resolve()
         sanitized = str(real_cwd).replace("/", "-")
         project_dir = Path.home() / ".claude" / "projects" / sanitized
         session_jsonl = project_dir / f"{cc_session_id}.jsonl"
+        # If resuming, the jsonl better exist; otherwise CC's --session-id
+        # would create a fresh session under that uuid (losing context).
+        # Bail with a clear error so cortex can fall back to v0.5.
+        if resuming and not session_jsonl.exists():
+            await _emit_progress({
+                "stage": "error", "icon": "✗",
+                "detail": f"cannot resume cc session {cc_session_id[:8]} — jsonl not found",
+                "is_error": True,
+            })
+            return {
+                "ok": False, "error": f"resume target jsonl missing: {session_jsonl}",
+                "session_id": cc_session_id, "resume_failed": True,
+            }
 
         # Ensure target dir exists (CC may not create it if cwd is brand new)
         try:
@@ -811,8 +833,16 @@ class ClaudeCodeAdapter:
         # the same accounts and need OAuth we don't want); we keep
         # chrome-devtools (no overlap with anything Cortex does).
         agent_mcp_config = str(Path(__file__).parent / "agent_mcp.json")
+        # `--resume <id>` loads prior conversation (Modify-on-FINAL path);
+        # `--session-id <id>` is the fresh-session form. CC's --session-id
+        # with an EXISTING uuid does NOT resume — it starts blank under
+        # that id (verified manually). Use --resume to actually rehydrate.
+        if resuming:
+            session_flag = ["--resume", cc_session_id]
+        else:
+            session_flag = ["--session-id", cc_session_id]
         claude_cmd_parts = [
-            "claude", "--session-id", cc_session_id,
+            "claude", *session_flag,
             "--permission-mode", agent_permission_mode,
             "--strict-mcp-config",
             "--mcp-config", agent_mcp_config,
@@ -865,7 +895,11 @@ class ClaudeCodeAdapter:
                 "detail": "waiting for CC TUI to render",
             })
             await asyncio.sleep(2.0)
-            if agent_permission_mode in ("bypassPermissions",):
+            # Safety-prompt dismiss is only needed on FRESH sessions —
+            # `--resume` rehydrates a session that already accepted bypass,
+            # so the dialog never appears. Skip the check; otherwise we'd
+            # send a phantom Down+Enter into CC's input field.
+            if not resuming and agent_permission_mode in ("bypassPermissions",):
                 _, pane_out, _ = await _run(
                     _tmux("capture-pane", "-t", tmux_session, "-p"), timeout=5,
                 )
@@ -906,8 +940,20 @@ class ClaudeCodeAdapter:
                     "detail": msg,
                 })
 
-            result = await _tail_jsonl_until_idle(
+            # When resuming, the jsonl already has prior events (loaded by
+            # CC as context). Skip past them so the tail only emits NEW
+            # events for THIS turn — otherwise the HUD would replay every
+            # prior tool_use as if it was happening fresh.
+            tail_start_pos = 0
+            if resuming:
+                try:
+                    tail_start_pos = session_jsonl.stat().st_size
+                except OSError:
+                    tail_start_pos = 0
+
+            result = await _tail_jsonl_until_idle_from(
                 session_jsonl,
+                start_pos=tail_start_pos,
                 on_event=lambda ev: self._handle_jsonl_event(
                     ev, _emit_progress, cc_session_id,
                 ),

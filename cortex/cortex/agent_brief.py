@@ -197,3 +197,49 @@ def estimate_size(brief: str) -> dict[str, int]:
         "lines": brief.count("\n") + 1,
         "approx_tokens": len(brief) // 4,
     }
+
+
+def build_modify_brief(
+    *,
+    prior_summary: str | None,
+    prior_actions: list[dict[str, Any]] | None,
+    prior_notes: str | None,
+    modify_text: str,
+    now_iso: str | None = None,
+) -> str:
+    """Compose the follow-up brief Cortex hands to CC when the user clicks
+    Modify on an agent FINAL preview card.
+
+    Sent as the next user turn in a RESUMED CC session (--session-id =
+    prior cc_session_id). CC's conversation history is fully loaded by CC
+    itself; we don't need to re-inline anything except a compact summary
+    of what CC already proposed + the user's correction.
+    """
+    L: list[str] = []
+    L.append("== MODIFICATION ==")
+    L.append(f'Zack reviewed your last output and asks:  "{modify_text.strip()}"')
+    if now_iso:
+        L.append(f"NOW: {now_iso}")
+    L.append("")
+    L.append("== YOUR PRIOR OUTPUT (for reference; you already have full conversation history) ==")
+    if prior_summary:
+        L.append(f"Summary: {prior_summary[:300]}")
+    if prior_actions:
+        L.append("Actions you proposed:")
+        for a in prior_actions[:8]:
+            try:
+                compact = json.dumps(a, ensure_ascii=False)
+            except (TypeError, ValueError):
+                compact = str(a)
+            L.append(f"  · {compact[:300]}")
+    if prior_notes:
+        L.append(f"Notes: {prior_notes[:300]}")
+    L.append("")
+    L.append("== TASK ==")
+    L.append("Emit the REVISED final JSON (same schema as before): summary, actions[],")
+    L.append("optional notes. Re-use your prior research — you already did the Bash/Read")
+    L.append("calls in this session, don't redo them unless Zack's correction genuinely")
+    L.append("needs fresh info. Don't go silent — emit valid JSON.")
+    L.append("")
+    L.append("Output the JSON object directly as your final message; no prose around it.")
+    return "\n".join(L)
