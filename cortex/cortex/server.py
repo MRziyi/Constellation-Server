@@ -490,6 +490,11 @@ class CortexServer:
         # The client uses this to learn the server-minted session_id for
         # fresh threads (when the user didn't supply one).
         self._event_to_session: dict[str, str] = {}
+        # Auto-distiller: background process that watches Modify-with-text
+        # decisions and proposes Twin updates when a stable pattern emerges.
+        # Hooks in via _handle_user_decision (modify branch).
+        from .distiller import Distiller
+        self.distiller = Distiller(self)
 
         # Parse confirm-policies once at construction; reload on Twin write later (Phase 7).
         self._confirm_policies = _parse_confirm_policies(twin.root)
@@ -1555,6 +1560,8 @@ class CortexServer:
                 decision_kind=kind,
                 correction_text=resolved_text,
             )
+            if kind == "modify":
+                self.distiller.on_modify(has_correction_text=bool(resolved_text))
             await self._resume_agent_phase(pending, decision, feedback_text, event)
             return
 
@@ -1581,6 +1588,7 @@ class CortexServer:
                 decision_kind=kind,
                 correction_text=resolved_text,
             )
+            self.distiller.on_modify(has_correction_text=bool(resolved_text))
             try:
                 await self._resume_agent_with_modify(pending, resolved_text, event)
                 return
@@ -1619,6 +1627,8 @@ class CortexServer:
             decision_kind=kind,
             correction_text=resolved_text,
         )
+        if kind == "modify":
+            self.distiller.on_modify(has_correction_text=bool(resolved_text))
 
         plan = pending["plan"]
         task_continues = bool(plan.get("task_continues"))
