@@ -29,7 +29,8 @@ log = structlog.get_logger(__name__)
 
 WHISPER_CLI = os.environ.get("WHISPER_CLI", "/opt/homebrew/bin/whisper-cli")
 WHISPER_MODELS_DIR = Path(os.environ.get(
-    "WHISPER_MODELS_DIR", "/tmp/whisper-models"
+    "WHISPER_MODELS_DIR",
+    str(Path.home() / "constellation" / "whisper-models"),
 ))
 
 # Supported model names (must have ggml-<name>.bin in WHISPER_MODELS_DIR).
