@@ -102,6 +102,11 @@ class AudioStreamBuffer:
         stream was never started or already finalized."""
         return self._streams.pop(stream_id, None)
 
+    def peek(self, stream_id: str) -> StreamEntry | None:
+        """Return the live entry without removing it. Used by Level 2 partial
+        transcription, which runs whisper on the in-flight buffer."""
+        return self._streams.get(stream_id)
+
     def discard(self, stream_id: str) -> None:
         """Cancel a stream without returning its bytes (e.g. user said 'cancel')."""
         self._streams.pop(stream_id, None)

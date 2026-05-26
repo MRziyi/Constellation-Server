@@ -158,6 +158,13 @@ def cli(
             await whisper.prewarm()
         except Exception as e:
             log.warning("whisper.prewarm.failed", error=str(e))
+        # Also prewarm the partial-transcription model (Level 2 streaming).
+        partial = getattr(srv, "_whisper_partial", None)
+        if partial is not None:
+            try:
+                await partial.prewarm()
+            except Exception as e:
+                log.warning("whisper.prewarm_partial.failed", error=str(e))
 
     async def main() -> None:
         await asyncio.gather(

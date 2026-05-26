@@ -513,9 +513,19 @@ class CortexServer:
         from .audio_buffer import AudioStreamBuffer
         self._audio_buffer = AudioStreamBuffer()
         # Whisper pipeline (lazy — actual model load deferred to first use
-        # OR to cortex.main pre-warm call).
+        # OR to cortex.main pre-warm call). `small` for finalised utterances;
+        # `tiny` for Level-2 streaming partials (faster, less accurate).
         from .whisper_pipeline import WhisperPipeline
         self._whisper = WhisperPipeline(model="small")
+        # `base` for partials — ~2-3× faster than `small`, accuracy on short
+        # in-flight audio is "good enough" for a streaming preview. Switch to
+        # `tiny` if base proves too slow; download with:
+        #   bash whisper.cpp/models/download-ggml-model.sh tiny
+        self._whisper_partial = WhisperPipeline(model="base")
+        # Per-stream guard: while a partial transcription is in flight, skip
+        # new partial triggers for that stream so we don't pile up subprocess
+        # invocations.
+        self._partial_inflight: set[str] = set()
         log.info(
             "confirm_policies.loaded",
             count=len(self._confirm_policies),
@@ -781,8 +791,16 @@ class CortexServer:
 
     # ── Phase 3b: Glass client — audio + voice-fired decisions ─────────────
 
+    # Level-2 streaming partials: every N chunks of ~250ms (= ~1s of audio)
+    # we fire a `tiny` whisper pass on the in-flight buffer and emit a
+    # hud_state(stage="listening") with the partial transcript. Set to 4 ×
+    # 250ms = 1 second cadence. Drop new triggers while a previous partial
+    # is still running for the same stream.
+    _PARTIAL_EVERY_N_CHUNKS = 4
+
     async def _handle_audio_chunk(self, event: Event) -> None:
-        """Append a base64 PCM frame to the per-stream buffer."""
+        """Append a base64 PCM frame to the per-stream buffer; opportunistically
+        fire a partial transcription every N chunks (Level 2 streaming)."""
         p = event.payload or {}
         sid = (p.get("stream_id") or "").strip()
         if not sid:
@@ -795,6 +813,49 @@ class CortexServer:
             sample_rate=int(p.get("sample_rate") or 16000),
             channels=int(p.get("channels") or 1),
         )
+
+        if "hud_state" not in self._glass_accept:
+            return
+        entry = self._audio_buffer.peek(sid)
+        if entry is None or entry.n_chunks == 0:
+            return
+        if entry.n_chunks % self._PARTIAL_EVERY_N_CHUNKS != 0:
+            return
+        if sid in self._partial_inflight:
+            log.debug("partial.skip_inflight", stream_id=sid, n_chunks=entry.n_chunks)
+            return
+        # Snapshot a copy so the running whisper pass doesn't race with new
+        # chunks mutating the buffer mid-flight.
+        snapshot = bytes(entry.buffer)
+        lang_hint = (p.get("lang_hint") or "auto").lower()
+        asyncio.create_task(self._run_partial(sid, snapshot, entry.sample_rate, entry.channels, lang_hint))
+
+    async def _run_partial(
+        self, stream_id: str, pcm: bytes, sample_rate: int, channels: int, lang: str,
+    ) -> None:
+        """Run one partial whisper pass and emit a hud_state(listening) frame
+        with the current transcript. Best-effort — failures are logged and
+        swallowed so the full audio_end pass remains the source of truth."""
+        self._partial_inflight.add(stream_id)
+        try:
+            text = await self._whisper_partial.transcribe(
+                pcm, sample_rate=sample_rate, channels=channels,
+                lang=lang if lang in ("zh", "en") else "auto",
+            )
+            text = text.strip()
+            if not text:
+                return
+            log.info("partial.transcript", stream_id=stream_id,
+                     n_chars=len(text), bytes=len(pcm))
+            await self.emit_hud_state(
+                stage="listening",
+                icon="🎤",
+                detail_runs=[{"text": text, "style": "dim"}],
+            )
+        except Exception as e:
+            log.warning("partial.failed", stream_id=stream_id, error=str(e))
+        finally:
+            self._partial_inflight.discard(stream_id)
 
     async def _handle_audio_end(self, event: Event) -> None:
         """Finalize a stream: pop its PCM, run Whisper, inject the transcript
