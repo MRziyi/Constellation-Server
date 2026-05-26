@@ -1472,7 +1472,17 @@ class CortexServer:
             title = f"Agent ready — {len(subtasks)} action{'s' if len(subtasks) != 1 else ''}"
         else:
             subtasks = []
-            body_md = (rpc_result.get("result_text") or "(no actions proposed)")[:1500]
+            # Prefer the structured `summary` field (clean prose CC was asked
+            # to produce) over the raw result_text (which is the whole JSON
+            # blob {summary, actions, notes} serialized — looks like raw JSON
+            # in the HUD body). Notes append if present, for context.
+            summary = (structured or {}).get("summary") if isinstance(structured, dict) else None
+            notes = (structured or {}).get("notes") if isinstance(structured, dict) else None
+            if summary:
+                body_md = summary if not notes else f"{summary}\n\n— {notes}"
+            else:
+                body_md = (rpc_result.get("result_text") or "(no actions proposed)")
+            body_md = body_md[:1500]
             title = "Agent finished — no actions"
 
         cmd = Command(
