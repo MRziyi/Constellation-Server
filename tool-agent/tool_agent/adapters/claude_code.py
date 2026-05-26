@@ -940,16 +940,38 @@ class ClaudeCodeAdapter:
                     "detail": msg,
                 })
 
-            # When resuming, the jsonl already has prior events (loaded by
-            # CC as context). Skip past them so the tail only emits NEW
-            # events for THIS turn — otherwise the HUD would replay every
-            # prior tool_use as if it was happening fresh.
+            # When resuming, the jsonl already has prior events. We need to
+            # ensure the tail starts AFTER our just-pasted brief's USER
+            # message lands in the file — NOT just at the byte-EOF at this
+            # instant (which races with CC writing prior-session lingering
+            # events like ai-title / permission-mode / leaked replies). If
+            # we land before a lingering prior assistant message, that
+            # message's text would set saw_assistant_text=True and trigger
+            # idle_after_text after 6s, returning the WRONG last_assistant
+            # text. So: poll the file until we see a USER record whose
+            # content matches our brief's first 60 chars, then start the
+            # tail right after that line.
             tail_start_pos = 0
             if resuming:
-                try:
-                    tail_start_pos = session_jsonl.stat().st_size
-                except OSError:
-                    tail_start_pos = 0
+                marker = brief.strip()[:60]
+                seek_started = asyncio.get_event_loop().time()
+                while (asyncio.get_event_loop().time() - seek_started) < 10.0:
+                    found_pos = await _scan_for_user_message_end(session_jsonl, marker)
+                    if found_pos is not None:
+                        tail_start_pos = found_pos
+                        break
+                    await asyncio.sleep(0.3)
+                else:
+                    # Brief never appeared in jsonl within 10s — fall back
+                    # to current EOF (less reliable but better than nothing).
+                    try:
+                        tail_start_pos = session_jsonl.stat().st_size
+                    except OSError:
+                        tail_start_pos = 0
+                    await _emit_progress({
+                        "stage": "warning", "icon": "⚠️",
+                        "detail": "resume brief not seen in jsonl; tailing from EOF",
+                    })
 
             result = await _tail_jsonl_until_idle_from(
                 session_jsonl,
@@ -1231,6 +1253,49 @@ class ClaudeCodeAdapter:
 
 
 # ── Session.jsonl tail + distillation (module-level helpers) ──────────────
+
+async def _scan_for_user_message_end(path: Path, marker: str) -> int | None:
+    """Scan the jsonl for a user-message record whose content contains
+    `marker` (used to find our just-pasted brief). Returns the byte
+    position immediately AFTER the matching line (so the tail seek
+    starts there) — or None if not found.
+
+    Why this exists: on `--resume`, the jsonl already has prior events.
+    Naive seek-to-EOF races with CC writing lingering prior-session
+    output and can land BEFORE a prior assistant text, which then
+    falsely triggers idle_after_text. We use the brief itself as a
+    deterministic marker — the tail starts after the line where our
+    user-input lands, guaranteed.
+    """
+    if not path.exists() or not marker:
+        return None
+    try:
+        with path.open("rb") as f:
+            offset = 0
+            for raw in f:
+                offset += len(raw)
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if ev.get("type") != "user":
+                    continue
+                content = ev.get("message", {}).get("content")
+                text = content if isinstance(content, str) else ""
+                if not text and isinstance(content, list):
+                    for c in content:
+                        if isinstance(c, dict) and c.get("type") == "text":
+                            text = c.get("text", "")
+                            break
+                if marker in text:
+                    return offset
+    except OSError:
+        return None
+    return None
+
 
 async def _tail_jsonl_until_idle_from(
     path: Path,
