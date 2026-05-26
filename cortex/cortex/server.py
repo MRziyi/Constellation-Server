@@ -67,10 +67,6 @@ def _apply_confirm_policies(plan: dict[str, Any], rules: dict[str, str]) -> dict
       - `deny`           → mark subtask with diagnostics; Cortex will skip dispatch.
       - unknown / wildcard fallback → preview-default.
 
-    Additional enforcement (SoT C-20 + C-22): any plan with task_continues=true MUST
-    have hud_kind=preview_action so the user has a yield point to optionally voice-feedback
-    via the always-on mic. Auto-advancing past a hud_show would silently violate C-22.
-
     Returns the same plan, mutated in place (caller may keep reference).
     """
     forced_preview = False
@@ -91,8 +87,7 @@ def _apply_confirm_policies(plan: dict[str, Any], rules: dict[str, str]) -> dict
                 st["requires_confirm"] = True
             st["_confirm_policy"] = policy
 
-    needs_user_gate = forced_preview or bool(plan.get("task_continues"))
-    if needs_user_gate and plan.get("hud_response", {}).get("kind") == "hud_show":
+    if forced_preview and plan.get("hud_response", {}).get("kind") == "hud_show":
         plan["hud_response"]["kind"] = "preview_action"
         if not plan["hud_response"].get("options"):
             plan["hud_response"]["options"] = ["Proceed", "Edit", "Cancel"]
@@ -799,7 +794,7 @@ class CortexServer:
         and CC produces a revised actions[] without losing research.
 
         Failure of either path → raise ResumeFailed; caller falls back to
-        the legacy v0.5 `_advance_task` (re-plan with feedback).
+        `_replan_with_feedback` (one-shot re-plan via Router).
         """
         from .agent_brief import build_modify_brief, CANONICAL_ACTIONS_SCHEMA
 
@@ -910,7 +905,7 @@ class CortexServer:
 
         rpc_result = rpc.result or {}
         # If resume failed (jsonl gone, CC crashed at spawn) → raise so
-        # the caller falls back to v0.5 _advance_task.
+        # the caller falls back to _replan_with_feedback.
         if rpc_result.get("resume_failed"):
             raise ResumeFailed(
                 f"prior CC session {cc_session_id} could not be resumed "
@@ -1024,9 +1019,9 @@ class CortexServer:
                 "plan": {
                     "primary_intent": "agent_checkpoint",
                     "subtasks": [], "reasoning": "phase checkpoint",
-                    "hud_response": cmd.payload, "task_continues": True,
+                    "hud_response": cmd.payload,
                 },
-                "subtask_results": [], "task_history": [],
+                "subtask_results": [],
                 "from_agent": True, "is_checkpoint": True,
                 "agent_result": rpc_result,
                 "agent_working_dir": working_dir,
@@ -1072,10 +1067,9 @@ class CortexServer:
             "plan": {
                 "primary_intent": "agent_actions",
                 "subtasks": subtasks, "reasoning": "agent dispatch (resumed)",
-                "hud_response": cmd.payload, "task_continues": False,
+                "hud_response": cmd.payload,
             },
             "subtask_results": [{} for _ in subtasks],
-            "task_history": [],
             "from_agent": True,
             # from_agent_final routes Modify back through CC via --session-id
             # resume (instead of falling through to v0.5 planner). Carries
@@ -1541,11 +1535,10 @@ class CortexServer:
         cmd = self._build_command(plan, subtask_results)
         sid = (event.payload or {}).get("session_id")
         self._pending_previews[cmd.id] = {
-            "event": event,  # full event kept so we can re-route on feedback / advance
+            "event": event,  # full event kept so we can re-route on Modify feedback
             "session_id": sid,
             "plan": plan,
             "subtask_results": subtask_results,
-            "task_history": [],  # multi-step task history; empty on first round
         }
         if sid:
             self.sessions.append(
@@ -1557,28 +1550,17 @@ class CortexServer:
             )
         if self._glass_conn:
             await self._glass_conn.send(cmd.model_dump_json())
-        log.info(
-            "command.sent",
-            id=cmd.id, kind=cmd.kind,
-            task_continues=bool(plan.get("task_continues")),
-            n_history=0,
-        )
+        log.info("command.sent", id=cmd.id, kind=cmd.kind)
 
         # hud_show = "done already, just informing"; no user gate, write receipt now.
-        # (If task_continues=true with hud_show, this is an unusual case — auto-advance.)
         if hud_kind == "hud_show":
             self._pending_previews.pop(cmd.id, None)
             self._write_receipt(plan, subtask_results, event.id)
-            if plan.get("task_continues"):
-                # Auto-advance with the hud_show results as a step in history.
-                history = [self._summarize_step_for_history(plan, subtask_results, "auto_advance")]
-                await self._advance_task(event, history, event.id)
 
     async def _route(
         self,
         event: Event,
         feedback_iteration: dict[str, Any] | None = None,
-        task_history: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         if self.use_stub_router:
             return route_stub(event)
@@ -1591,7 +1573,6 @@ class CortexServer:
             twin_toc_table=toc_table,
             toc_paths=toc_paths,
             model=self.router_model,
-            task_history=task_history,
         )
         context_pack = self.twin.assemble_context_pack(picked)
         return await route(
@@ -1601,7 +1582,6 @@ class CortexServer:
             model=self.router_model,
             context_pack=context_pack,
             feedback_iteration=feedback_iteration,
-            task_history=task_history,
         )
 
     def _build_command(self, plan: dict[str, Any], results: list[dict[str, Any]]) -> Command:
@@ -1659,8 +1639,6 @@ class CortexServer:
             return str(r.get(field, ""))
 
         return pattern.sub(replace, template)
-
-    MAX_TASK_ROUNDS = 5
 
     async def _handle_user_decision(self, event: Event) -> None:
         decision = event.payload.get("decision")
@@ -1824,10 +1802,10 @@ class CortexServer:
                 return
             except ResumeFailed as e:
                 # Genuine resume-failure (CC couldn't load the prior jsonl,
-                # spawn failed, etc.). Fall through to v0.5 _advance_task —
-                # not as good (loses CC's research context) but better than
-                # nothing.
-                log.warning("modify_resume.failed_falling_back_to_v05", error=str(e))
+                # spawn failed, etc.). Fall through to the one-shot
+                # _replan_with_feedback path — not as good (loses CC's
+                # research context) but better than stranding the user.
+                log.warning("modify_resume.failed_falling_back_to_replan", error=str(e))
                 self._pending_previews[cmd_id] = pending
             except Exception as e:
                 # Anything else (WSS dropped mid-card-send, transient IO,
@@ -1861,185 +1839,76 @@ class CortexServer:
             self.distiller.on_modify(has_correction_text=bool(resolved_text))
 
         plan = pending["plan"]
-        task_continues = bool(plan.get("task_continues"))
-        task_history: list[dict[str, Any]] = list(pending.get("task_history") or [])
         original_event: Event = pending["event"]
 
         if kind == "approve":
-            if task_continues:
-                exec_subtasks = [st for st in plan["subtasks"] if st["result_format"] == "execute"]
-                if exec_subtasks:
-                    log.warning("intermediate.has_execute_subtasks", n=len(exec_subtasks))
-                    await self._execute_remaining_no_receipt(pending)
-                self._write_step_receipt(plan, pending["subtask_results"], event.id, step_index=len(task_history))
-                task_history.append(self._summarize_step_for_history(plan, pending["subtask_results"], "send"))
-                try:
-                    await self._advance_task(original_event, task_history, event.id)
-                except Exception as e:
-                    log.error("task.advance_failed", error=str(e), error_type=type(e).__name__, exc_info=True)
-                    raise
-            else:
-                try:
-                    await self._execute_remaining(pending, event.id)
-                except Exception as e:
-                    log.error("execute_remaining.failed", error=str(e), error_type=type(e).__name__, exc_info=True)
-                    raise
+            try:
+                await self._execute_remaining(pending, event.id)
+            except Exception as e:
+                log.error("execute_remaining.failed", error=str(e), error_type=type(e).__name__, exc_info=True)
+                raise
             return
 
-        # kind == "modify" with text
-        task_history.append(self._summarize_step_for_history(
-            plan, pending["subtask_results"], "feedback", resolved_text
-        ))
+        # kind == "modify" with text — one-shot re-plan with feedback.
+        # (P1.1 ripout: no more task_history / recursive _advance_task.
+        # Complex multi-step asks live in the agent path; the simple path
+        # is strictly one round + optional feedback re-plan.)
         try:
-            await self._advance_task(
-                original_event, task_history, event.id,
-                feedback_text=resolved_text,
-                prior_plan=plan,
+            await self._replan_with_feedback(
+                original_event, plan, resolved_text, src_evt=event.id,
             )
         except Exception as e:
             log.error("feedback_loop.failed", error=str(e), error_type=type(e).__name__, exc_info=True)
             raise
 
-    def _summarize_step_for_history(
-        self,
-        plan: dict[str, Any],
-        subtask_results: list[dict[str, Any]],
-        user_decision: str,
-        feedback_text: str | None = None,
-    ) -> dict[str, Any]:
-        """Build a compact step record for inclusion in PRIOR TASK HISTORY."""
-        return {
-            "step_intent": plan.get("primary_intent"),
-            "next_step_hint": plan.get("next_step_hint"),
-            "subtasks": [
-                {
-                    "tool": s.get("tool"),
-                    "action": s.get("action"),
-                    "result_format": s.get("result_format"),
-                    "args": s.get("args"),
-                }
-                for s in plan.get("subtasks", [])
-            ],
-            "subtask_results": subtask_results,
-            "router_reasoning": plan.get("reasoning"),
-            "user_decision": user_decision,
-            "user_feedback_text": feedback_text,
-        }
-
-    async def _execute_remaining_no_receipt(self, pending: dict[str, Any]) -> None:
-        """Same as _execute_remaining but without writing the final receipt — used when
-        we know we're in the middle of a multi-step task and want to keep going."""
-        plan = pending["plan"]
-        results = list(pending["subtask_results"])
-        for i, st in enumerate(plan["subtasks"]):
-            if st["result_format"] == "execute":
-                interpolated_args = self._interpolate_args(st.get("args", {}), results, plan=plan)
-                rpc_result = await self._dispatch_to_tool({**st, "args": interpolated_args})
-                results[i] = rpc_result.result
-        pending["subtask_results"] = results
-
-    def _write_step_receipt(
-        self, plan: dict[str, Any], results: list[dict[str, Any]],
-        src_evt: str, step_index: int,
-    ) -> None:
-        """Write a step-level receipt for a multi-step task (audit trail)."""
-        rcpt_id = ids.receipt_id()
-        body = (
-            f"\n## {datetime.now(timezone.utc).strftime('%H:%M:%S')} — "
-            f"[step {step_index}] {plan['primary_intent']} [{rcpt_id}]\n"
-            f"- evt: {src_evt}\n"
-            f"- task_continues: {plan.get('task_continues')}\n"
-            f"- next_step_hint: {json.dumps(plan.get('next_step_hint'), ensure_ascii=False)[:200]}\n"
-            f"- reasoning: {plan.get('reasoning')}\n"
-        )
-        for i, (st, r) in enumerate(zip(plan["subtasks"], results)):
-            body += f"  - [{i}] {st['tool']}.{st['action']} ({st['result_format']}) → {json.dumps(r, ensure_ascii=False)[:160]}\n"
-        self.twin.receipt_append(body)
-        self.twin.changelog_append(
-            summary=f"[step {step_index}] {plan['primary_intent']}",
-            src=src_evt,
-            details=[f"Appended step receipt {rcpt_id}"],
-        )
-        log.info("step_receipt", step_index=step_index, rcpt_id=rcpt_id)
-
-    async def _advance_task(
+    async def _replan_with_feedback(
         self,
         original_event: Event,
-        task_history: list[dict[str, Any]],
+        prior_plan: dict[str, Any],
+        feedback_text: str,
+        *,
         src_evt: str,
-        feedback_text: str | None = None,
-        prior_plan: dict[str, Any] | None = None,
     ) -> None:
-        """Unified re-invocation path for both multi-step continuation and free-form feedback.
+        """One-shot router re-plan with user feedback. Replaces the legacy
+        recursive _advance_task — there's no multi-round loop anymore;
+        complex multi-step research lives in the CC agent path.
 
-        Router sees PRIOR TASK HISTORY (always) + USER FEEDBACK (if present) and decides
-        the next plan. This includes deciding whether to redo, advance, skip, or inject
-        info per the FREE-FORM FEEDBACK INTERPRETATION section of the system prompt.
-
-        Emits progress to Glass at every step — _advance_task can take 10-20s
-        (selector + router LLM calls). Without these emits the HUD just sat
-        on the previous frame (per Zack 2026-05-25 "no response" complaint).
+        Used by:
+        - Modify on a simple-path card (route through Router again with
+          ZACK'S WORDS = feedback_text, get a revised plan, surface a new
+          card the user can Approve/Modify/Kill).
+        - ResumeFailed fallback when --resume of a prior CC session breaks:
+          we have CC's prior structured output as 'prior_plan' and the
+          user's modify text → ask Router to translate it into a simple
+          fallback.
         """
-        round_n = len(task_history)
-        log.info("task.advance.start", round=round_n, has_feedback=bool(feedback_text))
-
+        log.info("replan_with_feedback.start", text=feedback_text[:80])
         await self._emit_progress_to_glass(
             parent_event_id=original_event.id,
             stage="re_planning", icon="✍️",
-            detail=(
-                f"re-planning with your correction (round {round_n + 1})"
-                if feedback_text
-                else f"advancing to round {round_n + 1}"
-            ),
+            detail="re-planning with your correction",
         )
-
-        if round_n >= self.MAX_TASK_ROUNDS:
-            log.warning("task.max_rounds_reached", rounds=round_n)
-            terminal_cmd = Command(
-                id=ids.command_id(), ts=datetime.now(timezone.utc),
-                kind="hud_show",
-                payload={
-                    "title": "Task too long",
-                    "body": f"Hit {self.MAX_TASK_ROUNDS}-step limit. Restate the request to start fresh.",
-                    "icon": "✗", "options": [],
-                },
-                requires_confirm=False, ttl_ms=15_000,
-            )
-            if self._glass_conn:
-                await self._glass_conn.send(terminal_cmd.model_dump_json())
-            return
-
-        feedback_iteration = None
-        if feedback_text:
-            feedback_iteration = {
-                "feedback_text": feedback_text,
-                "prior_plan_summary": (
-                    {
-                        "primary_intent": prior_plan["primary_intent"],
-                        "reasoning": prior_plan.get("reasoning"),
-                        "hud_response": prior_plan.get("hud_response"),
-                    }
-                    if prior_plan
-                    else None
-                ),
-            }
-
+        feedback_iteration = {
+            "feedback_text": feedback_text,
+            "prior_plan_summary": {
+                "primary_intent": prior_plan.get("primary_intent"),
+                "reasoning": prior_plan.get("reasoning"),
+                "hud_response": prior_plan.get("hud_response"),
+            },
+        }
         await self._emit_progress_to_glass(
             parent_event_id=original_event.id,
             stage="planning", icon="🧠",
             detail="re-running planner with your feedback",
         )
         next_plan = await self._route(
-            original_event,
-            feedback_iteration=feedback_iteration,
-            task_history=task_history,
+            original_event, feedback_iteration=feedback_iteration,
         )
         next_plan = _apply_confirm_policies(next_plan, self._confirm_policies)
         log.info(
-            "task.advanced",
-            round=round_n,
+            "replan_with_feedback.planned",
             primary_intent=next_plan["primary_intent"],
-            task_continues=bool(next_plan.get("task_continues")),
+            n_subtasks=len(next_plan.get("subtasks", [])),
         )
         await self._emit_progress_to_glass(
             parent_event_id=original_event.id,
@@ -2047,11 +1916,11 @@ class CortexServer:
             detail=f"plan: {next_plan['primary_intent']} · {len(next_plan.get('subtasks', []))} subtasks",
         )
 
-        # Same dispatch flow as _handle_user_invoke
+        # Same dispatch flow as the first round of _handle_user_invoke.
         hud_kind = next_plan["hud_response"]["kind"]
         subtask_results: list[dict[str, Any]] = []
         for i, st in enumerate(next_plan["subtasks"]):
-            if st["result_format"] in ("draft", "query") or hud_kind == "hud_show":
+            if st["result_format"] == "query" or hud_kind == "hud_show":
                 await self._emit_progress_to_glass(
                     parent_event_id=original_event.id,
                     stage="dispatch", icon="🔧",
@@ -2069,17 +1938,12 @@ class CortexServer:
             detail=f"preparing {hud_kind}",
         )
         cmd = self._build_command(next_plan, subtask_results)
-        # Carry session_id forward so downstream decisions land in the
-        # right session log. Without this, follow-up Approve/Modify on
-        # the new card hit pending.get("session_id") == None and the
-        # session log loses the rest of the conversation.
         sid = (original_event.payload or {}).get("session_id")
         self._pending_previews[cmd.id] = {
             "event": original_event,
             "session_id": sid,
             "plan": next_plan,
             "subtask_results": subtask_results,
-            "task_history": task_history,  # carry forward
         }
         if sid:
             self.sessions.append(
@@ -2088,27 +1952,17 @@ class CortexServer:
                 title=cmd.payload.get("title", ""),
                 body_excerpt=(cmd.payload.get("body") or "")[:400],
                 primary_intent=next_plan.get("primary_intent"),
-                round=round_n,
+                from_replan=True,
             )
         if self._glass_conn:
             await self._glass_conn.send(cmd.model_dump_json())
-        log.info(
-            "command.sent",
-            id=cmd.id, kind=cmd.kind,
-            task_continues=bool(next_plan.get("task_continues")),
-            n_history=round_n,
-        )
+        log.info("command.sent", id=cmd.id, kind=cmd.kind, from_replan=True)
 
-        # If this round's HUD is hud_show, no user gate; write step receipt and possibly auto-advance.
+        # hud_show = no user gate; write receipt now. (No auto-advance —
+        # the re-plan is strictly one-shot.)
         if hud_kind == "hud_show":
             self._pending_previews.pop(cmd.id, None)
-            self._write_step_receipt(next_plan, subtask_results, src_evt, step_index=round_n)
-            if next_plan.get("task_continues"):
-                # Auto-advance — extend history with this round and recurse
-                task_history.append(
-                    self._summarize_step_for_history(next_plan, subtask_results, "auto_advance")
-                )
-                await self._advance_task(original_event, task_history, src_evt)
+            self._write_receipt(next_plan, subtask_results, src_evt)
 
     async def _execute_remaining(self, pending: dict[str, Any], src_evt: str) -> None:
         """Run the `execute` subtasks after user SEND. Write receipt + CHANGELOG.
@@ -2310,6 +2164,12 @@ async def serve(
     )
     if plane is not None:
         plane.bind(server=server, twin=twin)
+    # P1.4 — wire the insight engine. Default OFF; opt in via env var
+    # CONSTELLATION_INSIGHT_ENGINE=1. No-op when disabled.
+    from .insight_engine import InsightEngine, register_default_providers
+    server.insight_engine = InsightEngine(server)
+    register_default_providers(server.insight_engine)
+    server.insight_engine.start()
     log.info("cortex.listening", host=host, port=port)
     async with websockets.serve(server.handle_glass, host, port):
         await asyncio.Future()  # run forever

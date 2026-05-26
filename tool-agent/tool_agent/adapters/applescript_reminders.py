@@ -137,13 +137,31 @@ class RemindersAdapter:
         completed = bool(args.get("completed", False))
         completed_filter = "true" if completed else "false"
 
+        # Each line: id<TAB>name<TAB>iso_due ("none" if no due date).
+        # AppleScript's `date` -> ISO via short ISO format helper.
         script = f'''
         tell application "Reminders"
-            if not (exists list "{_applescript_escape(list_name)}") then return "[]"
+            if not (exists list "{_applescript_escape(list_name)}") then return ""
             set theList to list "{_applescript_escape(list_name)}"
             set itemsOut to {{}}
             repeat with r in (reminders of theList whose completed is {completed_filter})
-                set end of itemsOut to (id of r) & "\\t" & (name of r)
+                set dueStr to "none"
+                try
+                    set dd to due date of r
+                    set y to year of dd as integer
+                    set mo to month of dd as integer
+                    set dy to day of dd as integer
+                    set hr to hours of dd as integer
+                    set mi to minutes of dd as integer
+                    set se to seconds of dd as integer
+                    set dueStr to ((y as string) & "-" & ¬
+                        (text -2 thru -1 of ("0" & mo)) & "-" & ¬
+                        (text -2 thru -1 of ("0" & dy)) & "T" & ¬
+                        (text -2 thru -1 of ("0" & hr)) & ":" & ¬
+                        (text -2 thru -1 of ("0" & mi)) & ":" & ¬
+                        (text -2 thru -1 of ("0" & se)))
+                end try
+                set end of itemsOut to (id of r) & "\\t" & (name of r) & "\\t" & dueStr
             end repeat
             set AppleScript's text item delimiters to linefeed
             set joined to itemsOut as text
@@ -155,9 +173,12 @@ class RemindersAdapter:
             raise RuntimeError(f"osascript failed (rc={rc}): {stderr.strip()}")
         items = []
         for line in stdout.strip().splitlines():
-            if "\t" in line:
-                rid, title = line.split("\t", 1)
-                items.append({"reminder_id": rid, "title": title})
+            parts = line.split("\t")
+            if len(parts) >= 2:
+                entry = {"reminder_id": parts[0], "title": parts[1]}
+                if len(parts) >= 3 and parts[2] and parts[2] != "none":
+                    entry["due"] = parts[2]
+                items.append(entry)
         return {"list": list_name, "completed": completed, "items": items}
 
     async def _complete(self, args: dict[str, Any]) -> dict[str, Any]:

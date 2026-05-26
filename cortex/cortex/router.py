@@ -61,6 +61,11 @@ result_format
   execute — side effect (add reminder, send email, run shortcut, …)
   (`draft` is legacy — composition/research now lives in the agent path, not here)
 
+SCOPE — you handle SINGLE-SHOT plans only. Any ask needing multi-step
+research, drafting, or mid-task user judgment was routed to the agent path
+upstream and never reaches you. So: ONE round, ONE plan, then either
+hud_show (info) or preview_action (one batch of subtasks pending confirm).
+
 OUTPUT — think briefly in plain text if useful, then emit JSON inside a ```json
 fence (Cortex parses only the fence):
 
@@ -72,7 +77,7 @@ fence (Cortex parses only the fence):
       "action": "<documented action>",
       "args":   { ... ISO dates ... },
       "context_pack": [],
-      "result_format": "draft" | "execute" | "query",
+      "result_format": "execute" | "query",
       "requires_confirm": true | false | null
     }
   ],
@@ -86,31 +91,13 @@ fence (Cortex parses only the fence):
   // NOTE: never emit kind="tool_card". That kind is reserved for the reverse-wake
   // path which Cortex builds directly without invoking you. For user-initiated
   // side-effecting actions use preview_action; for pure info use hud_show.
-  "reasoning": "one sentence",
-  "task_continues": true | false,
-  "next_step_hint": "(optional) free-text hint to FUTURE-YOU"
+  "reasoning": "one sentence"
 }
 
-MULTI-STEP — use when an intent needs mid-task user judgment (e.g. "find the
-meeting time with 云 in recent mail, add a reminder, then reply"; can't add the
-reminder until Zack confirms the extracted time).
-- First round: task_continues=true, subtasks read-only ONLY (query/draft, never
-  execute mid-task). body_template surfaces findings; options like
-  ["Proceed","Edit","Cancel"]. next_step_hint tells FUTURE-YOU what's next.
-- Cortex yields a card; Zack responds. You're re-invoked with WHAT HAPPENED
-  ALREADY and (if he spoke) ZACK'S WORDS appended. Output the next round.
-- Max 5 rounds; round 5 must set task_continues=false.
-- Simple intents → single-shot, no multi-step.
-
-FREE-FORM FEEDBACK — when ZACK'S WORDS appears (mic is always-on; voice runs
-parallel to ring-tap). Classify:
-  (a) CONFIRM    "yes" / "对" / "go ahead"           → follow prior next_step_hint
-  (b) CORRECTION "actually 4pm not 10am"             → fix the value, recompute
-  (c) SKIP       "skip the reminder" / "that's all"  → TERMINAL plan: hud_show +
-                 task_continues=false + empty subtasks + brief ack.
-                 Skip is AUTHORITATIVE — never proceed "just in case".
-  (d) INJECT     "the meeting is Thursday 4pm"       → use his value as truth
-If ambiguous → treat as (a).
+FEEDBACK RE-PLAN — when ZACK'S WORDS appears on a follow-up call, treat it as
+a correction to the PRIOR plan. Apply the change (e.g. "4pm not 10am" updates
+the value; "skip" emits hud_show + empty subtasks + brief ack). Emit ONE
+revised plan; you won't be re-invoked again on this ask.
 
 HUD BODY — every card is INFO + a yield point, not a yes/no question. body_template
 must carry enough for Zack to judge / correct / skip without tapping.
@@ -121,45 +108,11 @@ must carry enough for Zack to judge / correct / skip without tapping.
 """
 
 
-def _summarise_subtask_for_history(sub: dict[str, Any], result: dict[str, Any]) -> str:
-    """One-line compact representation of an executed subtask for history blocks."""
-    tool = sub.get("tool", "?")
-    action = sub.get("action", "?")
-    rf = sub.get("result_format", "?")
-    # Compact result: prefer key fields; fall back to truncated JSON
-    if isinstance(result, dict):
-        # Pick a sensible 1-line summary based on common fields
-        if "text" in result and isinstance(result["text"], str):
-            res_s = f"text({len(result['text'])} chars): {result['text'][:120]!r}"
-        elif "items" in result and isinstance(result["items"], list):
-            res_s = f"items×{len(result['items'])}"
-            if result["items"]:
-                first = result["items"][0]
-                if isinstance(first, dict):
-                    res_s += f" (e.g. {next(iter(first.items()))})"
-        elif "answer" in result and isinstance(result["answer"], str):
-            res_s = f"answer: {result['answer'][:160]!r}"
-        elif "content" in result and isinstance(result["content"], str):
-            res_s = f"content({len(result['content'])} chars): {result['content'][:120]!r}"
-        elif "error" in result:
-            res_s = f"ERROR: {str(result['error'])[:120]}"
-        else:
-            # Compact non-trivial dict
-            kv_preview = json.dumps(result, ensure_ascii=False)
-            if len(kv_preview) > 200:
-                kv_preview = kv_preview[:200] + "…"
-            res_s = kv_preview
-    else:
-        res_s = str(result)[:200]
-    return f"{tool}.{action}({rf}) → {res_s}"
-
-
 def _build_user_prompt(
     event: Event,
     available_tools_block: str,
     context_pack: dict[str, str] | None = None,
     feedback_iteration: dict[str, Any] | None = None,
-    task_history: list[dict[str, Any]] | None = None,
 ) -> str:
     """Compose the natural-language brief sent to the Router.
 
@@ -190,27 +143,20 @@ def _build_user_prompt(
     blocks.append(f"NOW: {now_local.strftime('%Y-%m-%d %H:%M %Z')}")
     blocks.append("")
 
-    # ── WHAT HAPPENED ALREADY (multi-step continuation) ──
-    if task_history:
-        blocks.append(f"WHAT HAPPENED ALREADY (planning round {len(task_history) + 1}/5)")
-        for i, step in enumerate(task_history, start=1):
-            blocks.append(f'R{i} — "{step.get("step_intent") or "?"}"')
-            for sub, res in zip(step.get("subtasks", []), step.get("subtask_results") or []):
-                blocks.append(f"  · {_summarise_subtask_for_history(sub, res)}")
-            if hint := step.get("next_step_hint"):
-                blocks.append(f'  · next_hint: "{hint}"')
-            decision = step.get("user_decision") or "?"
-            if fb := step.get("user_feedback_text"):
-                blocks.append(f'  · Zack: "{fb}" (tapped {decision})')
-            else:
-                blocks.append(f"  · Zack: {decision} (ring-tap)")
-        blocks.append("")
-
-    # ── ZACK'S WORDS ON THE PRIOR CARD (free-form feedback) ──
+    # ── ZACK'S WORDS ON THE PRIOR CARD (single feedback re-plan) ──
     if feedback_iteration:
-        blocks.append("ZACK'S WORDS ON THE PRIOR CARD")
+        prior = feedback_iteration.get("prior_plan_summary") or {}
+        blocks.append("PRIOR PLAN (what you proposed last time)")
+        if prior.get("primary_intent"):
+            blocks.append(f"primary_intent: {prior['primary_intent']}")
+        if prior.get("reasoning"):
+            blocks.append(f"reasoning: {prior['reasoning']}")
+        if prior.get("hud_response"):
+            blocks.append(f"hud: {json.dumps(prior['hud_response'], ensure_ascii=False)[:300]}")
+        blocks.append("")
+        blocks.append("ZACK'S WORDS ON THAT PLAN")
         blocks.append(f'"{feedback_iteration.get("feedback_text", "")}"')
-        blocks.append("Classify (a)confirm (b)correction (c)skip (d)inject and shape the next plan.")
+        blocks.append("Treat as correction/skip/inject and emit ONE revised plan.")
         blocks.append("")
 
     # ── ZACK'S DIGITAL TWIN ──
@@ -263,10 +209,11 @@ def _validate_plan(plan: dict[str, Any], allowed_tools: set[str]) -> None:
     hud.setdefault("title", "Constellation")
     hud.setdefault("body_template", "")
     hud.setdefault("options", [])
-    plan.setdefault("task_continues", False)
+    # P1.1 ripout — task_continues / next_step_hint are no longer part of the
+    # contract. Force False (legacy callers still read it) so any LLM that
+    # still emits true can't re-trigger the deleted auto-advance branch.
+    plan["task_continues"] = False
     plan.setdefault("next_step_hint", None)
-    if not isinstance(plan["task_continues"], bool):
-        raise ValueError(f"task_continues must be bool, got {type(plan['task_continues'])}")
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -302,7 +249,6 @@ SELECTOR_FALLBACK_PATHS = ["identity.md"]
 def _build_selector_prompt(
     event: Event,
     twin_toc_table: str,
-    task_history: list[dict[str, Any]] | None = None,
 ) -> str:
     """Compose the user prompt for the selector pass. Tiny on purpose."""
     blocks: list[str] = []
@@ -320,17 +266,6 @@ def _build_selector_prompt(
         blocks.append(f"{event.kind}: {json.dumps(payload, ensure_ascii=False)[:200]}")
     blocks.append("")
 
-    if task_history:
-        blocks.append(f"PRIOR ROUNDS (compact, round {len(task_history) + 1}/5)")
-        for i, step in enumerate(task_history, start=1):
-            blocks.append(f'R{i} — "{step.get("step_intent") or "?"}"')
-            results = step.get("subtask_results") or []
-            for sub, res in zip(step.get("subtasks", []), results):
-                blocks.append(f"  · {_summarise_subtask_for_history(sub, res)}")
-            if fb := step.get("user_feedback_text"):
-                blocks.append(f'  · Zack said: "{fb}"')
-        blocks.append("")
-
     blocks.append("TWIN TOC")
     blocks.append(twin_toc_table)
     blocks.append("")
@@ -346,7 +281,6 @@ async def select_twin_paths(
     twin_toc_table: str,
     toc_paths: set[str],
     model: str = DEFAULT_MODEL,
-    task_history: list[dict[str, Any]] | None = None,
 ) -> list[str]:
     """Pass 1: ask the LLM which Twin paths to load. Returns a validated list.
 
@@ -354,7 +288,7 @@ async def select_twin_paths(
     SELECTOR_FALLBACK_PATHS rather than raising; the planner still does
     something sensible with just identity.md.
     """
-    user_prompt = _build_selector_prompt(event, twin_toc_table, task_history=task_history)
+    user_prompt = _build_selector_prompt(event, twin_toc_table)
     try:
         raw = await cached_chat_create(
             model=model,
@@ -397,7 +331,6 @@ async def route(
     model: str = DEFAULT_MODEL,
     context_pack: dict[str, str] | None = None,
     feedback_iteration: dict[str, Any] | None = None,
-    task_history: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Real Router. Calls OpenAI via cached_chat_create; validates + returns plan dict.
 
@@ -409,7 +342,6 @@ async def route(
         available_tools_block,
         context_pack=context_pack,
         feedback_iteration=feedback_iteration,
-        task_history=task_history,
     )
 
     try:
@@ -426,8 +358,7 @@ async def route(
         plan = parse_json_response(raw)
         _validate_plan(plan, allowed_tools)
         log.info("router.plan", primary_intent=plan["primary_intent"],
-                 n_subtasks=len(plan["subtasks"]),
-                 task_continues=plan.get("task_continues", False))
+                 n_subtasks=len(plan["subtasks"]))
         return plan
     except Exception as e:
         log.error("router.failed", error=str(e), error_type=type(e).__name__)
@@ -447,7 +378,6 @@ def _fallback_plan(reason: str) -> dict[str, Any]:
         },
         "reasoning": f"Router fallback: {reason}",
         "task_continues": False,
-        "next_step_hint": None,
     }
 
 
@@ -480,7 +410,6 @@ def route_stub(event: Event) -> dict[str, Any]:
         },
         "reasoning": "Phase 1 stub — echoes the input.",
         "task_continues": False,
-        "next_step_hint": None,
     }
 
 

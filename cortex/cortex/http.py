@@ -250,12 +250,10 @@ def make_app(plane: ControlPlane) -> web.Application:
                 "event_id": getattr(evt, "id", None),
                 "event_kind": getattr(evt, "kind", None),
                 "primary_intent": plan.get("primary_intent"),
-                "task_continues": plan.get("task_continues", False),
-                "next_step_hint": plan.get("next_step_hint"),
-                "rounds_seen": len(pending.get("task_history") or []),
                 "n_subtasks": len(plan.get("subtasks", [])),
                 "hud_kind": plan.get("hud_response", {}).get("kind"),
                 "hud_title": plan.get("hud_response", {}).get("title"),
+                "is_checkpoint": bool(pending.get("is_checkpoint")),
                 "is_reverse_wake": bool(pending.get("wake_response_map")),
             })
         return _json({"active": out})
@@ -417,6 +415,31 @@ def make_app(plane: ControlPlane) -> web.Application:
             return _err("distiller not initialised", 503)
         result = plane.server.distiller.force_run()
         return _json(result)
+
+    async def dev_insight_tick(request: web.Request) -> web.Response:
+        """Force one tick of the Insight Engine, bypassing cron schedule
+        + global cooldown. Used to dogfood-test insight providers; surfaces
+        any matching insight via the standard hud_show path.
+
+        Returns immediately; the tick runs in the background.
+        """
+        if plane.server is None:
+            return _err("server not bound", 503)
+        engine = getattr(plane.server, "insight_engine", None)
+        if engine is None:
+            return _err("insight engine not initialised", 503)
+        # Bypass the global cooldown for the manual tick.
+        engine._global_last = None
+
+        async def _bg_tick() -> None:
+            try:
+                await engine._tick()
+            except Exception as e:
+                log.warning("dev_insight_tick.failed", error=str(e), exc_info=True)
+
+        asyncio.create_task(_bg_tick())
+        return _json({"ok": True, "queued": True, "n_providers": len(engine._providers),
+                      "enabled": engine.enabled})
 
     async def dev_inject_wake(request: web.Request) -> web.Response:
         """Synthesise a tool_reverse_wake event (without going through Router)
@@ -658,6 +681,7 @@ def make_app(plane: ControlPlane) -> web.Application:
     app.router.add_post("/api/dev/inject_wake", dev_inject_wake)
     app.router.add_post("/api/dev/agent_invoke", dev_agent_invoke)
     app.router.add_post("/api/dev/distill_now", dev_distill_now)
+    app.router.add_post("/api/dev/insight_tick", dev_insight_tick)
     app.router.add_get("/api/trace/stream", trace_stream)
 
     return app
