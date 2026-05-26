@@ -1013,12 +1013,17 @@ class CortexServer:
         ttl_ms: int = 30_000,
     ) -> None:
         from .markdown_runs import to_runs
+        # `options is None` means "no caller preference — use the canonical
+        # approve/modify/kill". An explicit `options=[]` means "info-only card,
+        # no actionable buttons" — must be preserved as empty (don't fall
+        # through to the truthiness default).
+        resolved_options = ["approve", "modify", "kill"] if options is None else options
         await self._emit_glass_frame("card", {
             "cmd_id": cmd_id,
             "title_runs": to_runs(title),
             "body_runs": to_runs(body_md),
             "scroll_total_lines": scroll_total_lines,
-            "options": options or ["approve", "modify", "kill"],
+            "options": resolved_options,
             "ttl_ms": ttl_ms,
         })
 
@@ -1076,9 +1081,13 @@ class CortexServer:
             # decision to voice (not on empty-option info cards).
             if options:
                 await self.emit_mic_open(stream_id=f"modify_{cmd.id}", ttl_ms=30_000)
-        # hud_show → if the peer wants `insight` AND the payload carries
-        # the insight marker, emit a glass `insight`. Otherwise the legacy
-        # frame above is enough.
+        # hud_show fan-out for glass peers:
+        #   - has `_insight_kind` marker + peer accepts `insight` → glass insight
+        #     frame (proactive surface, TTL countdown, no buttons)
+        #   - otherwise + peer accepts `card`                     → glass card
+        #     frame with options=[] (info-only response: user reads the body,
+        #     no approve/modify/kill — fixes P1.6b protocol gap where pure-info
+        #     hud_show responses were dropped on the glass side)
         elif cmd.kind == "hud_show":
             insight_kind = cmd.payload.get("_insight_kind")
             if insight_kind and "insight" in self._glass_accept:
@@ -1086,6 +1095,14 @@ class CortexServer:
                     title=cmd.payload.get("title", ""),
                     body_md=cmd.payload.get("body", ""),
                     insight_kind=insight_kind,
+                    ttl_ms=cmd.ttl_ms,
+                )
+            elif "card" in self._glass_accept:
+                await self.emit_card(
+                    cmd_id=cmd.id,
+                    title=cmd.payload.get("title", ""),
+                    body_md=cmd.payload.get("body", ""),
+                    options=[],  # info-only: caller relies on emit_card preserving []
                     ttl_ms=cmd.ttl_ms,
                 )
 
