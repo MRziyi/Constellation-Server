@@ -140,6 +140,25 @@ def cli(
 
     http_bind = http_host or host
 
+    async def _prewarm_whisper() -> None:
+        """Phase 3b — preload the whisper.cpp model so the first real Glass
+        audio_end doesn't pay the ~3 s model-load tax. Runs in the background;
+        prewarm failures are logged but non-fatal (we may be running on a box
+        without whisper-cli — e.g. CI)."""
+        await asyncio.sleep(2.0)  # let serve() bind first
+        srv = plane.server
+        if srv is None:
+            log.warning("whisper.prewarm.no_server")
+            return
+        whisper = getattr(srv, "_whisper", None)
+        if whisper is None:
+            log.warning("whisper.prewarm.no_whisper_attr")
+            return
+        try:
+            await whisper.prewarm()
+        except Exception as e:
+            log.warning("whisper.prewarm.failed", error=str(e))
+
     async def main() -> None:
         await asyncio.gather(
             serve(
@@ -152,6 +171,7 @@ def cli(
                 plane=plane,
             ),
             serve_http(host=http_bind, port=http_port, plane=plane),
+            _prewarm_whisper(),
         )
 
     asyncio.run(main())

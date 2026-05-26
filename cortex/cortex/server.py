@@ -504,6 +504,18 @@ class CortexServer:
 
         # Parse confirm-policies once at construction; reload on Twin write later (Phase 7).
         self._confirm_policies = _parse_confirm_policies(twin.root)
+
+        # Phase 3b — Glass client support.
+        # Capabilities of the current Glass connection (set in handle_glass);
+        # empty for Console (which uses the existing schema only).
+        self._glass_accept: set[str] = set()
+        # Per-stream PCM buffer for audio_chunk → whisper pipeline.
+        from .audio_buffer import AudioStreamBuffer
+        self._audio_buffer = AudioStreamBuffer()
+        # Whisper pipeline (lazy — actual model load deferred to first use
+        # OR to cortex.main pre-warm call).
+        from .whisper_pipeline import WhisperPipeline
+        self._whisper = WhisperPipeline(model="small")
         log.info(
             "confirm_policies.loaded",
             count=len(self._confirm_policies),
@@ -513,8 +525,27 @@ class CortexServer:
     # ── Glass-side handler ──
 
     async def handle_glass(self, ws: ServerConnection) -> None:
-        log.info("glass.connected", remote=ws.remote_address)
+        # Phase 3b — parse client capabilities from the connect URL query.
+        # Glass declares `?accept=hud_state,card,insight,mic_open,mic_close`
+        # so we know which glass-shaped frames it wants. Console doesn't
+        # pass anything and keeps getting the existing schema.
+        accept_kinds: set[str] = set()
+        try:
+            from urllib.parse import urlparse, parse_qs
+            path = getattr(ws, "request", None)
+            raw_query = ""
+            if path is not None and hasattr(path, "path"):
+                raw_query = urlparse(path.path).query or ""
+            elif hasattr(ws, "path"):
+                raw_query = urlparse(ws.path).query or ""
+            if raw_query:
+                accept_param = parse_qs(raw_query).get("accept", [""])[0]
+                accept_kinds = {k.strip() for k in accept_param.split(",") if k.strip()}
+        except Exception as e:
+            log.warning("glass.capabilities_parse_failed", error=str(e))
+        log.info("glass.connected", remote=ws.remote_address, accept=sorted(accept_kinds))
         self._glass_conn = ws
+        self._glass_accept = accept_kinds
         # P2.3 — surface any pending startup card (e.g. TCC denials caught
         # before Glass was online). One-shot; clear after delivery.
         pending_startup = getattr(self, "_pending_startup_card", None)
@@ -570,6 +601,13 @@ class CortexServer:
         elif event.kind == "progress_feedback":
             # Glass-side user input within an agent's progress feedback window
             await self._handle_progress_feedback(event)
+        # Phase 3b — Glass client events (audio + voice-fired decision)
+        elif event.kind == "audio_chunk":
+            await self._handle_audio_chunk(event)
+        elif event.kind == "audio_end":
+            await self._handle_audio_end(event)
+        elif event.kind == "decision_voice":
+            await self._handle_decision_voice(event)
         else:
             log.warning("unsupported_event_kind", kind=event.kind)
 
@@ -682,6 +720,17 @@ class CortexServer:
         except Exception as e:
             log.warning("local_progress.send_failed", error=str(e))
 
+        # Phase 3b — if peer accepts hud_state, also emit the styled-runs
+        # flavor. Console drops it (didn't accept); Glass renders into a
+        # single replace-in-place row (per design §1.3).
+        if "hud_state" in self._glass_accept:
+            await self.emit_hud_state(
+                stage=stage,
+                icon=icon,
+                detail_runs=[{"text": detail or "", "style": "normal"}],
+                meta_runs=[],
+            )
+
     async def _handle_progress_feedback(self, event: Event) -> None:
         """User typed/spoke something during a progress window. If substantive,
         inject into the active CC tmux session via send-keys. Else drop."""
@@ -729,6 +778,255 @@ class CortexServer:
                 }, ensure_ascii=False))
         except Exception as e:
             log.error("progress_feedback.inject_failed", error=str(e), exc_info=True)
+
+    # ── Phase 3b: Glass client — audio + voice-fired decisions ─────────────
+
+    async def _handle_audio_chunk(self, event: Event) -> None:
+        """Append a base64 PCM frame to the per-stream buffer."""
+        p = event.payload or {}
+        sid = (p.get("stream_id") or "").strip()
+        if not sid:
+            log.warning("audio_chunk.no_stream_id")
+            return
+        self._audio_buffer.on_chunk(
+            stream_id=sid,
+            seq=int(p.get("seq") or 0),
+            b64_pcm=p.get("b64_pcm") or "",
+            sample_rate=int(p.get("sample_rate") or 16000),
+            channels=int(p.get("channels") or 1),
+        )
+
+    async def _handle_audio_end(self, event: Event) -> None:
+        """Finalize a stream: pop its PCM, run Whisper, inject the transcript
+        into the existing classifier pipeline as either a fresh user_invoke
+        OR a user_decision.feedback_text (when in CARD modify flow)."""
+        p = event.payload or {}
+        sid = (p.get("stream_id") or "").strip()
+        if not sid:
+            log.warning("audio_end.no_stream_id")
+            return
+        entry = self._audio_buffer.finalize(sid)
+        if entry is None or len(entry.buffer) == 0:
+            log.warning("audio_end.no_buffer", stream_id=sid)
+            return
+
+        lang_hint = (p.get("lang_hint") or "auto").lower()
+        intent = (p.get("intent") or "fresh").lower()
+        cmd_id = p.get("cmd_id")
+        session_id = p.get("session_id")
+
+        # Bridge: announce we're transcribing (Glass keeps HUD in THINKING
+        # while we crunch). Reuses the existing progress channel.
+        if self._glass_conn:
+            try:
+                await self._glass_conn.send(json.dumps({
+                    "id": f"prog_{ids.event_id()[4:]}",
+                    "kind": "progress",
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "stage": "transcribing", "icon": "📝",
+                    "detail": f"whisper.cpp · {len(entry.buffer)//1024} kB",
+                    "session_id": session_id,
+                }, ensure_ascii=False))
+            except Exception:
+                pass
+
+        try:
+            transcript = await self._whisper.transcribe(
+                bytes(entry.buffer),
+                sample_rate=entry.sample_rate,
+                channels=entry.channels,
+                lang=lang_hint if lang_hint in ("zh", "en") else "auto",
+            )
+        except Exception as e:
+            log.error("audio_end.transcribe_failed", error=str(e), exc_info=True)
+            return
+
+        log.info("audio_end.transcript",
+                 stream_id=sid, n_chars=len(transcript), intent=intent)
+
+        if not transcript.strip():
+            log.info("audio_end.empty_transcript")
+            return
+
+        if intent == "modify" and cmd_id:
+            # User said "改 …" → treat as user_decision feedback for the
+            # pending card. Synthesize the event the existing handler expects.
+            synth = Event(
+                id=ids.event_id(),
+                kind="user_decision",
+                ts=datetime.now(timezone.utc),
+                payload={
+                    "in_reply_to": cmd_id,
+                    "decision": "Modify",
+                    "feedback_text": transcript,
+                },
+            )
+            await self._handle_user_decision(synth)
+            return
+
+        # Fresh user_invoke (from IDLE wake or first turn).
+        synth = Event(
+            id=ids.event_id(),
+            kind="user_invoke",
+            ts=datetime.now(timezone.utc),
+            payload={"text": transcript, "session_id": session_id},
+        )
+        await self._handle_user_invoke(synth)
+
+    async def _handle_decision_voice(self, event: Event) -> None:
+        """InstructSdk on the Glass fired a keyword for the current CARD.
+        Convert to the existing user_decision shape and route through the
+        existing pipeline so all the receipts / sessions / distiller hooks
+        fire identically."""
+        p = event.payload or {}
+        cmd_id = p.get("cmd_id")
+        command = (p.get("command") or "").strip().lower()
+        if not cmd_id or not command:
+            log.warning("decision_voice.missing_fields", payload=p)
+            return
+        # Map glass commands → existing 3-button vocabulary.
+        # scroll_up / scroll_down are pure HUD ops (we don't forward server-side);
+        # 'continue' is a checkpoint advance which the existing approve-on-
+        # checkpoint path handles cleanly.
+        glass_to_decision = {
+            "approve":     "Approve",
+            "modify":      "Modify",   # NB: Modify-without-text re-surfaces the card
+            "kill":        "Kill",
+            "continue":    "Approve",  # checkpoint advance
+        }
+        decision = glass_to_decision.get(command)
+        if decision is None:
+            log.info("decision_voice.non_decision_command", command=command)
+            return
+        log.info("decision_voice.routed", cmd_id=cmd_id, command=command, decision=decision)
+        synth = Event(
+            id=ids.event_id(),
+            kind="user_decision",
+            ts=datetime.now(timezone.utc),
+            payload={
+                "in_reply_to": cmd_id,
+                "decision": decision,
+                # No feedback_text from voice command — Modify requires a
+                # follow-up audio stream (the Glass opens mic locally).
+            },
+        )
+        await self._handle_user_decision(synth)
+
+    # ── Phase 3b: Glass-shaped command emitters ──────────────────────────
+
+    async def _emit_glass_frame(self, kind: str, payload: dict[str, Any]) -> None:
+        """Generic emit of a glass-shaped command frame. No-op if the current
+        Glass peer didn't declare it in its `?accept=` handshake (i.e., we're
+        currently talking to a Console — keep using the existing schema)."""
+        if not self._glass_conn or kind not in self._glass_accept:
+            return
+        frame = {
+            "id": ids.command_id(),
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "kind": kind,
+            **payload,
+        }
+        try:
+            await self._glass_conn.send(json.dumps(frame, ensure_ascii=False))
+            log.info("glass_frame.emit", kind=kind)
+        except Exception as e:
+            log.warning("glass_frame.emit_failed", kind=kind, error=str(e))
+
+    async def emit_hud_state(
+        self, *, stage: str, icon: str | None = None,
+        detail_runs: list[dict[str, str]] | None = None,
+        meta_runs: list[dict[str, str]] | None = None,
+    ) -> None:
+        await self._emit_glass_frame("hud_state", {
+            "stage": stage,
+            "icon": icon,
+            "detail_runs": detail_runs or [],
+            "meta_runs": meta_runs or [],
+        })
+
+    async def emit_card(
+        self, *, cmd_id: str,
+        title: str, body_md: str,
+        scroll_total_lines: int = 0,
+        options: list[str] | None = None,
+        ttl_ms: int = 30_000,
+    ) -> None:
+        from .markdown_runs import to_runs
+        await self._emit_glass_frame("card", {
+            "cmd_id": cmd_id,
+            "title_runs": to_runs(title),
+            "body_runs": to_runs(body_md),
+            "scroll_total_lines": scroll_total_lines,
+            "options": options or ["approve", "modify", "kill"],
+            "ttl_ms": ttl_ms,
+        })
+
+    async def emit_insight(
+        self, *, title: str, body_md: str, insight_kind: str,
+        ttl_ms: int = 8_000, context_id: str | None = None,
+    ) -> None:
+        from .markdown_runs import to_runs
+        await self._emit_glass_frame("insight", {
+            "title_runs": to_runs(title),
+            "body_runs": to_runs(body_md),
+            "insight_kind": insight_kind,
+            "ttl_ms": ttl_ms,
+            "context_id": context_id,
+        })
+
+    async def emit_mic_open(
+        self, *, stream_id: str, lang_hint: str | None = None,
+        ttl_ms: int | None = None,
+    ) -> None:
+        await self._emit_glass_frame("mic_open", {
+            "stream_id": stream_id,
+            "lang_hint": lang_hint,
+            "ttl_ms": ttl_ms,
+        })
+
+    async def emit_mic_close(self, *, stream_id: str) -> None:
+        await self._emit_glass_frame("mic_close", {"stream_id": stream_id})
+
+    async def _send_command(self, cmd: Command) -> None:
+        """Unified path: send the existing Command to the Glass peer AND,
+        if the peer accepted glass-shaped frames, also emit the styled-runs
+        flavor (card/hud_show → card or insight) + mic_open on CARD entry.
+
+        Use this instead of `self._glass_conn.send(cmd.model_dump_json())`
+        directly so glass-shaped frames stay in sync with the legacy ones."""
+        if not self._glass_conn:
+            return
+        try:
+            await self._glass_conn.send(cmd.model_dump_json())
+        except Exception as e:
+            log.warning("command.send_failed", id=cmd.id, kind=cmd.kind, error=str(e))
+            return
+        # Glass-shaped frame, if the peer wants one.
+        if cmd.kind == "preview_action":
+            options = cmd.payload.get("options") or []
+            await self.emit_card(
+                cmd_id=cmd.id,
+                title=cmd.payload.get("title", ""),
+                body_md=cmd.payload.get("body", ""),
+                options=options,
+                ttl_ms=cmd.ttl_ms,
+            )
+            # Mic auto-opens on CARD entry only when the user has an actionable
+            # decision to voice (not on empty-option info cards).
+            if options:
+                await self.emit_mic_open(stream_id=f"modify_{cmd.id}", ttl_ms=30_000)
+        # hud_show → if the peer wants `insight` AND the payload carries
+        # the insight marker, emit a glass `insight`. Otherwise the legacy
+        # frame above is enough.
+        elif cmd.kind == "hud_show":
+            insight_kind = cmd.payload.get("_insight_kind")
+            if insight_kind and "insight" in self._glass_accept:
+                await self.emit_insight(
+                    title=cmd.payload.get("title", ""),
+                    body_md=cmd.payload.get("body", ""),
+                    insight_kind=insight_kind,
+                    ttl_ms=cmd.ttl_ms,
+                )
 
     # ── P0.1: HUD-session-scoped CC tmux registry ─────────────────────────
     # TTL: a tmux idle for more than this is considered stale and gets
@@ -1082,8 +1380,7 @@ class CortexServer:
                     cmd_id=cmd.id, cmd_kind="preview_action", is_checkpoint=True,
                     title=cmd.payload["title"], body_excerpt=cmd.payload["body"][:400],
                 )
-            if self._glass_conn:
-                await self._glass_conn.send(cmd.model_dump_json())
+            await self._send_command(cmd)
             return
 
         # FINAL
@@ -1137,8 +1434,7 @@ class CortexServer:
                 title=cmd.payload["title"], body_excerpt=cmd.payload["body"][:400],
                 n_actions=len(subtasks),
             )
-        if self._glass_conn:
-            await self._glass_conn.send(cmd.model_dump_json())
+        await self._send_command(cmd)
 
     async def _dispatch_complex_agent(
         self,
@@ -1437,8 +1733,7 @@ class CortexServer:
             "wake_response_map": wake_response_map,
             "wake_session_id": session_id,
         }
-        if self._glass_conn:
-            await self._glass_conn.send(cmd.model_dump_json())
+        await self._send_command(cmd)
         log.info("command.sent", id=cmd.id, kind=cmd.kind, source="reverse_wake")
 
         # If there's no actionable choice (e.g. completion_notice), this is a one-shot
@@ -1597,8 +1892,7 @@ class CortexServer:
                 body_excerpt=(cmd.payload.get("body") or "")[:400],
                 primary_intent=plan.get("primary_intent"),
             )
-        if self._glass_conn:
-            await self._glass_conn.send(cmd.model_dump_json())
+        await self._send_command(cmd)
         log.info("command.sent", id=cmd.id, kind=cmd.kind)
 
         # hud_show = "done already, just informing"; no user gate, write receipt now.
@@ -2003,8 +2297,7 @@ class CortexServer:
                 primary_intent=next_plan.get("primary_intent"),
                 from_replan=True,
             )
-        if self._glass_conn:
-            await self._glass_conn.send(cmd.model_dump_json())
+        await self._send_command(cmd)
         log.info("command.sent", id=cmd.id, kind=cmd.kind, from_replan=True)
 
         # hud_show = no user gate; write receipt now. (No auto-advance —

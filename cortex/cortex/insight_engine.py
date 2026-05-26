@@ -161,6 +161,18 @@ class InsightEngine:
         except Exception as e:
             log.warning("insight.send_failed", error=str(e))
 
+        # Phase 3b — also emit glass-shaped `insight` frame (no-op if peer
+        # didn't declare acceptance). Glass uses ttl_ms to auto-close.
+        try:
+            await self.server.emit_insight(
+                title=ins.title,
+                body_md=ins.body,
+                insight_kind=ins.kind,
+                ttl_ms=int(ins.cooldown.total_seconds() * 1000) if ins.cooldown else 8000,
+            )
+        except Exception as e:
+            log.warning("insight.glass_emit_failed", error=str(e))
+
 
 # ── Default providers ────────────────────────────────────────────────────
 
