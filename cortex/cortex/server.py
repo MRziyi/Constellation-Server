@@ -277,6 +277,14 @@ class ResumeFailed(Exception):
 # Kill    = abandon: kill any agent tmux + drop pending + log a kill signal.
 _THREE_OPTIONS = ["Approve", "Modify", "Kill"]
 
+# Q.4.5 / C-47: tools that opt into receiving event.payload.image as
+# `_image_b64` in their args. The router decides per-prompt whether to route
+# to one of these (text-prompt-based, NEVER inspects image content). Other
+# tools never see the image even when one is attached — that's the
+# "default-off" guarantee Zack asked for (image is a passthrough, not a
+# broadcast). Extend this set when new vision tools land (OCR, face-id, etc.).
+_VISION_AWARE_TOOLS: set[str] = {"vision_describe"}
+
 _APPROVE_BUTTON_TOKENS = {
     # English
     "approve", "send", "send all", "continue", "ok", "yes", "go", "go ahead",
@@ -1944,6 +1952,14 @@ class CortexServer:
         #   - preview_action: dispatch draft/query now (for preview); defer execute to SEND.
         #   - hud_show:       confirm-policy says auto. Dispatch ALL subtasks now so the
         #                     hud_show body can reflect real results; receipt written immediately.
+        #
+        # Q.4.5 / C-47: image bytes flow ONLY to tools the router explicitly
+        # routed to that are declared vision-aware (see _VISION_AWARE_TOOLS).
+        # Default = image goes nowhere; router has to opt in by routing to a
+        # vision-capable tool based on the text prompt. The dispatcher itself
+        # never decodes/inspects the image — it just hands the opaque bytes to
+        # the selected vision tool's args.
+        image_b64 = (event.payload or {}).get("image")
         subtask_results: list[dict[str, Any]] = []
         for i, st in enumerate(plan["subtasks"]):
             if st["result_format"] in ("draft", "query") or hud_kind == "hud_show":
@@ -1954,6 +1970,8 @@ class CortexServer:
                 )
                 # Re-interpolate args (subtask N may reference N-1's result)
                 args = self._interpolate_args(st.get("args", {}), subtask_results, plan=plan)
+                if image_b64 and st["tool"] in _VISION_AWARE_TOOLS:
+                    args = {**args, "_image_b64": image_b64}
                 rpc_result = await self._dispatch_to_tool({**st, "args": args})
                 subtask_results.append(rpc_result.result)
             else:
