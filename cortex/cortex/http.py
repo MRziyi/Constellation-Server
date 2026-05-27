@@ -92,6 +92,19 @@ def make_app(plane: ControlPlane) -> web.Application:
             "tool_conn": bool(plane.server and plane.server._tool_conn is not None),
         })
 
+    async def ping(_request: web.Request) -> web.Response:
+        """Lightweight liveness probe for the in-app TEST CONNECTION button
+        (P-app.A D7). Doesn't touch the router / dispatcher / LLM cache —
+        just confirms the HTTP server + the tool_agent socket are alive.
+        Returns the same shape as /api/health minus the stats block (which
+        the in-app UI doesn't need for a single click)."""
+        return _json({
+            "ok": True,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "server_bound": bool(plane.server and plane.server._glass_conn is not None),
+            "tool_conn": bool(plane.server and plane.server._tool_conn is not None),
+        })
+
     # ── claude_code (priority surfaces) ──
     async def cc_sessions(_request: web.Request) -> web.Response:
         if plane.server is None:
@@ -655,6 +668,8 @@ def make_app(plane: ControlPlane) -> web.Application:
 
     # ── route table ──
     app.router.add_get("/api/health", health)
+    app.router.add_post("/api/ping", ping)
+    app.router.add_get("/api/ping", ping)  # support both — clients may use either verb
     app.router.add_get("/api/sessions", sessions_list)
     app.router.add_get("/api/sessions/{session_id}", session_detail)
     app.router.add_get("/api/cc-archive", cc_archive_list)
