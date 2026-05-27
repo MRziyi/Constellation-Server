@@ -60,6 +60,11 @@ complex = false WHEN it's a SINGLE explicit step:
   - bounded message: "send 'on my way' to Mike" (recipient + content both given)
   - pure state query: "battery?", "what time?", "focus mode?", "current tab?"
   - bounded file write: "write 'X' to /tmp/y.txt"
+  - **photo-bearing vision ask**: when "Note: photo attached." is present AND
+    the ask is vision-shaped (describe / identify / read / what's-in-front /
+    who-is-this / OCR / etc.) → the direct path has a `vision_describe`
+    adapter that handles this as a single bounded call. Do NOT route to the
+    agent path for these — CC is text-only and can't see images.
 
 When ambiguous, prefer complex=true — the agent path can degrade to a single
 action; the direct path can't escalate to research.

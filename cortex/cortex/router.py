@@ -487,6 +487,23 @@ AVAILABLE_TOOLS: dict[str, dict[str, str]] = {
             "planner doesn't emit them.)"
         ),
     },
+    "vision_describe": {
+        "actions": "describe",
+        "description": (
+            "Vision-aware image description / identification / OCR / 'what's in front'. "
+            "describe(prompt). Pick ONLY when the ask line ends with '(photo attached)' "
+            "AND the prompt is vision-shaped: describe / identify / read / what's-in-front "
+            "/ who-is-this / what-does-X-say / OCR. Single-call bounded query. "
+            "DO NOT pick when no '(photo attached)' tag is present — even if the prompt "
+            "mentions an image, the photo isn't there. DO NOT pick for non-vision asks "
+            "(mail / reminders / search) even when a photo is attached — the photo is "
+            "incidental in those cases. Cortex's dispatcher gates image passthrough on "
+            "this tool's name; routing here is the ONLY way image bytes reach any tool. "
+            "RESULT SHAPE: returns {description: str, model: str, tokens: {...}, had_image: bool} "
+            "— the body_template should be exactly `{{subtasks[i].result.description}}` "
+            "so the visible card body is just the clean prose, not the JSON wrapper."
+        ),
+    },
 }
 
 

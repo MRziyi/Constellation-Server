@@ -76,10 +76,17 @@ async def _describe(prompt: str, image_b64: str, *, model: str) -> dict[str, Any
     try:
         from openai import AsyncOpenAI
         client = AsyncOpenAI()
+        # gpt-5.x uses `max_completion_tokens`; older gpt-4.x uses `max_tokens`.
+        # Probe by model name to avoid runtime API errors on either family.
+        token_kwarg = (
+            {"max_completion_tokens": DEFAULT_MAX_TOKENS}
+            if model.startswith("gpt-5") or model.startswith("o")
+            else {"max_tokens": DEFAULT_MAX_TOKENS}
+        )
         resp = await client.chat.completions.create(
             model=model,
             messages=messages,
-            max_tokens=DEFAULT_MAX_TOKENS,
+            **token_kwarg,
         )
         text = (resp.choices[0].message.content or "").strip()
         usage = resp.usage

@@ -491,6 +491,8 @@ class CortexServer:
                 "imessage",
                 "safari_state",
                 "claude_code",
+                "vision_describe",  # Q.4.5 — receives image bytes only when
+                                    # router selects it (gated by _VISION_AWARE_TOOLS)
             }
         )
 
