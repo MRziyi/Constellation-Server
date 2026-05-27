@@ -285,6 +285,39 @@ _THREE_OPTIONS = ["Approve", "Modify", "Kill"]
 # broadcast). Extend this set when new vision tools land (OCR, face-id, etc.).
 _VISION_AWARE_TOOLS: set[str] = {"vision_describe"}
 
+# R-13 / C-55: regex heuristic for "user's text looks like a visual question".
+# Used by _handle_user_invoke to decide whether to pre-pull a scene capture
+# from glass before classification. Intentionally generous on both English
+# and Chinese — false positives waste a single capture (~70 KB / ~1.5s),
+# false negatives just yield text-only answers. Both acceptable.
+_VISUAL_INTENT_PATTERNS = [
+    # English: what/which/can-you-see/describe/read/recognize + reference to
+    # something in front of / on the desk / in the picture
+    re.compile(
+        r"\b(what(?:'s| is)?|describe|read|recognize|identify|see|look at|tell me about)\b"
+        r".*\b(this|that|these|those|here|there|in front|on (?:the|my) (?:desk|table|screen|wall|monitor)|"
+        r"the (?:screen|monitor|image|picture|photo|sign|text|object|thing|menu|page|document))\b",
+        re.IGNORECASE,
+    ),
+    # English: explicit "what's in front" / "what do you see"
+    re.compile(r"\b(what'?s in front|what do you see|what am i looking at)\b", re.IGNORECASE),
+    # Chinese: 看 (see/look) / 这是什么 / 那是什么 / 前面 / 屏幕
+    re.compile(r"(看一?下|这是什么|那是什么|前面|这个是|那个是|屏幕上)"),
+]
+
+
+def _looks_visual_intent(text: str) -> bool:
+    """True iff the user's text reads like a visual question that would
+    benefit from a scene capture. Used to gate the C-55 upfront image pull.
+    Conservative regex; no LLM call."""
+    if not text:
+        return False
+    for pat in _VISUAL_INTENT_PATTERNS:
+        if pat.search(text):
+            return True
+    return False
+
+
 _APPROVE_BUTTON_TOKENS = {
     # English
     "approve", "send", "send all", "continue", "ok", "yes", "go", "go ahead",
@@ -474,6 +507,12 @@ class CortexServer:
         #   value:  {tmux_session, cc_session_id, working_dir, timeout_s,
         #            last_activity (epoch s), last_summary?}
         self._active_hud_session_tmux: dict[str, dict[str, Any]] = {}
+        # R-13 / C-55: server-pull-on-demand vision. When router selects a
+        # vision-aware tool but `event.payload.image` is None, Cortex emits
+        # `request_image` to glass and awaits a matching `image_attached`
+        # event. Future keyed by req_id (server-minted); resolved with the
+        # image b64 string (or None on timeout/empty payload).
+        self._pending_image_requests: dict[str, asyncio.Future[str | None]] = {}
         # cmd_id → { event_id, plan, current_subtask_results, [wake_response_map] }
 
         # Available tools block for Router prompt + validation set.
@@ -628,6 +667,9 @@ class CortexServer:
             await self._handle_audio_end(event)
         elif event.kind == "decision_voice":
             await self._handle_decision_voice(event)
+        # R-13 / C-55: glass replied to a request_image with the captured frame
+        elif event.kind == "image_attached":
+            await self._handle_image_attached(event)
         else:
             log.warning("unsupported_event_kind", kind=event.kind)
 
@@ -1062,6 +1104,74 @@ class CortexServer:
 
     async def emit_mic_close(self, *, stream_id: str) -> None:
         await self._emit_glass_frame("mic_close", {"stream_id": stream_id})
+
+    # ── R-13 / C-55: server-pull-on-demand vision ─────────────────────────
+
+    async def _request_image_from_glass(
+        self, parent_event_id: str, hint: str | None = None,
+        timeout_s: float = 10.0,
+    ) -> str | None:
+        """Ask the current glass peer to capture a photo and send it back.
+        Returns the b64-encoded JPEG string on success, or None on timeout /
+        peer-not-glass / peer-missing-capability.
+
+        Used by `_dispatch_complex_agent` when the router routed to a tool
+        in [_VISION_AWARE_TOOLS] but the originating event had no image.
+        Glass-side handler: `StateMachine.dispatch` `"request_image"` →
+        CameraGate.captureViaGate → `wss.sendEvent(ImageAttached(req_id, b64))`.
+        """
+        # Only meaningful for glass peers that advertised "card" support
+        # (we co-opt the same capability gate — a console peer wouldn't have
+        # a camera anyway).
+        if not self._glass_conn or "card" not in self._glass_accept:
+            return None
+        req_id = ids.command_id()
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[str | None] = loop.create_future()
+        self._pending_image_requests[req_id] = fut
+        payload: dict[str, Any] = {
+            "req_id": req_id,
+            "parent_event_id": parent_event_id,
+        }
+        if hint:
+            payload["hint"] = hint
+        await self._emit_glass_frame("request_image", payload)
+        log.info("request_image.sent", req_id=req_id, parent=parent_event_id, hint=hint)
+        try:
+            return await asyncio.wait_for(fut, timeout=timeout_s)
+        except asyncio.TimeoutError:
+            log.warning(
+                "request_image.timeout",
+                req_id=req_id, parent=parent_event_id, timeout_s=timeout_s,
+            )
+            return None
+        finally:
+            # Always clear from registry — even on success, the future was
+            # set by _handle_image_attached and we're done with this req_id.
+            self._pending_image_requests.pop(req_id, None)
+
+    async def _handle_image_attached(self, event: Event) -> None:
+        """Glass → Cortex `image_attached` arrives. Resolve the matching
+        pending Future so `_request_image_from_glass()` can return."""
+        payload = event.payload or {}
+        req_id = payload.get("req_id")
+        image_b64 = payload.get("image")
+        if not req_id:
+            log.warning("image_attached.no_req_id", event_id=event.id)
+            return
+        fut = self._pending_image_requests.get(req_id)
+        if fut is None or fut.done():
+            log.warning("image_attached.no_pending_or_done", req_id=req_id)
+            return
+        # Empty string is treated as "tried but no usable image" — None signals
+        # the same downstream (fallback to image-less dispatch).
+        result: str | None = image_b64 if image_b64 else None
+        fut.set_result(result)
+        log.info(
+            "image_attached.resolved",
+            req_id=req_id, has_image=bool(result),
+            bytes_b64=len(result) if result else 0,
+        )
 
     async def _send_command(self, cmd: Command) -> None:
         """Unified path: send the existing Command to the Glass peer AND,
@@ -1865,6 +1975,47 @@ class CortexServer:
         from .sessions import current_session_id as _csid
         _csid.set(session_id_for_turn)
 
+        # R-13 / C-55: voice-with-vision detection. If the user's text looks
+        # like a visual question but no image was attached (typical for a
+        # voice-only invoke from glass), pull a scene capture from glass
+        # NOW — before classifier + router. Reason: router refuses to pick
+        # `vision_describe` when no image is in the event ("n_subtasks=0
+        # primary_intent=unsupported"); classifier may correctly flag
+        # "vision intent without photo" but then dispatches to CC which also
+        # can't help. By prefetching, classifier sees has_image=True and
+        # everything downstream just works.
+        #
+        # Heuristic is intentionally simple (regex) — no extra LLM call. False
+        # positives waste a capture (~70KB, ~1.5s); false negatives just mean
+        # the user gets a text-only answer. Both acceptable. Disabled when no
+        # glass peer is connected (lookup needs the WSS) or when the event
+        # already has an image (e.g. came from a photo shortcut).
+        if (
+            ask_text
+            and not payload.get("image")
+            and self._glass_conn
+            and "card" in self._glass_accept
+            and _looks_visual_intent(ask_text)
+        ):
+            log.info("vision.upfront_request_image", event_id=event.id, ask_preview=ask_text[:60])
+            await self._emit_progress_to_glass(
+                parent_event_id=event.id,
+                stage="capturing", icon="📷",
+                detail="capturing scene…",
+            )
+            img = await self._request_image_from_glass(
+                parent_event_id=event.id,
+                hint="scene in front",
+            )
+            if img:
+                event.payload["image"] = img
+                log.info("vision.upfront_image_attached", event_id=event.id, bytes_b64=len(img))
+            else:
+                log.warning(
+                    "vision.upfront_image_unavailable_fallback_textonly",
+                    event_id=event.id,
+                )
+
         # Phase 5c — classify intent first; complex asks bypass the v0.5
         # Router entirely and go straight to the CC agent path. Simple
         # asks (single-step state queries or explicit one-action requests)
@@ -1890,6 +2041,10 @@ class CortexServer:
                         stage="classified", icon="🧭",
                         detail=f"intent: complex → agent — {why}",
                     )
+                    # R-13 / C-55: vision upfront-pull happened before
+                    # classifier (see top of _handle_user_invoke). By the time
+                    # we reach here, event.payload.image is set if the user's
+                    # text looked visual; nothing to do at this layer.
                     await self._dispatch_complex_agent(event)
                     return
                 log.info("intent.simple_via_router", why=decision.get("why"))
@@ -1962,6 +2117,31 @@ class CortexServer:
         # never decodes/inspects the image — it just hands the opaque bytes to
         # the selected vision tool's args.
         image_b64 = (event.payload or {}).get("image")
+        # R-13 / C-55: if the router selected a vision-aware tool but the
+        # originating event had no image attached, ask the glass peer to
+        # capture one now (server-pull-on-demand). One round-trip per turn
+        # regardless of how many vision-aware subtasks the plan has.
+        if not image_b64 and any(
+            st.get("tool") in _VISION_AWARE_TOOLS for st in plan["subtasks"]
+        ):
+            log.info(
+                "vision.request_image",
+                event_id=event.id,
+                tools=[st.get("tool") for st in plan["subtasks"] if st.get("tool") in _VISION_AWARE_TOOLS],
+            )
+            await self._emit_progress_to_glass(
+                parent_event_id=event.id,
+                stage="capturing", icon="📷",
+                detail="capturing scene…",
+            )
+            image_b64 = await self._request_image_from_glass(
+                parent_event_id=event.id,
+                hint="scene in front",
+            )
+            if image_b64:
+                log.info("vision.image_received", event_id=event.id, bytes_b64=len(image_b64))
+            else:
+                log.warning("vision.image_unavailable_fallback_to_textonly", event_id=event.id)
         subtask_results: list[dict[str, Any]] = []
         for i, st in enumerate(plan["subtasks"]):
             if st["result_format"] in ("draft", "query") or hud_kind == "hud_show":

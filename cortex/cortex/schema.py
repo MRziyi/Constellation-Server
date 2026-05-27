@@ -44,6 +44,8 @@ class Event(BaseModel):
         "audio_chunk",         # Glass → Cortex: ~250 ms base64 PCM frame
         "audio_end",           # Glass → Cortex: end of utterance, run STT
         "decision_voice",      # Glass → Cortex: InstructSdk fired for a CARD
+        # R-13 / C-55: server-pull-on-demand vision
+        "image_attached",      # Glass → Cortex: response to a `request_image` frame
     ]
     payload: dict[str, Any]
 
