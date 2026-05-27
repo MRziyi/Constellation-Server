@@ -318,6 +318,34 @@ def _looks_visual_intent(text: str) -> bool:
     return False
 
 
+# R-14 / C-56: derive a short stable session title from the first prompt or
+# summary. Used by the session router LLM to let the user voice-reference
+# past sessions ("the auth refactor one"). 8-word cap, strips trailing
+# punctuation; lowercases nothing — preserves proper nouns.
+def _derive_session_title(text: str) -> str:
+    if not text:
+        return "(untitled)"
+    t = text.strip()
+    # Drop common "instruction prefixes" that aren't part of the topic.
+    for prefix in (
+        "please ", "Please ", "could you ", "Could you ", "can you ", "Can you ",
+        "i want to ", "I want to ", "help me ", "Help me ",
+        "帮我", "请", "麻烦", "我想", "我要",
+    ):
+        if t.startswith(prefix):
+            t = t[len(prefix):]
+            break
+    # Cap at 8 English words OR 16 Chinese characters.
+    words = t.split()
+    if len(words) > 8:
+        t = " ".join(words[:8]) + "…"
+    if len(t) > 60:
+        t = t[:60] + "…"
+    # Strip trailing punctuation.
+    t = t.rstrip("?。.!?,，；;：:")
+    return t or "(untitled)"
+
+
 _APPROVE_BUTTON_TOKENS = {
     # English
     "approve", "send", "send all", "continue", "ok", "yes", "go", "go ahead",
@@ -1236,30 +1264,53 @@ class CortexServer:
     def _hud_tmux_register(
         self, session_id: str | None, agent_result: dict[str, Any],
         *, working_dir: str | None, timeout_s: float,
+        ask_text: str | None = None,
     ) -> None:
         """Stash the (tmux, cc_session_id) so the next invoke in the same
         HUD session can reuse it via agent_continue. Caller must have
-        dispatched the agent with keep_alive_on_final=True."""
+        dispatched the agent with keep_alive_on_final=True.
+
+        R-14: extended metadata used by `_route_session` to disambiguate
+        when the user voice-references "the email one" / "auth refactor".
+        `title` is preserved across turns; `turn_count` increments; other
+        fields refreshed each turn.
+        """
         if not session_id:
             return
         tmux = agent_result.get("tmux_session")
         cc_sid = agent_result.get("session_id")
         if not tmux or not cc_sid:
             return
+        now = time.time()
+        existing = self._active_hud_session_tmux.get(session_id)
+        new_summary = (
+            ((agent_result.get("structured") or {}).get("summary") or "")[:120]
+            if isinstance(agent_result.get("structured"), dict) else ""
+        )
+        # `title` is sticky — derived from the first prompt or summary; subsequent
+        # turns keep the original (so voice references like "the email one" still
+        # match even after many turns of follow-up).
+        if existing and existing.get("title"):
+            title = existing["title"]
+        else:
+            title = _derive_session_title(ask_text or new_summary)
         self._active_hud_session_tmux[session_id] = {
             "tmux_session": tmux,
             "cc_session_id": cc_sid,
             "working_dir": working_dir,
             "timeout_s": float(timeout_s),
-            "last_activity": time.time(),
-            "last_summary": (
-                ((agent_result.get("structured") or {}).get("summary") or "")[:120]
-                if isinstance(agent_result.get("structured"), dict) else ""
-            ),
+            "last_activity": now,
+            "last_summary": new_summary,
+            # ── R-14 additions ──
+            "title": title,
+            "created_at": (existing.get("created_at") if existing else now),
+            "turn_count": (int(existing.get("turn_count", 0)) if existing else 0) + 1,
+            "pinned": bool(existing.get("pinned")) if existing else False,
         }
         log.info(
             "hud_tmux.registered",
             session_id=session_id, tmux=tmux, cc_sid=cc_sid[:8],
+            title=title, turn=self._active_hud_session_tmux[session_id]["turn_count"],
         )
 
     async def _hud_tmux_evict(self, session_id: str, *, reason: str) -> None:
@@ -1295,6 +1346,31 @@ class CortexServer:
             )
             return None
         return entry
+
+    def _gather_active_sessions(self) -> list[dict[str, Any]]:
+        """R-14 / C-56: snapshot of currently-active (non-stale) HUD sessions,
+        sorted most-recent-first. Used by session_router to disambiguate
+        user voice references like "the email one" / "auth refactor".
+
+        Each item has the keys session_router expects: session_id, title,
+        last_summary, last_activity, turn_count, created_at.
+        """
+        now = time.time()
+        out: list[dict[str, Any]] = []
+        for sid, entry in self._active_hud_session_tmux.items():
+            last_activity = float(entry.get("last_activity") or 0)
+            if (now - last_activity) > self._HUD_TMUX_TTL_S:
+                continue  # stale — sweeper will evict on its next pass
+            out.append({
+                "session_id": sid,
+                "title": entry.get("title") or "(untitled)",
+                "last_summary": entry.get("last_summary") or "",
+                "last_activity": last_activity,
+                "turn_count": int(entry.get("turn_count", 0)),
+                "created_at": float(entry.get("created_at") or last_activity),
+            })
+        out.sort(key=lambda s: s["last_activity"], reverse=True)
+        return out
 
     # P0.1 patch — proactive TTL eviction. Without this, a user who fires
     # one invoke then walks away leaves the tmux alive forever (lazy lookup
@@ -1959,6 +2035,54 @@ class CortexServer:
         payload = event.payload or {}
         ask_text = (payload.get("text") or "").strip()
         existing_sid = (payload.get("session_id") or "").strip() or None
+
+        # R-14 / C-56 — voice-addressable session router. Runs BEFORE start_turn
+        # so the routed target dictates which session the turn extends. Short-
+        # circuits when 0 or 1 sessions are active (caller behavior unchanged).
+        # On `decision="continue"` → mutate existing_sid to the routed target;
+        # downstream `_dispatch_complex_agent` then naturally uses agent_continue
+        # via the existing `_hud_tmux_lookup` reuse path.
+        active_sessions = self._gather_active_sessions()
+        if len(active_sessions) >= 2 and ask_text:
+            from .session_router import route_session, HIGH_CONFIDENCE
+            routed = await route_session(
+                text=ask_text,
+                active_sessions=active_sessions,
+                current_session_id=existing_sid,
+                has_image=bool(payload.get("image")),
+            )
+            # Only act on confident continues; "continue" with confidence <
+            # HIGH_CONFIDENCE is logged but doesn't switch sessions (R-14.c
+            # will add a confirmation card path for that band).
+            if routed["decision"] == "continue":
+                target = routed["target_session_id"]
+                if target and target != existing_sid and routed["confidence"] >= HIGH_CONFIDENCE:
+                    title = next((s.get("title") for s in active_sessions
+                                  if s["session_id"] == target), None) or target
+                    log.info(
+                        "session_router.switched",
+                        from_sid=existing_sid, to_sid=target,
+                        title=title, confidence=routed["confidence"],
+                    )
+                    await self._emit_progress_to_glass(
+                        parent_event_id=event.id,
+                        stage="routing", icon="🧭",
+                        detail=f"routing to '{title}'",
+                    )
+                    existing_sid = target
+            elif routed["decision"] == "new" and routed["confidence"] >= HIGH_CONFIDENCE:
+                if existing_sid:
+                    log.info(
+                        "session_router.new",
+                        from_sid=existing_sid, confidence=routed["confidence"],
+                    )
+                    await self._emit_progress_to_glass(
+                        parent_event_id=event.id,
+                        stage="routing", icon="🧭",
+                        detail="starting a new session",
+                    )
+                existing_sid = None  # force start_turn to mint fresh
+
         session_id_for_turn = self.sessions.start_turn(
             existing_session_id=existing_sid,
             event_id=event.id, ask_text=ask_text,
