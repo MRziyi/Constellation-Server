@@ -52,6 +52,11 @@ adapters:
     class: tool_agent.adapters.claude_code.ClaudeCodeAdapter
     enabled: true   # Slice C — uses `claude -p` (no tmux); draft/run/continue/list_sessions
 
+  - name: vision_describe
+    class: tool_agent.adapters.vision_describe.VisionDescribeAdapter
+    enabled: true   # Q.4.5 — vision-aware tool; receives `_image_b64` only when the
+                    # router routes here (gated by cortex._VISION_AWARE_TOOLS allowlist)
+
   # Phase 6:
   # - name: local_face_recognition
   #   class: tool_agent.adapters.face.LocalFaceRecognitionAdapter
