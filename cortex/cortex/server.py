@@ -318,6 +318,45 @@ def _looks_visual_intent(text: str) -> bool:
     return False
 
 
+# R-14.b / C-56: pin/unpin intent detection. Tiny regex on the user's
+# voice-invoke text — when the entire utterance is a pin command, we
+# short-circuit the normal classifier+dispatch flow, flip the session's
+# `pinned` flag, emit a confirmation card, and stop. Pin patterns cover EN
+# + ZH; the test is "is the ENTIRE prompt a pin instruction?" — not "does
+# it contain pin words" (which would false-positive on "pin a reminder
+# about X").
+_PIN_INTENT_PATTERNS = [
+    # English
+    re.compile(r"^\s*(please\s+)?(pin|keep)( this| it| this one| this session)?\.?\s*$", re.IGNORECASE),
+    re.compile(r"^\s*keep( this)? alive\.?\s*$", re.IGNORECASE),
+    re.compile(r"^\s*don'?t (kill|drop|evict) this\.?\s*$", re.IGNORECASE),
+    # Chinese
+    re.compile(r"^\s*(请\s*)?(钉住|留着|保留|别(关|掐|杀)|不要(关|掐|杀))\s*(这个|此|它|这条|这个会话|这个对话|这个 session)?\s*[。.!！]?\s*$"),
+]
+_UNPIN_INTENT_PATTERNS = [
+    re.compile(r"^\s*(please\s+)?unpin( this| it| this one| this session)?\.?\s*$", re.IGNORECASE),
+    re.compile(r"^\s*release( this)?\.?\s*$", re.IGNORECASE),
+    # Chinese
+    re.compile(r"^\s*(取消(钉住|保留)|不(钉|留)了|解除(钉住|保留))\s*(这个|此|它)?\s*[。.!！]?\s*$"),
+]
+
+
+def _looks_pin_intent(text: str) -> bool:
+    """True iff the user's text is the WHOLE pin command (not just contains
+    pin words). False positives would spuriously pin sessions when the user
+    asks to "pin a reminder about X"; the anchored regex prevents that."""
+    if not text:
+        return False
+    return any(p.search(text) for p in _PIN_INTENT_PATTERNS)
+
+
+def _looks_unpin_intent(text: str) -> bool:
+    """True iff the user's text is the WHOLE unpin command."""
+    if not text:
+        return False
+    return any(p.search(text) for p in _UNPIN_INTENT_PATTERNS)
+
+
 # R-14 / C-56: derive a short stable session title from the first prompt or
 # summary. Used by the session router LLM to let the user voice-reference
 # past sessions ("the auth refactor one"). 8-word cap, strips trailing
@@ -1339,6 +1378,8 @@ class CortexServer:
         entry = self._active_hud_session_tmux.get(session_id)
         if not entry:
             return None
+        if entry.get("pinned"):
+            return entry  # pinned → never stale
         if (time.time() - float(entry.get("last_activity") or 0)) > self._HUD_TMUX_TTL_S:
             log.info(
                 "hud_tmux.stale_skipping",
@@ -1346,6 +1387,75 @@ class CortexServer:
             )
             return None
         return entry
+
+    async def _handle_pin_command(
+        self, event: Event, existing_sid: str | None, ask_text: str,
+    ) -> None:
+        """R-14.b: handle whole-utterance voice pin/unpin commands. Short-
+        circuits classifier+dispatch. Emits a brief info-only CARD with the
+        result. If no session is active (or sid not registered), emit a
+        friendly no-op card so the user gets feedback instead of silence.
+
+        Routing for pin/unpin:
+          - If existing_sid is set and live → operate on that session
+          - Else if there's exactly 1 active session → operate on it
+          - Else → emit "no active session" card; no-op
+        """
+        is_pin = _looks_pin_intent(ask_text)  # else: unpin
+        # Resolve target
+        entry = self._active_hud_session_tmux.get(existing_sid) if existing_sid else None
+        if not entry:
+            active = [s for s in self._gather_active_sessions()]
+            if len(active) == 1:
+                target_sid = active[0]["session_id"]
+                entry = self._active_hud_session_tmux.get(target_sid)
+        else:
+            target_sid = existing_sid
+
+        if not entry:
+            # No session to act on — give the user a quick info card so the
+            # voice command doesn't appear to be ignored.
+            await self._emit_info_card(
+                event_id=event.id,
+                title="No active session",
+                body=("No session to pin." if is_pin else "No session to unpin."),
+                ttl_ms=5_000,
+            )
+            return
+
+        title = entry.get("title") or "(untitled)"
+        if is_pin:
+            entry["pinned"] = True
+            log.info("session.pinned", session_id=target_sid, title=title)
+            confirm_title = "📌 Pinned"
+            body = f"'{title}' stays alive until you unpin or kill it."
+        else:
+            entry["pinned"] = False
+            log.info("session.unpinned", session_id=target_sid, title=title)
+            confirm_title = "📌 Unpinned"
+            body = f"'{title}' is back on the 30-min TTL."
+        await self._emit_info_card(
+            event_id=event.id,
+            title=confirm_title,
+            body=body,
+            ttl_ms=5_000,
+        )
+
+    async def _emit_info_card(
+        self, *, event_id: str, title: str, body: str, ttl_ms: int = 5_000,
+    ) -> None:
+        """Lightweight info-only card (no options) used for confirmation
+        feedback. Goes through `emit_card` (with options=[]) so the glass-side
+        info-only TTL + double-click dismiss machinery kicks in (R-13 / C-55
+        Issue 1 fix preserves empty-list passthrough). Falls back to no-op
+        silently when no glass peer is connected."""
+        await self.emit_card(
+            cmd_id=ids.command_id(),
+            title=title,
+            body_md=body,
+            options=[],
+            ttl_ms=ttl_ms,
+        )
 
     def _gather_active_sessions(self) -> list[dict[str, Any]]:
         """R-14 / C-56: snapshot of currently-active (non-stale) HUD sessions,
@@ -1389,12 +1499,19 @@ class CortexServer:
             try:
                 now = time.time()
                 stale: list[str] = []
+                n_pinned_skipped = 0
                 for sid, entry in list(self._active_hud_session_tmux.items()):
+                    if entry.get("pinned"):
+                        n_pinned_skipped += 1
+                        continue  # R-14.b: pinned sessions never auto-evict
                     age = now - float(entry.get("last_activity") or 0)
                     if age > self._HUD_TMUX_TTL_S:
                         stale.append(sid)
-                if stale:
-                    log.info("hud_tmux.sweep", n_stale=len(stale))
+                if stale or n_pinned_skipped:
+                    log.info(
+                        "hud_tmux.sweep",
+                        n_stale=len(stale), n_pinned_skipped=n_pinned_skipped,
+                    )
                 for sid in stale:
                     await self._hud_tmux_evict(sid, reason="ttl_sweeper")
             except Exception as e:
@@ -2035,6 +2152,15 @@ class CortexServer:
         payload = event.payload or {}
         ask_text = (payload.get("text") or "").strip()
         existing_sid = (payload.get("session_id") or "").strip() or None
+
+        # R-14.b / C-56: voice pin/unpin commands. Whole-utterance regex
+        # ("pin this" / "unpin" / "钉住" / "保留" / etc.) — if the entire
+        # prompt is a pin command, flip the flag + emit a one-line confirmation
+        # card, short-circuit. This is per-session (operates on the user's
+        # current HUD session); needs no classifier or router round-trip.
+        if ask_text and (_looks_pin_intent(ask_text) or _looks_unpin_intent(ask_text)):
+            await self._handle_pin_command(event, existing_sid, ask_text)
+            return
 
         # R-14 / C-56 — voice-addressable session router. Runs BEFORE start_turn
         # so the routed target dictates which session the turn extends. Short-
