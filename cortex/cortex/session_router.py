@@ -55,13 +55,22 @@ HIGH_CONFIDENCE = 0.7
 
 
 SYSTEM_PROMPT = """\
-You're Cortex's session router. Single job: given a new user prompt and a list
-of currently-active CC sessions, decide which session the prompt belongs to OR
-whether to create a new one.
+You're Cortex's session router. Two jobs:
 
-Output JSON ONLY: {"decision": "continue"|"new", "target_session_id": "ses_..."|null, "confidence": 0.0-1.0, "why": "≤15 words"}
+(1) ROUTING — given a new user prompt and a list of currently-active CC sessions,
+    decide which session the prompt belongs to OR whether to create a new one.
 
-Rules:
+(2) CROSS-SESSION CONTEXT (R-14.d) — if the prompt asks to USE INFORMATION FROM
+    other session(s) while continuing/starting THIS one, list those OTHER
+    session_ids in `context_from`. Example: a user in session B saying "draft
+    an email using the auth-refactor session's action items" → continue B and
+    set context_from=[<auth-refactor session_id>]. NEVER include the target
+    session in context_from. NEVER use context_from to "do work in" another
+    session — context_from only LENDS context to the chosen target.
+
+Output JSON ONLY: {"decision": "continue"|"new", "target_session_id": "ses_..."|null, "confidence": 0.0-1.0, "why": "≤15 words", "context_from": ["ses_...", ...]}
+
+Routing rules:
 - If the prompt clearly references an existing session's topic (subject overlap,
   pronouns like "the email one"/"that auth refactor"/"那个邮件"/"那个 auth"),
   pick decision="continue" + that session_id. High confidence (0.8-1.0).
@@ -75,6 +84,8 @@ Rules:
   medium confidence (0.5-0.7). The orchestrator may show a confirmation card.
 - When in doubt, prefer "continue" the current session (the caller passes
   current_session_id in the input; weight it heavily).
+- Default `context_from`: empty list `[]`. Only populate when the prompt
+  explicitly cross-references another session.
 
 JSON ONLY. No fence. No prose.
 """
@@ -148,21 +159,30 @@ async def route_session(
                 "target_session_id": current_session_id,
                 "confidence": 0.0,
                 "why": "router invalid shape, defaulting to current",
+                "context_from": [],
             }
         decision = parsed["decision"]
         target = parsed.get("target_session_id") or None
         confidence = float(parsed.get("confidence", 0.0))
         why = str(parsed.get("why", ""))[:80]
+        # R-14.d: cross-session context bleed.
+        active_ids = {s["session_id"] for s in active_sessions}
+        raw_context_from = parsed.get("context_from") or []
+        if not isinstance(raw_context_from, list):
+            raw_context_from = []
+        context_from = [
+            sid for sid in raw_context_from
+            if isinstance(sid, str) and sid in active_ids and sid != target
+        ]
         # Validate target_session_id is in the active set when decision=continue
         if decision == "continue":
-            if not target or target not in {s["session_id"] for s in active_sessions}:
+            if not target or target not in active_ids:
                 log.warning(
                     "session_router.target_not_in_active",
                     target=target,
-                    active=[s["session_id"] for s in active_sessions],
+                    active=list(active_ids),
                 )
-                # Fall back to current
-                target = current_session_id
+                target = current_session_id  # fall back
         else:
             target = None  # "new" implies caller mints
         log.info(
@@ -172,12 +192,14 @@ async def route_session(
             n_active=len(active_sessions),
             current=current_session_id,
             text_preview=text[:60],
+            context_from=context_from,
         )
         return {
             "decision": decision,
             "target_session_id": target,
             "confidence": confidence,
             "why": why,
+            "context_from": context_from,
         }
     except Exception as e:
         log.warning(
@@ -189,4 +211,5 @@ async def route_session(
             "target_session_id": current_session_id,
             "confidence": 0.0,
             "why": f"router error: {e}",
+            "context_from": [],
         }
