@@ -1251,14 +1251,29 @@ class CortexServer:
         flavor (card/hud_show → card or insight) + mic_open on CARD entry.
 
         Use this instead of `self._glass_conn.send(cmd.model_dump_json())`
-        directly so glass-shaped frames stay in sync with the legacy ones."""
+        directly so glass-shaped frames stay in sync with the legacy ones.
+
+        When a glass-shaped frame WILL be emitted below, the legacy Command
+        is suppressed: Glass silent-ignores legacy preview_action / hud_show /
+        tool_card since P1.6c (edfb3ba), so double-emit is pure overhead
+        (~30-40% of CARD traffic). Skipping it on every CARD halves per-card
+        WSS bytes with zero downstream impact. Legacy still goes out for kinds
+        that have no glass-shaped equivalent."""
         if not self._glass_conn:
             return
-        try:
-            await self._glass_conn.send(cmd.model_dump_json())
-        except Exception as e:
-            log.warning("command.send_failed", id=cmd.id, kind=cmd.kind, error=str(e))
-            return
+        # Pre-decide whether a glass-shaped frame will follow.
+        insight_kind = cmd.payload.get("_insight_kind") if cmd.kind == "hud_show" else None
+        will_emit_glass = (
+            (cmd.kind == "preview_action" and "card" in self._glass_accept)
+            or (cmd.kind == "hud_show" and bool(insight_kind) and "insight" in self._glass_accept)
+            or (cmd.kind == "hud_show" and not insight_kind and "card" in self._glass_accept)
+        )
+        if not will_emit_glass:
+            try:
+                await self._glass_conn.send(cmd.model_dump_json())
+            except Exception as e:
+                log.warning("command.send_failed", id=cmd.id, kind=cmd.kind, error=str(e))
+                return
         # Glass-shaped frame, if the peer wants one.
         if cmd.kind == "preview_action":
             options = cmd.payload.get("options") or []
