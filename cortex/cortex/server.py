@@ -1392,7 +1392,11 @@ class CortexServer:
             log.warning("hud_tmux.kill_failed", error=str(e), tmux=tmux)
 
     def _hud_tmux_lookup(self, session_id: str | None) -> dict[str, Any] | None:
-        """Return the fresh entry, or None if absent / stale."""
+        """Return the fresh entry, or None if absent / stale.
+
+        R-14.b: pinned sessions skip the TTL stale check — they live until
+        explicitly unpinned or Kill'd.
+        """
         if not session_id:
             return None
         entry = self._active_hud_session_tmux.get(session_id)
