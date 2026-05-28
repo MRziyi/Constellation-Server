@@ -342,13 +342,19 @@ def make_app(plane: ControlPlane) -> web.Application:
         body = await request.json()
         text = body.get("text", "")
         image = body.get("image")  # base64 if provided
+        session_id = body.get("session_id")  # P1.9 / R-14: route to specific session for testing
         if not text and not image:
             return _err("text or image required")
+        payload = {"text": text}
+        if image:
+            payload["image"] = image
+        if session_id:
+            payload["session_id"] = session_id
         event = Event(
             id=ids.event_id(),
             kind="user_invoke",
             ts=datetime.now(timezone.utc),
-            payload={"text": text, **({"image": image} if image else {})},
+            payload=payload,
         )
         # Fire-and-return: pipeline runs async, console watches /api/trace/stream
         asyncio.create_task(plane.server._process_event(event))
