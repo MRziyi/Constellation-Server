@@ -574,6 +574,11 @@ class CortexServer:
         #   value:  {tmux_session, cc_session_id, working_dir, timeout_s,
         #            last_activity (epoch s), last_summary?}
         self._active_hud_session_tmux: dict[str, dict[str, Any]] = {}
+        # R-14.c: pending session-route confirmation cards. cmd_id → original
+        # event payload + chosen candidate. Drained by `_handle_user_decision`
+        # before normal preview lookup. Map cleared on approve / kill / modify
+        # (also on 60s TTL via _pending_previews TTL machinery if applicable).
+        self._pending_session_routes: dict[str, dict[str, Any]] = {}
         # R-13 / C-55: server-pull-on-demand vision. When router selects a
         # vision-aware tool but `event.payload.image` is None, Cortex emits
         # `request_image` to glass and awaits a matching `image_attached`
@@ -1457,6 +1462,83 @@ class CortexServer:
             ttl_ms=ttl_ms,
         )
 
+    async def _emit_session_route_confirmation(
+        self, *, event: Event, candidate_session_id: str,
+        candidate_title: str, candidate_summary: str, confidence: float,
+    ) -> None:
+        """R-14.c: when session_router decides "continue" with medium
+        confidence (0.4-0.7), ask the user via an actionable CARD whether
+        to switch into the candidate session. Approve → route there;
+        Modify → for v1 same as Kill (start new); Kill → start new.
+
+        The original event is held in `_pending_session_routes[cmd_id]` until
+        the user's decision arrives, then re-injected via `_handle_user_invoke`
+        with `_skip_session_router=True` so the router doesn't loop.
+        """
+        cmd_id = ids.command_id()
+        body = (
+            f"Continue '{candidate_title}'?\n"
+            + (f"  ↪ {candidate_summary[:80]}\n" if candidate_summary else "")
+            + "\nClick=yes  ·  Long=clarify  ·  Double=new session"
+        )
+        # Save the original event so we can re-inject it after the user picks.
+        # Copy payload because we'll mutate it on re-injection.
+        self._pending_session_routes[cmd_id] = {
+            "event_id": event.id,
+            "original_payload": dict(event.payload or {}),
+            "candidate_session_id": candidate_session_id,
+            "candidate_title": candidate_title,
+            "confidence": confidence,
+            "ts": time.time(),
+        }
+        await self.emit_card(
+            cmd_id=cmd_id,
+            title="🧭 Continue this session?",
+            body_md=body,
+            options=["approve", "modify", "kill"],
+            ttl_ms=30_000,
+        )
+        log.info(
+            "session_router.confirmation_card.emitted",
+            cmd_id=cmd_id, candidate=candidate_session_id,
+            title=candidate_title, confidence=confidence,
+        )
+
+    async def _resolve_session_route_decision(
+        self, route: dict[str, Any], decision_kind: str,
+    ) -> None:
+        """R-14.c: user picked from the session-route confirmation card.
+        Re-injects the original user_invoke event with the chosen
+        session_id pre-set and `_skip_session_router=True` so we don't loop.
+        - approve → use route["candidate_session_id"]
+        - kill    → use None (start new)
+        - modify  → v1: same as kill (start new). TODO: re-run router with
+                    this candidate excluded, or accept new voice input.
+        """
+        new_payload = dict(route["original_payload"])
+        if decision_kind == "approve":
+            new_payload["session_id"] = route["candidate_session_id"]
+            log.info(
+                "session_router.confirmed",
+                candidate=route["candidate_session_id"],
+                title=route.get("candidate_title"),
+            )
+        else:  # kill or modify
+            new_payload.pop("session_id", None)
+            log.info(
+                "session_router.declined",
+                decision=decision_kind,
+                candidate=route["candidate_session_id"],
+            )
+        new_payload["_skip_session_router"] = True
+        new_event = Event(
+            id=ids.event_id(),
+            kind="user_invoke",
+            ts=datetime.now(timezone.utc),
+            payload=new_payload,
+        )
+        await self._handle_user_invoke(new_event)
+
     def _gather_active_sessions(self) -> list[dict[str, Any]]:
         """R-14 / C-56: snapshot of currently-active (non-stale) HUD sessions,
         sorted most-recent-first. Used by session_router to disambiguate
@@ -1514,6 +1596,16 @@ class CortexServer:
                     )
                 for sid in stale:
                     await self._hud_tmux_evict(sid, reason="ttl_sweeper")
+                # R-14.c: drop confirmation-card entries the user never decided
+                # on. Card TTL is 30s; 2× that gives safe margin before reclaim.
+                stale_routes = [
+                    cid for cid, r in self._pending_session_routes.items()
+                    if (now - float(r.get("ts") or 0)) > 60.0
+                ]
+                for cid in stale_routes:
+                    self._pending_session_routes.pop(cid, None)
+                if stale_routes:
+                    log.info("pending_session_routes.swept", n=len(stale_routes))
             except Exception as e:
                 log.warning("hud_tmux.sweep_failed", error=str(e), exc_info=True)
 
@@ -2168,8 +2260,13 @@ class CortexServer:
         # On `decision="continue"` → mutate existing_sid to the routed target;
         # downstream `_dispatch_complex_agent` then naturally uses agent_continue
         # via the existing `_hud_tmux_lookup` reuse path.
+        #
+        # R-14.c: when re-injected from a confirmation-card decision, the
+        # event carries `_skip_session_router=True` so we don't loop on the
+        # second pass.
         active_sessions = self._gather_active_sessions()
-        if len(active_sessions) >= 2 and ask_text:
+        skip_router = bool(payload.pop("_skip_session_router", False))
+        if not skip_router and len(active_sessions) >= 2 and ask_text:
             from .session_router import route_session, HIGH_CONFIDENCE
             routed = await route_session(
                 text=ask_text,
@@ -2177,30 +2274,32 @@ class CortexServer:
                 current_session_id=existing_sid,
                 has_image=bool(payload.get("image")),
             )
-            # Only act on confident continues; "continue" with confidence <
-            # HIGH_CONFIDENCE is logged but doesn't switch sessions (R-14.c
-            # will add a confirmation card path for that band).
-            if routed["decision"] == "continue":
-                target = routed["target_session_id"]
-                if target and target != existing_sid and routed["confidence"] >= HIGH_CONFIDENCE:
-                    title = next((s.get("title") for s in active_sessions
-                                  if s["session_id"] == target), None) or target
-                    log.info(
-                        "session_router.switched",
-                        from_sid=existing_sid, to_sid=target,
-                        title=title, confidence=routed["confidence"],
-                    )
-                    await self._emit_progress_to_glass(
-                        parent_event_id=event.id,
-                        stage="routing", icon="🧭",
-                        detail=f"routing to '{title}'",
-                    )
-                    existing_sid = target
-            elif routed["decision"] == "new" and routed["confidence"] >= HIGH_CONFIDENCE:
+            MID_CONFIDENCE_FLOOR = 0.4
+            decision = routed["decision"]
+            confidence = routed["confidence"]
+            target = routed["target_session_id"]
+
+            if decision == "continue" and target and target != existing_sid \
+                    and confidence >= HIGH_CONFIDENCE:
+                # High-confidence continue → silently route
+                title = next((s.get("title") for s in active_sessions
+                              if s["session_id"] == target), None) or target
+                log.info(
+                    "session_router.switched",
+                    from_sid=existing_sid, to_sid=target,
+                    title=title, confidence=confidence,
+                )
+                await self._emit_progress_to_glass(
+                    parent_event_id=event.id,
+                    stage="routing", icon="🧭",
+                    detail=f"routing to '{title}'",
+                )
+                existing_sid = target
+            elif decision == "new" and confidence >= HIGH_CONFIDENCE:
                 if existing_sid:
                     log.info(
                         "session_router.new",
-                        from_sid=existing_sid, confidence=routed["confidence"],
+                        from_sid=existing_sid, confidence=confidence,
                     )
                     await self._emit_progress_to_glass(
                         parent_event_id=event.id,
@@ -2208,6 +2307,29 @@ class CortexServer:
                         detail="starting a new session",
                     )
                 existing_sid = None  # force start_turn to mint fresh
+            elif decision == "continue" and target \
+                    and MID_CONFIDENCE_FLOOR <= confidence < HIGH_CONFIDENCE:
+                # R-14.c: medium confidence → ask the user via a confirmation
+                # CARD (approve / modify / kill). The event is re-injected on
+                # the user's decision (with _skip_session_router=True so we
+                # don't loop).
+                title = next((s.get("title") for s in active_sessions
+                              if s["session_id"] == target), None) or target
+                summary = next((s.get("last_summary") for s in active_sessions
+                                if s["session_id"] == target), None) or ""
+                log.info(
+                    "session_router.confirm",
+                    candidate=target, title=title,
+                    confidence=confidence, why=routed.get("why"),
+                )
+                await self._emit_session_route_confirmation(
+                    event=event,
+                    candidate_session_id=target,
+                    candidate_title=title,
+                    candidate_summary=summary,
+                    confidence=confidence,
+                )
+                return  # wait for user_decision before dispatching
 
         session_id_for_turn = self.sessions.start_turn(
             existing_session_id=existing_sid,
@@ -2526,6 +2648,22 @@ class CortexServer:
         cmd_id = event.payload.get("in_reply_to")
         feedback_text = event.payload.get("feedback_text")
         log.info("user_decision.received", decision=decision, cmd_id=cmd_id, has_feedback=bool(feedback_text))
+
+        # R-14.c: drain session-route confirmation cards FIRST. The cmd_id
+        # would match an entry we stashed in `_pending_session_routes` when
+        # the router decided "continue" with medium confidence. On any of the
+        # standard 3 outcomes (approve/modify/kill), we re-inject the original
+        # user_invoke event with the chosen session_id so the rest of the
+        # pipeline runs normally.
+        session_route = self._pending_session_routes.pop(cmd_id, None)
+        if session_route:
+            kind, _resolved_text = _classify_user_decision(decision, feedback_text)
+            log.info(
+                "session_router.decision_received",
+                cmd_id=cmd_id, kind=kind, candidate=session_route.get("candidate_session_id"),
+            )
+            await self._resolve_session_route_decision(session_route, kind)
+            return
 
         # Peek (don't pop yet) — we may need to re-register if Modify lacks text.
         pending = self._pending_previews.get(cmd_id)
