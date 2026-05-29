@@ -345,6 +345,36 @@ def _vision_detail_for(text: str) -> str:
     return "low"
 
 
+# Per-conversation permission mode (Zack 2026-05-30). The agent's CC permission
+# mode is decided from the CREATING utterance and sticks for the conversation:
+#   - explicit "auto-run everything / I approve, just go" → bypassPermissions
+#     (CC runs every tool with no prompt).
+#   - default, or "I need to verify this" → acceptEdits ("edit mode"): CC
+#     auto-accepts file edits but PROMPTS for Bash/exec/other — and those prompts
+#     surface to Zack as checkpoint cards (Piece 2). Answer-needs (AskUserQuestion)
+#     surface as question cards (Piece 3).
+_AUTO_RUN_PATTERNS = [
+    re.compile(
+        r"(全自动|都自动|自动跑|全部(自动|批准|放行|跑)|都(批准|放行)|不用(问|确认)我?|"
+        r"无需确认|不用经过我|放手去做|你看着办|随便你|"
+        r"auto[-\s]?(run|approve|pilot|execute)|run\s+everything|"
+        r"don'?t\s+ask|no\s+confirm|without\s+asking|just\s+do\s+it|yolo)",
+        re.IGNORECASE,
+    ),
+]
+
+
+def _permission_mode_for(text: str) -> str:
+    """Decide the CC permission mode for a fresh conversation from its first
+    utterance. Explicit auto-run → 'bypassPermissions'; otherwise 'acceptEdits'
+    (the default 'edit mode' — prompts for non-edit tools, which become cards)."""
+    if text:
+        for p in _AUTO_RUN_PATTERNS:
+            if p.search(text):
+                return "bypassPermissions"
+    return "acceptEdits"
+
+
 _TWIN_MEMO_ASSETS = os.path.expanduser("~/constellation/twin/memos/assets")
 
 
@@ -2370,13 +2400,21 @@ class CortexServer:
             detail=f"agent brief assembled ({len(brief)} chars)",
         )
 
+        # Per-conversation permission mode (decided from the creating utterance;
+        # see _permission_mode_for). acceptEdits by default → CC prompts for
+        # non-edit tools, surfaced to Zack as cards; bypass only on explicit
+        # "auto-run" opt-in.
+        permission_mode = _permission_mode_for(ask_text)
+        log.info("agent.permission_mode", mode=permission_mode,
+                 ask_preview=ask_text[:50])
+
         # Dispatch the agent action. RPC returns when CC end_turn's
         # (checkpoint or final).
         try:
             await self._emit_progress_to_glass(
                 parent_event_id=event.id,
                 stage="dispatching_agent", icon="🤖",
-                detail="dispatching claude_code.agent",
+                detail=f"dispatching agent ({permission_mode})",
             )
             if sid:
                 self.sessions.append(
@@ -2393,6 +2431,7 @@ class CortexServer:
                     "working_dir": working_dir,
                     "parent_event_id": event.id,
                     "timeout_s": timeout_s,
+                    "permission_mode": permission_mode,
                     # P0.1: leave tmux alive so the next turn in this HUD
                     # session can paste into it via agent_continue.
                     "keep_alive_on_final": True,
