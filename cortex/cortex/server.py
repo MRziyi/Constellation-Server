@@ -1284,10 +1284,12 @@ class CortexServer:
                 options=options,
                 ttl_ms=cmd.ttl_ms,
             )
-            # Mic auto-opens on CARD entry only when the user has an actionable
-            # decision to voice (not on empty-option info cards).
-            if options:
-                await self.emit_mic_open(stream_id=f"modify_{cmd.id}", ttl_ms=30_000)
+            # NB: the mic is NOT opened here. Under ring-exclusive control the
+            # mic opens only when the wearer explicitly asks to Modify (ring
+            # LONG_PRESS → user_decision modify-without-text → emit_mic_open in
+            # `_handle_user_decision`). Opening it speculatively on every
+            # actionable card held the mic for 30s per card — wasteful and
+            # against C-37 energy-first.
         # hud_show fan-out for glass peers:
         #   - has `_insight_kind` marker + peer accepts `insight` → glass insight
         #     frame (proactive surface, TTL countdown, no buttons)
@@ -2831,8 +2833,13 @@ class CortexServer:
                     "ts": datetime.now(timezone.utc).isoformat(),
                     "parent_event_id": pending["event"].id,
                     "stage": "modify_needs_text", "icon": "✍️",
-                    "detail": "Modify clicked — please tell me how to change it.",
+                    "detail": "Modify — tell me how to change it.",
                 }, ensure_ascii=False))
+            # Mic opens HERE — only on explicit Modify (ring LONG_PRESS), not
+            # speculatively on card entry. This is the single point where a
+            # card-driven voice capture begins. Glass enforces its own 15s
+            # hard cap (C-37) regardless of this ttl hint.
+            await self.emit_mic_open(stream_id=f"modify_{cmd_id}", ttl_ms=30_000)
             return  # leave the card pending
 
         # ── Multi-phase agent checkpoint: resume CC with the canonical outcome ──
