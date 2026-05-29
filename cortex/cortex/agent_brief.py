@@ -62,6 +62,7 @@ def build_agent_brief(
     ask_text: str,
     now_iso: str | None = None,
     has_photo: bool = False,
+    photo_path: str | None = None,
     twin_slices: dict[str, str] | None = None,
     output_schema: dict[str, Any] | str | None = None,
     available_dirs: list[str] | None = None,
@@ -99,7 +100,13 @@ def build_agent_brief(
     L.append(f'Zack: "{ask_text}"')
     if now_iso:
         L.append(f"NOW: {now_iso}")
-    if has_photo:
+    if photo_path:
+        # UC1: the glasses photo is already on disk under twin/. Tell CC where +
+        # how to embed it so a memo can include the captured poster/whiteboard.
+        L.append(f"PHOTO: a glasses photo is saved at twin/memos/{photo_path}")
+        L.append(f"  → if Zack wants a memo, write it under twin/memos/<slug>.md and")
+        L.append(f"    embed the image with markdown: ![]({photo_path})")
+    elif has_photo:
         L.append("PHOTO: attached (glass camera)")
     L.append("")
 

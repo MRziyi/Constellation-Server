@@ -345,6 +345,37 @@ def _vision_detail_for(text: str) -> str:
     return "low"
 
 
+_TWIN_MEMO_ASSETS = os.path.expanduser("~/constellation/twin/memos/assets")
+
+
+def _persist_image_to_twin(b64: str, tag: str) -> dict[str, str] | None:
+    """UC1: decode a glasses photo (base64 JPEG) onto disk under
+    twin/memos/assets/ so the agent can EMBED it in a memo (a captured poster /
+    whiteboard / etc.). Cortex holds the bytes already, so it writes the file
+    directly — far cheaper than pushing ~130 KB of base64 through the agent
+    brief, and the agent only ever sees a short relative path. Returns
+    {abs, rel_to_memos, bytes} or None on failure."""
+    if not b64:
+        return None
+    import base64 as _b64
+    try:
+        raw = _b64.b64decode(b64)
+    except Exception:
+        return None
+    if not raw:
+        return None
+    try:
+        os.makedirs(_TWIN_MEMO_ASSETS, exist_ok=True)
+        fname = f"img-{tag}.jpg"
+        abs_path = os.path.join(_TWIN_MEMO_ASSETS, fname)
+        with open(abs_path, "wb") as f:
+            f.write(raw)
+    except OSError:
+        return None
+    # Memos live in twin/memos/<name>.md, so a sibling assets/ ref is relative.
+    return {"abs": abs_path, "rel_to_memos": f"assets/{fname}", "bytes": str(len(raw))}
+
+
 # R-14.b / C-56: pin/unpin intent detection. Tiny regex on the user's
 # voice-invoke text — when the entire utterance is a pin command, we
 # short-circuit the normal classifier+dispatch flow, flip the session's
@@ -2290,10 +2321,28 @@ class CortexServer:
                     )
                     return
 
+        # UC1: if a photo rode in with this turn (e.g. a sendPhoto shortcut or a
+        # "save this poster" memo), persist it under twin/ now and hand the agent
+        # the relative path so it can embed the image in a memo. (On-demand
+        # vision pulls happen later in the subtask loop and aren't for memos.)
+        photo_path: str | None = None
+        if payload.get("image"):
+            persisted = _persist_image_to_twin(
+                payload["image"], event.id.replace("evt_", "")[:8])
+            if persisted:
+                photo_path = persisted["rel_to_memos"]
+                log.info("photo.persisted_to_twin", path=persisted["abs"],
+                         bytes=persisted["bytes"])
+                await self._emit_progress_to_glass(
+                    parent_event_id=event.id, stage="photo_saved", icon="🖼",
+                    detail="photo saved to twin",
+                )
+
         brief = build_agent_brief(
             ask_text=ask_text,
             now_iso=datetime.now(timezone.utc).astimezone().isoformat(),
             has_photo=bool(payload.get("image")),
+            photo_path=photo_path,
             twin_slices=twin_slices,
             output_schema=schema_hint,
             available_dirs=add_dirs,
