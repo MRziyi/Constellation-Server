@@ -641,19 +641,29 @@ class ClaudeCodeAdapter:
             return {"pushed": False, "reason": "event_pusher not attached"}
         wake_kind = args.get("wake_kind", "permission_request")
         session_id = args.get("session_id", "cc-test00000")
-        context = args.get("context") or (
-            "I want to run Bash command: ls ~/Code/Projects/Constellation\n"
-            "Do you want to allow this command? [y/N]"
-        )
-        options = (
-            [
+        if wake_kind == "question":
+            context = args.get("context") or (
+                "Which environment should I deploy to?\n"
+                "  1. staging\n  2. production\n  3. Other"
+            )
+            options = args.get("options") or [
+                {"id": "opt1", "label": "staging"},
+                {"id": "opt2", "label": "production"},
+                {"id": "other", "label": "Other"},
+            ]
+        elif wake_kind == "permission_request":
+            context = args.get("context") or (
+                "I want to run Bash command: ls ~/Code/Projects/Constellation\n"
+                "Do you want to allow this command? [y/N]"
+            )
+            options = [
                 {"id": "allow_once", "label": "Allow once"},
                 {"id": "allow_always", "label": "Always allow"},
                 {"id": "deny", "label": "Deny"},
             ]
-            if wake_kind == "permission_request"
-            else []
-        )
+        else:
+            context = args.get("context") or "(no context)"
+            options = []
         await self._event_pusher({
             "kind": "tool_reverse_wake",
             "payload": {

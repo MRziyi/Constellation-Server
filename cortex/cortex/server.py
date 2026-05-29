@@ -375,6 +375,21 @@ def _permission_mode_for(text: str) -> str:
     return "acceptEdits"
 
 
+def _card_type_for(options: list[str]) -> str:
+    """Piece 4 — the 3 formal card types, derived from the options the glass
+    will render (so the client can switch rendering + ring-mapping cleanly):
+      - no options                → 'notification'  (dismiss only)
+      - exactly ['answer']        → 'question'      (single answer → mic)
+      - anything else             → 'checkpoint'    (approve / modify / reject|kill)
+    """
+    low = [str(o).strip().lower() for o in (options or [])]
+    if not low:
+        return "notification"
+    if low == ["answer"]:
+        return "question"
+    return "checkpoint"
+
+
 _TWIN_MEMO_ASSETS = os.path.expanduser("~/constellation/twin/memos/assets")
 
 
@@ -1260,6 +1275,9 @@ class CortexServer:
             "body_runs": to_runs(body_md),
             "scroll_total_lines": scroll_total_lines,
             "options": resolved_options,
+            # Piece 4: explicit card type so Glass renders + ring-maps cleanly
+            # (notification=dismiss · checkpoint=approve/modify/reject · question=answer).
+            "card_type": _card_type_for(resolved_options),
             "ttl_ms": ttl_ms,
         })
 
@@ -2542,14 +2560,34 @@ class CortexServer:
             wake_permission = {"session_id": session_id, "deny": _send(deny_keys)}
             option_labels = ["approve", "modify", "reject"]
 
+        # An AskUserQuestion becomes a QUESTION card (Piece 3): a single "answer"
+        # action. CC's options are laid out in the body; Zack answers in natural
+        # language (ring → mic) and we drive CC's AskUserQuestion to its free-text
+        # "Other" slot and type his answer. (other_idx / nav key-count are a
+        # best-effort default — calibrate against a real AskUserQuestion TUI in
+        # the device session.)
+        wake_question: dict[str, Any] | None = None
+        if from_tool == "claude_code" and wake_kind == "question" and options:
+            other_idx = next(
+                (i for i, o in enumerate(options)
+                 if str(o.get("id", "")).lower() == "other"
+                 or str(o.get("label", "")).lower() == "other"),
+                len(options) - 1,
+            )
+            wake_question = {"session_id": session_id, "other_idx": other_idx,
+                             "n_options": len(options)}
+            option_labels = ["answer"]
+
         title_map = {
             "permission_request": f"{from_tool} needs you",
+            "question": f"{from_tool} is asking",
             "completion_notice": f"{from_tool} done",
             "error": f"{from_tool} error",
             "surprising_event": from_tool,
         }
         icon_map = {
             "permission_request": "⚙",
+            "question": "❓",
             "completion_notice": "✓",
             "error": "✗",
             "surprising_event": "✦",
@@ -2585,6 +2623,7 @@ class CortexServer:
             "wake_response_map": wake_response_map,
             "wake_session_id": session_id,
             "wake_permission": wake_permission,
+            "wake_question": wake_question,
         }
         await self._send_command(cmd)
         log.info("command.sent", id=cmd.id, kind=cmd.kind, source="reverse_wake")
@@ -3131,6 +3170,42 @@ class CortexServer:
             except Exception as e:
                 log.error("reverse_wake_followup.failed", error=str(e), exc_info=True)
                 raise
+            return
+
+        # Question card ANSWER (Piece 3): the wearer answers an AskUserQuestion
+        # in natural language. First "answer" (no text) opens the mic; the
+        # follow-up carries feedback_text → we drive CC's AskUserQuestion to its
+        # free-text "Other" slot and type the answer. (nav key-count is a
+        # best-effort default; calibrate against a real AskUserQuestion TUI.)
+        wake_question = pending.get("wake_question")
+        if wake_question and ((decision or "").strip().lower() == "answer" or feedback_text):
+            answer_text = (feedback_text or "").strip()
+            if not answer_text:
+                log.info("reverse_wake.answer_needs_text", cmd_id=cmd_id)
+                await self.emit_mic_open(stream_id=f"answer_{cmd_id}", ttl_ms=30_000)
+                if self._glass_conn:
+                    await self._glass_conn.send(json.dumps({
+                        "id": f"prog_{ids.event_id()[4:]}", "kind": "progress",
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "parent_event_id": pending["event"].id,
+                        "stage": "answer_needs_text", "icon": "❓",
+                        "detail": "Answer — say your reply.",
+                    }, ensure_ascii=False))
+                return  # leave the card pending for the spoken answer
+            self._pending_previews.pop(cmd_id, None)
+            try:
+                sess = wake_question["session_id"]
+                nav = ["Down"] * int(wake_question.get("other_idx", 0)) + ["Enter"]
+                await self._dispatch_to_tool({
+                    "tool": "claude_code", "action": "send_keys",
+                    "args": {"session_id": sess, "keys": nav, "literal": False},
+                    "context_pack": [], "result_format": "execute",
+                })
+                await asyncio.sleep(0.4)
+                await self._inject_feedback_into_agent(sess, answer_text)
+                log.info("reverse_wake.answer_injected", session=sess, text=answer_text[:60])
+            except Exception as e:
+                log.error("reverse_wake.answer_failed", error=str(e), exc_info=True)
             return
 
         # "dismiss" is a non-UI signal — fired by the web client on TTL

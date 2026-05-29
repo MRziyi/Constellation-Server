@@ -468,9 +468,14 @@ def make_app(plane: ControlPlane) -> web.Application:
         if plane.server is None:
             return _err("server not bound", 503)
         try:
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
             rpc = await plane.server._dispatch_to_tool({
                 "tool": "claude_code", "action": "__test_inject_wake__",
-                "args": {}, "result_format": "execute",
+                "args": body if isinstance(body, dict) else {},
+                "result_format": "execute",
             })
             return _json({"injected": True, "result": rpc.result})
         except Exception as e:
