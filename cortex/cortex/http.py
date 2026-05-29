@@ -672,69 +672,16 @@ def make_app(plane: ControlPlane) -> web.Application:
             "events": events,
         })
 
-    # ── Shortcuts CRUD (P-app.D) ─────────────────────────────────────────
-    # User-defined preset prompts stored in `skills/shortcuts.md`. Read by the
-    # in-app Settings → Shortcuts list/editor + (in the future) the router as
-    # known intents + by the HaloActionsProvider plugin path.
-    from .shortcuts_store import ShortcutsStore
-
-    def _store() -> ShortcutsStore | None:
-        if plane.twin is None:
-            return None
-        return ShortcutsStore(plane.twin)
-
-    async def shortcuts_list(_request: web.Request) -> web.Response:
-        s = _store()
-        if s is None:
-            return _err("twin not bound", 503)
-        return _json({"shortcuts": [sc.to_dict() for sc in s.list()]})
-
-    async def shortcuts_create(request: web.Request) -> web.Response:
-        s = _store()
-        if s is None:
-            return _err("twin not bound", 503)
-        try:
-            body = await request.json()
-        except Exception as e:
-            return _err(f"bad json: {e}", 400)
-        try:
-            sc = s.create(body)
-        except ValueError as e:
-            return _err(str(e), 400)
-        return _json({"shortcut": sc.to_dict()}, status=201)
-
-    async def shortcuts_update(request: web.Request) -> web.Response:
-        s = _store()
-        if s is None:
-            return _err("twin not bound", 503)
-        sid = request.match_info["sid"]
-        try:
-            body = await request.json()
-        except Exception as e:
-            return _err(f"bad json: {e}", 400)
-        result = s.update(sid, body)
-        if result is None:
-            return _err(f"no shortcut with id '{sid}'", 404)
-        return _json({"shortcut": result.to_dict()})
-
-    async def shortcuts_delete(request: web.Request) -> web.Response:
-        s = _store()
-        if s is None:
-            return _err("twin not bound", 503)
-        sid = request.match_info["sid"]
-        if not s.delete(sid):
-            return _err(f"no shortcut with id '{sid}'", 404)
-        return _json({"ok": True, "deleted": sid})
+    # Shortcuts CRUD (/api/shortcuts) removed — shortcuts are now 3 fixed
+    # app-local slots edited by voice (SoT Rev 16 / C-61). No client consumed
+    # this server surface after that change (Glass + Console both checked).
+    # `shortcuts_store.py` + `twin-seed/skills/shortcuts.md` deleted with it.
 
     # ── route table ──
     app.router.add_get("/api/health", health)
     app.router.add_post("/api/ping", ping)
     app.router.add_get("/api/ping", ping)  # support both — clients may use either verb
 
-    app.router.add_get("/api/shortcuts", shortcuts_list)
-    app.router.add_post("/api/shortcuts", shortcuts_create)
-    app.router.add_put("/api/shortcuts/{sid}", shortcuts_update)
-    app.router.add_delete("/api/shortcuts/{sid}", shortcuts_delete)
     app.router.add_get("/api/sessions", sessions_list)
     app.router.add_get("/api/sessions/{session_id}", session_detail)
     app.router.add_get("/api/cc-archive", cc_archive_list)

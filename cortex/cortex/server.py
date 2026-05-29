@@ -1350,11 +1350,16 @@ class CortexServer:
         )
         # `title` is sticky — derived from the first prompt or summary; subsequent
         # turns keep the original (so voice references like "the email one" still
-        # match even after many turns of follow-up).
+        # match even after many turns of follow-up). When neither ask_text nor a
+        # structured summary is available (agent returned plain text), fall back
+        # to the SessionStore-derived title (first turn's ask_text) so pin /
+        # confirmation cards never show "(untitled)".
         if existing and existing.get("title"):
             title = existing["title"]
         else:
             title = _derive_session_title(ask_text or new_summary)
+            if not title or title == "(untitled)":
+                title = self.sessions.title_for(session_id)
         self._active_hud_session_tmux[session_id] = {
             "tmux_session": tmux,
             "cc_session_id": cc_sid,
@@ -2342,6 +2347,50 @@ class CortexServer:
             confidence = routed["confidence"]
             target = routed["target_session_id"]
 
+            # R-14.d: cross-session context bleed. If the router flagged other
+            # sessions whose info the user wants to LEND to this turn, prepend
+            # their last_summary (each cap'd) to the prompt text. Done BEFORE the
+            # decision branches so it applies regardless of route — including the
+            # mid-conf confirmation path: the event we stash for re-injection
+            # then already carries the augmented text (fixes the C-58↔C-59 drop
+            # where the mid-conf `return` skipped the bleed). Source sessions are
+            # read-only (no agent_continue, no state change). Caps bound runaway
+            # augmentation: ≤3 sources, ≤1500 combined chars.
+            MAX_CONTEXT_SOURCES = 3
+            MAX_CONTEXT_TOTAL_CHARS = 1500
+            context_from = (routed.get("context_from") or [])[:MAX_CONTEXT_SOURCES]
+            if context_from:
+                context_blocks: list[str] = []
+                used_chars = 0
+                for src_sid in context_from:
+                    src = self._active_hud_session_tmux.get(src_sid)
+                    if not src:
+                        continue
+                    src_title = src.get("title") or src_sid
+                    src_summary = (src.get("last_summary") or "").strip()
+                    if not src_summary:
+                        continue
+                    remaining = MAX_CONTEXT_TOTAL_CHARS - used_chars
+                    if remaining <= 0:
+                        break
+                    block_body = src_summary[: min(400, remaining)]
+                    block = f"[context from session '{src_title}']\n{block_body}"
+                    context_blocks.append(block)
+                    used_chars += len(block)
+                if context_blocks:
+                    log.info(
+                        "session_router.context_bled",
+                        from_sids=context_from, n_blocks=len(context_blocks),
+                    )
+                    augmented = "\n\n".join(context_blocks) + "\n\n---\n\n" + ask_text
+                    event.payload["text"] = augmented
+                    ask_text = augmented
+                    await self._emit_progress_to_glass(
+                        parent_event_id=event.id,
+                        stage="routing", icon="🔗",
+                        detail=f"lent context from {len(context_blocks)} session(s)",
+                    )
+
             if decision == "continue" and target and target != existing_sid \
                     and confidence >= HIGH_CONFIDENCE:
                 # High-confidence continue → silently route
@@ -2393,50 +2442,6 @@ class CortexServer:
                     confidence=confidence,
                 )
                 return  # wait for user_decision before dispatching
-
-            # R-14.d: cross-session context bleed. If the router flagged other
-            # sessions whose info the user wants to LEND to this turn, prepend
-            # their last_summary (each cap'd) to the prompt text. CC/router/
-            # classifier see the augmented text; the source sessions are not
-            # otherwise touched (no agent_continue into them, no state change).
-            # Caps prevent runaway prompt augmentation if the router flags many
-            # sources (e.g. user has 8 active sessions). MAX_SOURCES bounds the
-            # number of summaries; MAX_TOTAL_CHARS bounds combined length so we
-            # don't blow downstream CC context.
-            MAX_CONTEXT_SOURCES = 3
-            MAX_CONTEXT_TOTAL_CHARS = 1500
-            context_from = (routed.get("context_from") or [])[:MAX_CONTEXT_SOURCES]
-            if context_from:
-                context_blocks: list[str] = []
-                used_chars = 0
-                for src_sid in context_from:
-                    src = self._active_hud_session_tmux.get(src_sid)
-                    if not src:
-                        continue
-                    src_title = src.get("title") or src_sid
-                    src_summary = (src.get("last_summary") or "").strip()
-                    if not src_summary:
-                        continue
-                    remaining = MAX_CONTEXT_TOTAL_CHARS - used_chars
-                    if remaining <= 0:
-                        break
-                    block_body = src_summary[: min(400, remaining)]
-                    block = f"[context from session '{src_title}']\n{block_body}"
-                    context_blocks.append(block)
-                    used_chars += len(block)
-                if context_blocks:
-                    log.info(
-                        "session_router.context_bled",
-                        from_sids=context_from, n_blocks=len(context_blocks),
-                    )
-                    augmented = "\n\n".join(context_blocks) + "\n\n---\n\n" + ask_text
-                    event.payload["text"] = augmented
-                    ask_text = augmented
-                    await self._emit_progress_to_glass(
-                        parent_event_id=event.id,
-                        stage="routing", icon="🔗",
-                        detail=f"lent context from {len(context_blocks)} session(s)",
-                    )
 
         session_id_for_turn = self.sessions.start_turn(
             existing_session_id=existing_sid,

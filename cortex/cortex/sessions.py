@@ -335,3 +335,21 @@ class SessionStore:
         if not (title or "").strip():
             return
         self.append(session_id, "title_set", title=title.strip()[:_TITLE_MAX])
+
+    def title_for(self, session_id: str) -> str:
+        """Display title for one session: an explicit `title_set` override if
+        present, else derived from the first turn's ask_text. Used as a
+        fallback by the HUD tmux registry when the agent returned no structured
+        summary (otherwise the pin / confirmation cards show "(untitled)")."""
+        recs = list(self.read(session_id))
+        title = next(
+            (r.get("title") for r in recs if r.get("kind") == "title_set" and r.get("title")),
+            None,
+        )
+        if not title:
+            first_ask = next(
+                (r.get("ask_text") for r in recs if r.get("kind") == "turn_start"),
+                "",
+            )
+            title = _derive_title(first_ask or "")
+        return title
