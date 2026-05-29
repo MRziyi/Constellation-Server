@@ -1483,6 +1483,40 @@ class CortexServer:
             ttl_ms=ttl_ms,
         )
 
+    async def _handle_shortcut_config(self, event: Event, ask_text: str) -> None:
+        """Voice-driven shortcut-slot edit. Parses "set shortcut N to …" into a
+        slot update and pushes a `shortcut_config` frame to Glass (which owns
+        the local slot store), then a confirmation card. Short-circuits the
+        normal classifier/dispatch — this edits config, it doesn't run a task."""
+        from .shortcut_config import parse_shortcut_config
+        cfg = await parse_shortcut_config(ask_text)
+        if cfg is None:
+            await self._emit_info_card(
+                event_id=event.id,
+                title="Shortcut unchanged",
+                body="Couldn't parse that. Try: \"set shortcut 2 to ask what's in front\".",
+                ttl_ms=6_000,
+            )
+            return
+        # Push the slot update to Glass (slot content lives app-side).
+        await self._emit_glass_frame("shortcut_config", {
+            "slot": cfg["slot"],
+            "prompt": cfg["prompt"],
+            "send_photo": cfg["send_photo"],
+            "label": cfg["label"],
+        })
+        log.info(
+            "shortcut_config.emitted",
+            slot=cfg["slot"], send_photo=cfg["send_photo"], label=cfg["label"],
+        )
+        photo = "📷 + " if cfg["send_photo"] else ""
+        await self._emit_info_card(
+            event_id=event.id,
+            title=f"Shortcut {cfg['slot']} set",
+            body=f"{photo}\"{cfg['prompt']}\"",
+            ttl_ms=6_000,
+        )
+
     async def _emit_session_route_confirmation(
         self, *, event: Event, candidate_session_id: str,
         candidate_title: str, candidate_summary: str, confidence: float,
@@ -2273,6 +2307,14 @@ class CortexServer:
         # current HUD session); needs no classifier or router round-trip.
         if ask_text and (_looks_pin_intent(ask_text) or _looks_unpin_intent(ask_text)):
             await self._handle_pin_command(event, existing_sid, ask_text)
+            return
+
+        # Voice-driven shortcut-slot config. "set shortcut 2 to …" EDITS a
+        # fixed slot (the app owns slot content) rather than running a task —
+        # parse it + push a `shortcut_config` frame to Glass, short-circuit.
+        from .shortcut_config import looks_shortcut_config
+        if ask_text and looks_shortcut_config(ask_text):
+            await self._handle_shortcut_config(event, ask_text)
             return
 
         # R-14 / C-56 — voice-addressable session router. Runs BEFORE start_turn
