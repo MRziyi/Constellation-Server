@@ -1594,8 +1594,15 @@ def _distill_jsonl_event(ev: dict[str, Any]) -> dict[str, Any] | None:
                     "icon": "💭",
                     "detail": text[:120] + ("…" if len(text) > 120 else ""),
                 }
-            if ct == "thinking":
-                return None
+            if ct in ("thinking", "redacted_thinking"):
+                # Surface extended-thinking as a brief indicator (Zack wants
+                # "💭 thinking…" visible). Show a short snippet when present;
+                # redacted_thinking carries no text. CC usually doesn't stream
+                # thinking deltas to disk, so this fires at most once per block
+                # — the _tail heartbeat covers the long silent stretches.
+                think = (c.get("thinking") or "").strip()
+                detail = "thinking… " + think[:60] if think else "thinking…"
+                return {"stage": "thinking", "icon": "💭", "detail": detail}
         return None
 
     if t == "user":
@@ -1704,52 +1711,143 @@ def _basename_path(p: str) -> str:
     return ".../" + "/".join(parts[-2:])
 
 
+def _mcp_pretty(tool: str) -> str:
+    """`mcp__<server>__<action>` → a glanceable verb phrase.
+
+    Show the action (last segment, `_`→space); drop the noisy server prefix
+    which on plugin-hosted servers is very long (`plugin_chrome-devtools-mcp_…`).
+    """
+    seg = tool.split("__")[-1] if "__" in tool else tool
+    return seg.replace("_", " ").strip() or tool
+
+
 def _tool_glance(tool: str, inp: dict[str, Any]) -> tuple[str, str]:
     """Return (emoji, ≤70-char glanceable label) for one tool invocation.
 
     Designed for AR-glass HUD where vertical space is ~5 lines and you must
     grok the agent's action in <0.5s.  Prefer Anthropic's own short
     `description` arg when CC provides it; else extract the essence.
+
+    Coverage is the UNION of classic CC tool names (Task/TodoWrite/MultiEdit/
+    LS/BashOutput/ExitPlanMode/SlashCommand…) and the newer harness names
+    (Agent/TaskCreate/CronCreate/EnterWorktree/Monitor/ToolSearch/PowerShell…)
+    so it renders regardless of the Claude Code version that produced the jsonl.
+    Unknown tools still get a sensible generic glance. Keep this exhaustive — a
+    wearer should never see a raw "ToolName(arg=…)" for a common action.
     """
-    # CC's Bash tool requires a `description` (5-10 word verb phrase). Prefer it.
-    if tool == "Bash":
+    inp = inp or {}
+    # Common input aliases reused across tools.
+    fp = inp.get("file_path") or inp.get("path") or inp.get("notebook_path") or "?"
+
+    # ── Execution ──────────────────────────────────────────────────────────
+    if tool in ("Bash", "PowerShell"):
+        # CC's Bash tool requires a `description` (5-10 word verb phrase). Prefer it.
         desc = inp.get("description") or ""
         if desc:
             return "🔧", _shorten(desc, 70)
         cmd = inp.get("command", "")
-        # Pull leading executable for a hint
-        first = (cmd.split() or ["?"])[0]
+        first = (cmd.split() or ["?"])[0]  # leading executable as a hint
         return "🔧", _shorten(f"{first}: {cmd}", 70)
+    if tool == "BashOutput":
+        return "🔧", "reading shell output"
+    if tool in ("KillShell", "KillBash"):
+        return "🛑", "stopping background shell"
+    if tool == "Monitor":
+        return "👀", _shorten(f"monitoring: {inp.get('command') or inp.get('description') or '?'}", 70)
 
+    # ── File ops ───────────────────────────────────────────────────────────
     if tool == "Read":
-        return "📖", "reading " + _basename_path(inp.get("file_path") or inp.get("path") or "?")
+        return "📖", "reading " + _basename_path(fp)
     if tool == "Write":
-        return "✍️", "writing " + _basename_path(inp.get("file_path") or inp.get("path") or "?")
-    if tool == "Edit":
-        return "📝", "editing " + _basename_path(inp.get("file_path") or inp.get("path") or "?")
+        return "✍️", "writing " + _basename_path(fp)
+    if tool in ("Edit", "MultiEdit"):
+        return "📝", "editing " + _basename_path(fp)
+    if tool == "NotebookEdit":
+        return "📓", _shorten(f"editing notebook {_basename_path(fp)}", 70)
+    if tool == "LS":
+        return "📂", "listing " + _basename_path(inp.get("path") or ".")
+
+    # ── Search / navigation ────────────────────────────────────────────────
     if tool == "Glob":
         return "🔍", _shorten(f"glob {inp.get('pattern','?')}", 70)
     if tool == "Grep":
         return "🔍", _shorten(f"grep '{inp.get('pattern') or inp.get('query') or '?'}'", 70)
+    if tool == "LSP":
+        return "🔣", _shorten(f"lsp {inp.get('action','lookup')} {_basename_path(fp)}", 70)
+    if tool == "ToolSearch":
+        return "🔍", _shorten(f"finding tools: {inp.get('query','?')}", 70)
+
+    # ── Web ────────────────────────────────────────────────────────────────
     if tool == "WebFetch":
-        url = inp.get("url") or "?"
-        return "🌐", _shorten(f"fetching {url}", 70)
+        return "🌐", _shorten(f"fetching {inp.get('url') or '?'}", 70)
     if tool == "WebSearch":
         return "🌐", _shorten(f"searching: {inp.get('query') or '?'}", 70)
-    if tool == "TodoWrite":
-        return "📋", "updating own todo list"
-    if tool == "TodoRead":
-        return "📋", "checking own todos"
-    if tool == "Task":
-        return "🧵", _shorten(f"spawning sub-agent: {inp.get('subagent_type','?')}", 70)
+
+    # ── Task / todo management (classic TodoWrite + new TaskCreate family) ──
+    if tool in ("TodoWrite", "TodoRead"):
+        return "📋", "updating own todo list" if tool == "TodoWrite" else "checking own todos"
+    if tool in ("TaskCreate", "TaskUpdate", "TaskGet", "TaskList"):
+        what = inp.get("title") or inp.get("status") or inp.get("task_id") or ""
+        verb = {"TaskCreate": "new task", "TaskUpdate": "task update",
+                "TaskGet": "checking task", "TaskList": "listing tasks"}[tool]
+        return "📋", _shorten(f"{verb}: {what}".rstrip(": "), 70)
+    if tool == "TaskStop":
+        return "🛑", "stopping a task"
+    if tool == "TaskOutput":
+        return "📋", "reading task output"
+
+    # ── Delegation / sub-agents ────────────────────────────────────────────
+    if tool in ("Task", "Agent"):
+        sub = inp.get("subagent_type") or inp.get("agent_type") or "agent"
+        return "🧵", _shorten(f"sub-agent: {sub}", 70)
+    if tool == "SendMessage":
+        return "✉️", _shorten(f"messaging {inp.get('to') or inp.get('teammate_id') or 'agent'}", 70)
+    if tool == "Workflow":
+        return "🧵", _shorten(f"workflow: {inp.get('name') or inp.get('title') or '?'}", 70)
+
+    # ── Planning / worktree ────────────────────────────────────────────────
+    if tool == "EnterPlanMode":
+        return "📋", "entering plan mode"
+    if tool == "ExitPlanMode":
+        return "✔️", "presenting a plan"
+    if tool == "EnterWorktree":
+        return "🌲", _shorten(f"worktree {_basename_path(inp.get('path') or '?')}", 70)
+    if tool == "ExitWorktree":
+        return "🌲", "exiting worktree"
+
+    # ── Scheduling / automation ────────────────────────────────────────────
+    if tool == "CronCreate":
+        return "⏰", _shorten(f"scheduling: {inp.get('schedule') or inp.get('prompt') or '?'}", 70)
+    if tool in ("CronList", "CronDelete"):
+        return "⏰", "listing schedules" if tool == "CronList" else "deleting a schedule"
+    if tool == "ScheduleWakeup":
+        return "⏰", _shorten(f"wake-up: {inp.get('reason') or inp.get('delaySeconds') or '?'}", 70)
+    if tool == "RemoteTrigger":
+        return "⏰", _shorten(f"routine {inp.get('action') or ''} {inp.get('routine_name') or ''}".strip(), 70)
+
+    # ── Skills / slash commands ────────────────────────────────────────────
+    if tool == "Skill":
+        return "🎯", _shorten(f"skill: {inp.get('skill') or inp.get('skill_name') or inp.get('command') or '?'}", 70)
+    if tool == "SlashCommand":
+        return "⌘", _shorten(f"/{(inp.get('command') or '?').lstrip('/')}", 70)
+
+    # ── User interaction ───────────────────────────────────────────────────
+    if tool == "AskUserQuestion":
+        q = inp.get("question") or (inp.get("questions") or [{}])[0].get("question", "?") \
+            if isinstance(inp.get("questions"), list) else inp.get("question", "?")
+        return "❓", _shorten(f"asking: {q}", 70)
+    if tool == "PushNotification":
+        return "🔔", _shorten(f"notify: {inp.get('title') or inp.get('message') or '?'}", 70)
+
+    # ── Result finalisation ────────────────────────────────────────────────
     if tool == "StructuredOutput":
         return "📦", "finalising structured result"
 
-    # MCP / extension tools — name has dots/colons
-    if "__" in tool or ":" in tool:
-        return "🔌", _shorten(tool, 70)
+    # ── MCP / extension tools (mcp__server__action, or name with dots/colons) ─
+    if tool.startswith("mcp__") or "__" in tool or ":" in tool:
+        return "🔌", _shorten(_mcp_pretty(tool), 70)
 
-    # Generic fallback — show tool name + first input value
+    # ── Generic fallback — show tool name + first input value ──────────────
     if inp:
         k, v = next(iter(inp.items()))
         return "·", _shorten(f"{tool}({k}={v})", 70)

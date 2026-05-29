@@ -820,6 +820,26 @@ class CortexServer:
         except Exception as e:
             log.warning("progress.send_failed", error=str(e))
 
+        # Mirror to the styled `hud_state` flavor so the Glass HUD renders the
+        # agent's live action in its replace-in-place Thinking row — the SAME
+        # path Cortex-internal steps already use via `_emit_progress_to_glass`
+        # (line ~857). Without this mirror the per-CC-tool detail (📖 reading… /
+        # 📝 editing… / 🔧 <bash> / 🧵 sub-agent / 💭 thinking) reached the wire
+        # as `kind:"progress"` but the Glass client only renders `hud_state`,
+        # so the whole agent-activity feed was dropped at the eyewear. Skip
+        # stages the wearer doesn't need: tool RESULTS (the "out" — per Zack the
+        # HUD shows the action, not bash in/out), and terminal completed/error
+        # (a card/insight frame drives the final state; rendering them here just
+        # flickers Thinking after the Card).
+        if stage not in ("tool_result", "completed", "error") \
+                and "hud_state" in self._glass_accept:
+            await self.emit_hud_state(
+                stage=stage,
+                icon=frame["icon"],
+                detail_runs=[{"text": (payload.get("detail") or "")[:200], "style": "normal"}],
+                meta_runs=[],
+            )
+
     async def _emit_progress_to_glass(
         self,
         *,
