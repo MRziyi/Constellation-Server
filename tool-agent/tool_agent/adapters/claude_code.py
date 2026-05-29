@@ -900,25 +900,31 @@ class ClaudeCodeAdapter:
                 "detail": "waiting for CC TUI to render",
             })
             await asyncio.sleep(2.0)
-            # Safety-prompt dismiss is only needed on FRESH sessions —
-            # `--resume` rehydrates a session that already accepted bypass,
-            # so the dialog never appears. Skip the check; otherwise we'd
-            # send a phantom Down+Enter into CC's input field.
-            if not resuming and agent_permission_mode in ("bypassPermissions",):
-                _, pane_out, _ = await _run(
-                    _tmux("capture-pane", "-t", tmux_session, "-p"), timeout=5,
-                )
-                if "Bypass Permissions" in pane_out and "Yes, I accept" in pane_out:
-                    await _emit_progress({
-                        "stage": "accepting_bypass", "icon": "👋",
-                        "detail": "accepting bypass-permissions safety prompt",
-                    })
-                    await _run(_tmux("send-keys", "-t", tmux_session, "Down"), timeout=5)
-                    await asyncio.sleep(0.2)
-                    await _run(_tmux("send-keys", "-t", tmux_session, "Enter"), timeout=5)
-                    # CC needs a moment to clear the safety screen + draw the
-                    # input prompt.
-                    await asyncio.sleep(1.5)
+            # The bypassPermissions safety gate ("Bypass Permissions … Yes, I
+            # accept") appears once per PROCESS — INCLUDING a fresh `--resume`
+            # process. The old code skipped this on resume (assuming the dialog
+            # never reappears) which STALLED resumed agents: the gate sat
+            # unaccepted while we pasted the brief INTO it, so CC never ran the
+            # turn (observed 2026-05-30 on a UC2 idle-resume). Fix: poll on
+            # BOTH fresh + resume, dismissing only if the gate text is actually
+            # on-screen (so non-bypass modes never get phantom Down+Enter). Poll
+            # rather than a single check — resumes take longer to render.
+            if agent_permission_mode == "bypassPermissions":
+                for _ in range(6):
+                    _, pane_out, _ = await _run(
+                        _tmux("capture-pane", "-t", tmux_session, "-p"), timeout=5,
+                    )
+                    if "Bypass Permissions" in pane_out and "Yes, I accept" in pane_out:
+                        await _emit_progress({
+                            "stage": "accepting_bypass", "icon": "👋",
+                            "detail": "accepting bypass-permissions safety prompt",
+                        })
+                        await _run(_tmux("send-keys", "-t", tmux_session, "Down"), timeout=5)
+                        await asyncio.sleep(0.2)
+                        await _run(_tmux("send-keys", "-t", tmux_session, "Enter"), timeout=5)
+                        await asyncio.sleep(1.5)
+                        break
+                    await asyncio.sleep(1.0)
 
             # ── 2b. Paste the brief into CC's input prompt ──
             # tmux paste-buffer is the cleanest way to handle multi-line text

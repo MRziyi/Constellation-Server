@@ -253,6 +253,8 @@ def list_project_sessions(project_query: str, limit: int = 5) -> dict[str, Any]:
             "age_min": int((now - st.st_mtime) / 60),
             "working_dir": _bucket_to_path(bucket),
             "bucket": bucket,
+            # UC2: a live session (open in VS Code etc.) is browse-only.
+            "live": is_session_live(jsonl.stem),
         })
     log.info("session_browser.listed", project=project_query, bucket=bucket,
              n=len(sessions))
@@ -261,6 +263,36 @@ def list_project_sessions(project_query: str, limit: int = 5) -> dict[str, Any]:
         "working_dir": _bucket_to_path(bucket),
         "sessions": sessions,
     }
+
+
+def is_session_live(session_id: str) -> bool:
+    """True iff some `claude` process currently has this session open (e.g. it's
+    running in the user's VS Code / a tmux). Cheap `pgrep -f` on the uuid.
+
+    Why it matters (UC2): the user's real sessions run live in the VS Code
+    extension. Spawning a second `claude --resume <uuid>` on the SAME jsonl
+    forks/corrupts it. So a live session is browse-only (display its title +
+    last message); only IDLE sessions may be resumed from the glasses."""
+    if not session_id:
+        return False
+    import subprocess, re
+    try:
+        # Match specifically a `claude` process carrying this uuid
+        # (`--resume <uuid>` / `--session-id <uuid>`). A bare `pgrep -f <uuid>`
+        # is too loose — it also matches our own python liveness-checks / log
+        # tails that happen to mention the uuid (observed as a false-positive).
+        out = subprocess.run(
+            ["ps", "-axo", "command"],
+            capture_output=True, text=True, timeout=4,
+        ).stdout
+        # Match the ACTUAL CC flag carrying the session — `--resume <uuid>` or
+        # `--session-id <uuid>`. A looser `claude.*<uuid>` also matches `.claude/`
+        # paths and our own shell commands that merely mention the uuid (the
+        # harness shell sources ~/.claude/shell-snapshots/… → false positive).
+        return bool(re.search(
+            rf"--(?:resume|session-id)\s+{re.escape(session_id)}\b", out))
+    except Exception:
+        return False  # fail open to "idle" rather than block resume on a hiccup
 
 
 def resolve_session_jsonl(session_id: str) -> Path | None:

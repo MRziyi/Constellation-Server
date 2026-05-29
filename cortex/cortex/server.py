@@ -1663,6 +1663,8 @@ class CortexServer:
         from .session_browser import working_dir_for_session
         from .agent_brief import CANONICAL_ACTIONS_SCHEMA
 
+        from .session_browser import is_session_live
+
         sessions = pending.get("sessions") or []
         if not (1 <= idx <= len(sessions)):
             return
@@ -1671,6 +1673,21 @@ class CortexServer:
         working_dir = working_dir_for_session(cc_sid) or picked.get("working_dir")
         # Consume the pending listing (one pick per listing).
         self._pending_session_browse.pop(event.payload.get("session_id") or "_no_sid", None)
+
+        # UC2: never resume a LIVE session (open in VS Code etc.) — a second
+        # `claude --resume` on the same jsonl forks/corrupts it. Gate on a FRESH
+        # re-check (the listing's `live` flag can be stale by pick time, and is
+        # used only for the card's 🔴 marker). Live → browse-only.
+        if is_session_live(cc_sid):
+            await self._emit_info_card(
+                event_id=event.id,
+                title=f"🔴 {picked['title'][:38]} (live)",
+                body=(f"This session is open elsewhere (VS Code) — I can't continue it "
+                      f"from here without conflicting.\nLast message:\n“{picked.get('last_user_msg','')[:120]}”"),
+                ttl_ms=20_000,
+            )
+            log.info("session_browse.pick_live_blocked", cc_sid=cc_sid[:8])
+            return
 
         if not instruction:
             # Pick-only: enter the session, surface its last message, await next turn.
