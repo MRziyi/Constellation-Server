@@ -63,6 +63,7 @@ def build_agent_brief(
     now_iso: str | None = None,
     has_photo: bool = False,
     photo_path: str | None = None,
+    photo_summary: str | None = None,
     twin_slices: dict[str, str] | None = None,
     output_schema: dict[str, Any] | str | None = None,
     available_dirs: list[str] | None = None,
@@ -102,10 +103,13 @@ def build_agent_brief(
         L.append(f"NOW: {now_iso}")
     if photo_path:
         # UC1: the glasses photo is already on disk under twin/. Tell CC where +
-        # how to embed it so a memo can include the captured poster/whiteboard.
+        # how to embed it, and hand it the vision 简介 (CC can't see JPEGs) so a
+        # memo can include the captured poster/whiteboard + a ready analysis.
         L.append(f"PHOTO: a glasses photo is saved at twin/memos/{photo_path}")
-        L.append(f"  → if Zack wants a memo, write it under twin/memos/<slug>.md and")
-        L.append(f"    embed the image with markdown: ![]({photo_path})")
+        if photo_summary:
+            L.append(f'  vision analysis (简介): "{photo_summary.strip()}"')
+        L.append(f"  → if Zack wants a memo, write it under twin/memos/<slug>.md with:")
+        L.append(f"    his note + the analysis above + the image embedded: ![]({photo_path})")
     elif has_photo:
         L.append("PHOTO: attached (glass camera)")
     L.append("")
@@ -137,8 +141,11 @@ def build_agent_brief(
     # stream send_keys is unreliable; phase checkpoints handle correction).
     L.append("== RULES ==")
     L.append("R1  YOU MUST NOT execute side effects (mail send, reminder add, calendar add,")
-    L.append("    imessage, fs.write outside /tmp). Propose in actions[]; Cortex previews +")
-    L.append("    executes after Zack approves. Reads are fine.")
+    L.append("    imessage, fs.write outside /tmp and outside ~/constellation/twin/). Propose")
+    L.append("    those in actions[]; Cortex previews + executes after Zack approves.")
+    L.append("    EXCEPTION — Zack's OWN scratchpad: when he asks you to save a memo / note,")
+    L.append("    write it DIRECTLY under ~/constellation/twin/ (e.g. twin/memos/<slug>.md)")
+    L.append("    with your Write tool — no preview needed. Reads are always fine.")
     L.append("R2  YOU MUST always emit valid JSON. On Read/Bash failure or token limit: stop")
     L.append("    that path, commit with what you have, explain in notes:. Never go silent.")
     L.append("")

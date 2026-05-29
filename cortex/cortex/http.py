@@ -392,11 +392,14 @@ def make_app(plane: ControlPlane) -> web.Application:
         # Synthesise an event so the agent's progress events have a
         # parent_event_id; we record it into the events ring too so /api/trace
         # picks it up.
+        _payload = {"text": text, "_via": "dev_agent_invoke"}
+        if body.get("image"):  # UC1: allow attaching a base64 photo for testing
+            _payload["image"] = body["image"]
         event = Event(
             id=ids.event_id(),
             kind="user_invoke",
             ts=datetime.now(timezone.utc),
-            payload={"text": text, "_via": "dev_agent_invoke"},
+            payload=_payload,
         )
         plane.record_event(
             event_id=event.id, kind=event.kind,

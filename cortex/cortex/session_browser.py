@@ -265,6 +265,43 @@ def list_project_sessions(project_query: str, limit: int = 5) -> dict[str, Any]:
     }
 
 
+_PICK_STRIP = re.compile(
+    r"\b(continue|go|in|into|open|resume|the|one|that|this|session|sessions|conversation|please)\b",
+    re.IGNORECASE,
+)
+_PICK_STRIP_ZH = re.compile(r"(接着|继续|到|进|那个|这个|里(边|面)?|跑|去|会话|对话|的)")
+
+
+def match_pick_by_title(text: str, sessions: list[dict[str, Any]]) -> int | None:
+    """UC2 pick-by-TOPIC: resolve "the gesture one" / "接着那个 auth 的" to a
+    1-based index by fuzzy-matching the utterance against each listed session's
+    title + last_user_msg. Returns None if no confident, unambiguous match
+    (caller then falls back to #N or treats it as a normal ask).
+
+    Deliberately conservative: token-overlap + substring credit; requires the
+    best score ≥ 1 AND strictly beating the runner-up (no coin-flip on a tie)."""
+    if not text or not sessions:
+        return None
+    t = _PICK_STRIP_ZH.sub(" ", _PICK_STRIP.sub(" ", text))
+    qtoks = {w for w in re.findall(r"[a-z0-9一-鿿]+", t.lower()) if len(w) >= 2}
+    if not qtoks:
+        return None
+    scores: list[tuple[float, int]] = []
+    for i, s in enumerate(sessions, 1):
+        hay = f"{s.get('title', '')} {s.get('last_user_msg', '')}".lower()
+        htoks = set(re.findall(r"[a-z0-9一-鿿]+", hay))
+        # Substring credit is 1.0 (not 0.5): CJK tokenizes into long runs, so a
+        # distinctive query term (e.g. "能耗" / "跌落检测") only ever appears as a
+        # substring of the run, never as a matching token — it must still count.
+        score = float(len(qtoks & htoks)) + sum(1.0 for q in qtoks if q in hay and q not in htoks)
+        scores.append((score, i))
+    scores.sort(reverse=True)
+    best, runner = scores[0], (scores[1] if len(scores) > 1 else (0.0, -1))
+    if best[0] >= 1.0 and best[0] > runner[0]:
+        return best[1]
+    return None
+
+
 def is_session_live(session_id: str) -> bool:
     """True iff some `claude` process currently has this session open (e.g. it's
     running in the user's VS Code / a tmux). Cheap `pgrep -f` on the uuid.

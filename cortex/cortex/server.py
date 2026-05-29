@@ -1719,6 +1719,9 @@ class CortexServer:
         picked = sessions[idx - 1]
         cc_sid = picked["session_id"]
         working_dir = working_dir_for_session(cc_sid) or picked.get("working_dir")
+        log.info("session_browse.picked", idx=idx, cc_sid=cc_sid[:8],
+                 title=(picked.get("title") or "")[:40],
+                 has_instruction=bool(instruction))
         # Consume the pending listing (one pick per listing).
         self._pending_session_browse.pop(event.payload.get("session_id") or "_no_sid", None)
 
@@ -2391,6 +2394,7 @@ class CortexServer:
         # the relative path so it can embed the image in a memo. (On-demand
         # vision pulls happen later in the subtask loop and aren't for memos.)
         photo_path: str | None = None
+        photo_summary: str | None = None
         if payload.get("image"):
             persisted = _persist_image_to_twin(
                 payload["image"], event.id.replace("evt_", "")[:8])
@@ -2402,12 +2406,35 @@ class CortexServer:
                     parent_event_id=event.id, stage="photo_saved", icon="🖼",
                     detail="photo saved to twin",
                 )
+                # UC1: analyse the photo NOW (CC can't see JPEGs) so the agent
+                # can paste a ready 简介 into the memo. detail by intent (C-64);
+                # the agent decides whether to use it.
+                try:
+                    await self._emit_progress_to_glass(
+                        parent_event_id=event.id, stage="vision", icon="👁",
+                        detail="analysing the photo…",
+                    )
+                    vrpc = await self._dispatch_to_tool({
+                        "tool": "vision_describe", "action": "describe",
+                        "args": {
+                            "_image_b64": payload["image"],
+                            "prompt": ask_text or "Describe this image.",
+                            "detail": _vision_detail_for(ask_text),
+                        },
+                        "context_pack": [], "result_format": "execute",
+                    })
+                    photo_summary = (vrpc.result or {}).get("description") or None
+                    log.info("photo.vision_summary",
+                             chars=len(photo_summary or ""))
+                except Exception as e:
+                    log.warning("photo.vision_failed", error=str(e))
 
         brief = build_agent_brief(
             ask_text=ask_text,
             now_iso=datetime.now(timezone.utc).astimezone().isoformat(),
             has_photo=bool(payload.get("image")),
             photo_path=photo_path,
+            photo_summary=photo_summary,
             twin_slices=twin_slices,
             output_schema=schema_hint,
             available_dirs=add_dirs,
@@ -2668,7 +2695,7 @@ class CortexServer:
         #   (b) "list my sessions in <project>" → list + show a numbered card.
         from .session_browser import (
             looks_session_browse, parse_pick, list_project_sessions,
-            extract_project_query,
+            extract_project_query, match_pick_by_title,
         )
         pending_browse = self._pending_session_browse.get(existing_sid or "_no_sid")
         if ask_text and pending_browse and not looks_session_browse(ask_text):
@@ -2677,6 +2704,15 @@ class CortexServer:
                 await self._handle_session_browse_pick(
                     event, pending_browse, idx, instruction)
                 return
+            # No #N? Try pick-by-TOPIC ("the gesture one"). A confident match
+            # ENTERS the session (no inline instruction → await the next
+            # utterance, matching Zack's "到这个标题里面" then "我要跟它讲X").
+            if not pending_browse.get("await_instruction"):
+                tmatch = match_pick_by_title(ask_text, pending_browse["sessions"])
+                if tmatch is not None:
+                    await self._handle_session_browse_pick(
+                        event, pending_browse, tmatch, "")
+                    return
             # Pick-only step left a single session awaiting its instruction →
             # treat this whole (non-pick, non-browse) utterance as that instruction.
             if pending_browse.get("await_instruction"):
