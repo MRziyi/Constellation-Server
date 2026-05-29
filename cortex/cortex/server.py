@@ -2517,26 +2517,30 @@ class CortexServer:
         #   2. Yes, and always allow access to <scope>        → Down, Enter
         #   3. No                                             → Down, Down, Enter
         # We use tmux named-key mode (literal=False) for these.
+        # A permission_request becomes a CHECKPOINT card with the same 3-way
+        # semantics Zack uses everywhere (approve / modify / reject), so the ring
+        # drives it (TAP / LONG / DOUBLE). We translate those to CC's arrow-key
+        # permission menu under the hood:
+        #   approve → "Yes" (Enter)
+        #   reject  → "No"  (Down, Down, Enter)
+        #   modify  → reject the action, then inject Zack's spoken correction
+        #             (handled in _handle_user_decision; needs his text first).
+        # (CC v2.1.x menu: 1.Yes=Enter · 2.Yes,always=Down,Enter · 3.No=Down,Down,Enter)
         option_labels = [opt.get("label", opt.get("id", "?")) for opt in options]
         wake_response_map: dict[str, dict[str, Any]] = {}
-        for opt in options:
-            opt_id = opt.get("id")
-            if not opt_id:
-                continue
-            if from_tool == "claude_code" and wake_kind == "permission_request":
-                key_seq: list[str] | None = None
-                if opt_id == "allow_once":
-                    key_seq = ["Enter"]
-                elif opt_id == "allow_always":
-                    key_seq = ["Down", "Enter"]
-                elif opt_id == "deny":
-                    key_seq = ["Down", "Down", "Enter"]
-                if key_seq:
-                    wake_response_map[opt_id] = {
-                        "tool": "claude_code", "action": "send_keys",
-                        "args": {"session_id": session_id, "keys": key_seq, "literal": False},
-                        "context_pack": [], "result_format": "execute",
-                    }
+        wake_permission: dict[str, Any] | None = None
+        if from_tool == "claude_code" and wake_kind == "permission_request" and options:
+            def _send(keys: list[str]) -> dict[str, Any]:
+                return {
+                    "tool": "claude_code", "action": "send_keys",
+                    "args": {"session_id": session_id, "keys": keys, "literal": False},
+                    "context_pack": [], "result_format": "execute",
+                }
+            allow_keys = ["Enter"]            # option 1 "Yes"
+            deny_keys = ["Down", "Down", "Enter"]  # option 3 "No"
+            wake_response_map = {"approve": _send(allow_keys), "reject": _send(deny_keys)}
+            wake_permission = {"session_id": session_id, "deny": _send(deny_keys)}
+            option_labels = ["approve", "modify", "reject"]
 
         title_map = {
             "permission_request": f"{from_tool} needs you",
@@ -2580,6 +2584,7 @@ class CortexServer:
             "subtask_results": [],
             "wake_response_map": wake_response_map,
             "wake_session_id": session_id,
+            "wake_permission": wake_permission,
         }
         await self._send_command(cmd)
         log.info("command.sent", id=cmd.id, kind=cmd.kind, source="reverse_wake")
@@ -3216,6 +3221,31 @@ class CortexServer:
             # hard cap (C-37) regardless of this ttl hint.
             await self.emit_mic_open(stream_id=f"modify_{cmd_id}", ttl_ms=30_000)
             return  # leave the card pending
+
+        # ── Permission card MODIFY (Piece 2): reject the proposed action, then
+        # inject Zack's spoken correction into the live CC so it re-plans.
+        # (approve/reject already went through the wake_response_map path above.)
+        wake_perm = pending.get("wake_permission")
+        if kind == "modify" and resolved_text and wake_perm:
+            self._pending_previews.pop(cmd_id, None)
+            try:
+                await self._dispatch_to_tool(wake_perm["deny"])  # press "No" on the prompt
+                await asyncio.sleep(0.4)
+                await self._inject_feedback_into_agent(
+                    wake_perm["session_id"], resolved_text)
+                log.info("reverse_wake.modify_injected",
+                         session=wake_perm["session_id"], text=resolved_text[:60])
+                if self._glass_conn:
+                    await self._glass_conn.send(json.dumps({
+                        "id": f"prog_{ids.event_id()[4:]}", "kind": "progress",
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "parent_event_id": pending["event"].id,
+                        "stage": "feedback_injected", "icon": "💬",
+                        "detail": f"denied + redirected: \"{resolved_text[:50]}\"",
+                    }, ensure_ascii=False))
+            except Exception as e:
+                log.error("reverse_wake.modify_failed", error=str(e), exc_info=True)
+            return
 
         # ── Multi-phase agent checkpoint: resume CC with the canonical outcome ──
         if pending.get("is_checkpoint") and pending.get("agent_result"):
