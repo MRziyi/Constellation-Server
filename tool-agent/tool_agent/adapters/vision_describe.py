@@ -35,14 +35,25 @@ log = structlog.get_logger(__name__)
 
 DEFAULT_MODEL = os.environ.get("CORTEX_VISION_MODEL", "gpt-5.2")
 DEFAULT_MAX_TOKENS = int(os.environ.get("CORTEX_VISION_MAX_TOKENS", "400"))
+# OpenAI vision cost is driven by image resolution + the `detail` flag, NOT by
+# how the bytes are delivered (inline b64 vs Files API cost the same). `low` is
+# a flat ~85 input tokens (image read at 512px — fine for "what am I looking
+# at?"); `high` tiles the image at 512px (hundreds of tokens — needed to READ
+# text on a poster/sign/menu). Default `auto` ≈ high for non-tiny images, which
+# overpays on simple scene queries — so Cortex passes an explicit per-call
+# `detail` chosen by intent (see server `_vision_detail_for`).
+DEFAULT_DETAIL = os.environ.get("CORTEX_VISION_DETAIL", "auto")
+_VALID_DETAIL = {"low", "high", "auto"}
 DEFAULT_SYSTEM = (
     "You are describing a frame captured by Zack's AR glasses. "
     "Be concise (≤80 words), specific, human. No preamble."
 )
 
 
-async def _describe(prompt: str, image_b64: str, *, model: str) -> dict[str, Any]:
+async def _describe(prompt: str, image_b64: str, *, model: str, detail: str = "auto") -> dict[str, Any]:
     """Single multimodal call. Returns dict with description + tokens + model."""
+    if detail not in _VALID_DETAIL:
+        detail = "auto"
     if not os.environ.get("OPENAI_API_KEY"):
         return {
             "description": "(vision_describe: OPENAI_API_KEY not set)",
@@ -68,7 +79,7 @@ async def _describe(prompt: str, image_b64: str, *, model: str) -> dict[str, Any
             "role": "user",
             "content": [
                 {"type": "text", "text": prompt or "Describe this image."},
-                {"type": "image_url", "image_url": {"url": image_url}},
+                {"type": "image_url", "image_url": {"url": image_url, "detail": detail}},
             ],
         },
     ]
@@ -127,8 +138,11 @@ class VisionDescribeAdapter:
         # don't put it in the prompt verbatim".
         image_b64 = args.get("_image_b64") or ""
         model = args.get("model") or DEFAULT_MODEL
+        # Cortex injects `detail` per-intent (high to read text, low for a quick
+        # scene glance). Falls back to the env default when absent.
+        detail = args.get("detail") or DEFAULT_DETAIL
 
-        result = await _describe(prompt, image_b64, model=model)
+        result = await _describe(prompt, image_b64, model=model, detail=detail)
         # Surface the description as both a top-level field AND as `summary`
         # so the existing agent-finished-card body renderer picks it up
         # cleanly without special-case logic.
@@ -137,5 +151,6 @@ class VisionDescribeAdapter:
             "summary": result["description"],
             "model": result["model"],
             "tokens": result["tokens"],
+            "detail": detail,
             "had_image": bool(image_b64),
         }

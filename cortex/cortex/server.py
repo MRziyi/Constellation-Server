@@ -318,6 +318,33 @@ def _looks_visual_intent(text: str) -> bool:
     return False
 
 
+# Cues that the user wants to READ TEXT in the frame (poster / sign / menu /
+# document / "what does it say"). These justify OpenAI `detail:"high"` (image
+# tiled at 512px so small text is legible). Everything else → `detail:"low"`
+# (flat ~85 input tokens — enough for a scene glance, much cheaper). See
+# vision_describe DEFAULT_DETAIL note.
+_VISION_TEXT_READ_PATTERNS = [
+    re.compile(
+        r"\b(read|reads?|says?|written|text|word|wording|caption|title|label|"
+        r"poster|sign|menu|document|page|paper|slide|receipt|card|book|article|"
+        r"headline|paragraph|spell|transcribe|ocr)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"(读|念|写的什么|写着什么|上面.*字|文字|海报|招牌|牌子|菜单|文件|文档|标题|说明|条款|这段|这页|纸上)"),
+]
+
+
+def _vision_detail_for(text: str) -> str:
+    """Pick OpenAI vision `detail` by intent: `high` when the user wants to read
+    text in the frame (poster/sign/menu/doc), else `low` to save tokens. No LLM
+    call — a regex on the ask text."""
+    if text:
+        for pat in _VISION_TEXT_READ_PATTERNS:
+            if pat.search(text):
+                return "high"
+    return "low"
+
+
 # R-14.b / C-56: pin/unpin intent detection. Tiny regex on the user's
 # voice-invoke text — when the entire utterance is a pin command, we
 # short-circuit the normal classifier+dispatch flow, flip the session's
@@ -579,6 +606,10 @@ class CortexServer:
         # before normal preview lookup. Map cleared on approve / kill / modify
         # (also on 60s TTL via _pending_previews TTL machinery if applicable).
         self._pending_session_routes: dict[str, dict[str, Any]] = {}
+        # UC2 (session browser): the most recent "list my sessions in <project>"
+        # result per HUD session_id, so the wearer's follow-up ("continue #2 …")
+        # can resolve a numbered pick → resume that archived CC session.
+        self._pending_session_browse: dict[str, dict[str, Any]] = {}
         # R-13 / C-55: server-pull-on-demand vision. When router selects a
         # vision-aware tool but `event.payload.image` is None, Cortex emits
         # `request_image` to glass and awaits a matching `image_attached`
@@ -1542,6 +1573,145 @@ class CortexServer:
             ttl_ms=6_000,
         )
 
+    async def _handle_session_browse(
+        self, event: Event, ask_text: str, sid: str | None,
+    ) -> None:
+        """UC2 (a): "list my recent sessions in <project>". Deterministic disk
+        read (no LLM) → a numbered info card. Stash the listing keyed by the HUD
+        session_id so the wearer's next utterance ("continue #2 …") can resolve a
+        pick. The card also shows each session's last user message ("what did I
+        say last") so that question is answered in-line."""
+        from .session_browser import extract_project_query, list_project_sessions
+
+        project = extract_project_query(ask_text)
+        result = await asyncio.to_thread(list_project_sessions, project, 5)
+        sessions = result.get("sessions") or []
+        if not sessions:
+            await self._emit_info_card(
+                event_id=event.id,
+                title="No sessions found",
+                body=f"No Claude sessions matched “{project or 'that project'}”.",
+                ttl_ms=8_000,
+            )
+            return
+
+        # Stash for the pick follow-up (keyed by current HUD session; fall back
+        # to a sentinel so a session-less test invoke can still pick).
+        self._pending_session_browse[sid or "_no_sid"] = {
+            "sessions": sessions,
+            "project": result.get("matched_bucket"),
+            "ts": time.time(),
+        }
+
+        lines = []
+        for i, s in enumerate(sessions, 1):
+            last = s.get("last_user_msg") or ""
+            lines.append(f"{i}. {s['title'][:46]}  ({s['n_user_turns']}t·{s['age_min']}m)")
+            if last:
+                lines.append(f"   ↪ you: “{last[:60]}”")
+        body = "\n".join(lines) + "\n\nSay “continue #N: <instruction>”."
+        await self._emit_info_card(
+            event_id=event.id,
+            title=f"🗂 {result.get('working_dir','').split('/')[-1] or 'sessions'} — recent",
+            body=body,
+            ttl_ms=30_000,
+        )
+        log.info("session_browse.listed", project=project,
+                 bucket=result.get("matched_bucket"), n=len(sessions))
+
+    async def _handle_session_browse_pick(
+        self, event: Event, pending: dict[str, Any], idx: int, instruction: str,
+    ) -> None:
+        """UC2 (b): the wearer picked session #idx from a prior listing and (maybe)
+        gave a new instruction. Resume that ARCHIVED CC session via
+        `claude_code.agent` + `resume_cc_session_id` (the same path
+        `_resume_agent_with_modify`'s fallback uses), running in the session's own
+        cwd. If no instruction was given, just confirm entry and wait for the
+        next turn. Registers the resumed session in the HUD-tmux map so further
+        turns continue it via agent_continue."""
+        from .session_browser import working_dir_for_session
+        from .agent_brief import CANONICAL_ACTIONS_SCHEMA
+
+        sessions = pending.get("sessions") or []
+        if not (1 <= idx <= len(sessions)):
+            return
+        picked = sessions[idx - 1]
+        cc_sid = picked["session_id"]
+        working_dir = working_dir_for_session(cc_sid) or picked.get("working_dir")
+        # Consume the pending listing (one pick per listing).
+        self._pending_session_browse.pop(event.payload.get("session_id") or "_no_sid", None)
+
+        if not instruction:
+            # Pick-only: enter the session, surface its last message, await next turn.
+            await self._emit_info_card(
+                event_id=event.id,
+                title=f"▶ {picked['title'][:40]}",
+                body=(f"Resuming this session.\nYour last message:\n“{picked.get('last_user_msg','')[:120]}”"
+                      "\n\nWhat should I tell it?"),
+                ttl_ms=20_000,
+            )
+            # Remember the target so a plain next utterance continues it. We model
+            # this as a 1-item pending pick that any non-pick utterance resolves.
+            self._pending_session_browse[event.payload.get("session_id") or "_no_sid"] = {
+                "sessions": [picked], "project": pending.get("project"),
+                "ts": time.time(), "await_instruction": True,
+            }
+            return
+
+        await self._emit_progress_to_glass(
+            parent_event_id=event.id,
+            stage="resuming_agent", icon="▶️",
+            detail=f"resuming “{picked['title'][:30]}”",
+        )
+        add_dirs = [
+            os.path.expanduser("~/constellation/twin"),
+            os.path.expanduser("~/Code/Projects"),
+            os.path.expanduser("~/.claude/projects"),
+        ]
+        try:
+            rpc = await self._dispatch_to_tool({
+                "tool": "claude_code", "action": "agent",
+                "args": {
+                    "brief": instruction,
+                    "output_schema_hint": CANONICAL_ACTIONS_SCHEMA,
+                    "add_dirs": add_dirs,
+                    "working_dir": working_dir,
+                    "parent_event_id": event.id,
+                    "timeout_s": 240.0,
+                    "resume_cc_session_id": cc_sid,
+                    "keep_alive_on_final": True,
+                },
+                "result_format": "execute",
+            })
+        except Exception as e:
+            log.error("session_browse.resume_failed", error=str(e), cc_sid=cc_sid[:8])
+            await self._emit_info_card(
+                event_id=event.id, title="Couldn't resume",
+                body=f"Resume of that session failed: {e}", ttl_ms=8_000,
+            )
+            return
+
+        rpc_result = rpc.result or {}
+        if rpc_result.get("resume_failed") or not rpc_result.get("ok", True):
+            await self._emit_info_card(
+                event_id=event.id, title="Couldn't resume",
+                body=f"That session couldn't be rehydrated ({rpc_result.get('error','unknown')}).",
+                ttl_ms=8_000,
+            )
+            return
+        # Register so subsequent turns continue this (now-live) session.
+        new_sid = event.payload.get("session_id")
+        if new_sid:
+            self._hud_tmux_register(
+                new_sid, rpc_result, working_dir=working_dir,
+                timeout_s=240.0, ask_text=picked["title"],
+            )
+        await self._send_agent_card_for_decision(
+            rpc_result, event, working_dir, 240.0,
+        )
+        log.info("session_browse.resumed", cc_sid=cc_sid[:8],
+                 instruction_preview=instruction[:60])
+
     async def _emit_session_route_confirmation(
         self, *, event: Event, candidate_session_id: str,
         candidate_title: str, candidate_summary: str, confidence: float,
@@ -2342,6 +2512,32 @@ class CortexServer:
             await self._handle_shortcut_config(event, ask_text)
             return
 
+        # UC2 — session browser. Two hooks, pick-first so a pick utterance that
+        # also mentions "session" doesn't fall into a fresh listing:
+        #   (a) a pending listing for this HUD session + a pick ("continue #2 …")
+        #       → resume that archived CC session with the remainder instruction.
+        #   (b) "list my sessions in <project>" → list + show a numbered card.
+        from .session_browser import (
+            looks_session_browse, parse_pick, list_project_sessions,
+            extract_project_query,
+        )
+        pending_browse = self._pending_session_browse.get(existing_sid or "_no_sid")
+        if ask_text and pending_browse and not looks_session_browse(ask_text):
+            idx, instruction = parse_pick(ask_text, len(pending_browse["sessions"]))
+            if idx is not None:
+                await self._handle_session_browse_pick(
+                    event, pending_browse, idx, instruction)
+                return
+            # Pick-only step left a single session awaiting its instruction →
+            # treat this whole (non-pick, non-browse) utterance as that instruction.
+            if pending_browse.get("await_instruction"):
+                await self._handle_session_browse_pick(
+                    event, pending_browse, 1, ask_text)
+                return
+        if ask_text and looks_session_browse(ask_text):
+            await self._handle_session_browse(event, ask_text, existing_sid)
+            return
+
         # R-14 / C-56 — voice-addressable session router. Runs BEFORE start_turn
         # so the routed target dictates which session the turn extends. Short-
         # circuits when 0 or 1 sessions are active (caller behavior unchanged).
@@ -2657,7 +2853,14 @@ class CortexServer:
                 # Re-interpolate args (subtask N may reference N-1's result)
                 args = self._interpolate_args(st.get("args", {}), subtask_results, plan=plan)
                 if image_b64 and st["tool"] in _VISION_AWARE_TOOLS:
-                    args = {**args, "_image_b64": image_b64}
+                    args = {
+                        **args,
+                        "_image_b64": image_b64,
+                        # Intent-driven cost control: high only when reading text.
+                        "detail": args.get("detail") or _vision_detail_for(
+                            (event.payload or {}).get("text") or ""
+                        ),
+                    }
                 rpc_result = await self._dispatch_to_tool({**st, "args": args})
                 subtask_results.append(rpc_result.result)
             else:
