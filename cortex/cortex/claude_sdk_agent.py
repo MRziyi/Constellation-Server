@@ -234,10 +234,17 @@ class SdkAgentSession:
             return None
 
         if isinstance(msg, RateLimitEvent):
+            # status is the authoritative signal for THIS request:
+            #   'allowed'         → fine, proceed
+            #   'allowed_warning' → close to the limit, note it
+            #   'rejected'        → the request was actually blocked → stopped
+            # overage_status='rejected' is the NORMAL/desired state when usage
+            # credits are disabled (paid overage off) — it is NOT exhaustion and
+            # must NOT abort the run. (Verified 2026-05-30: a healthy run emits
+            # status='allowed' overage_status='rejected'.)
             info = msg.rate_limit_info
             status = getattr(info, "status", None)
-            over = getattr(info, "overage_status", None)
-            if status == "rejected" or over == "rejected":
+            if status == "rejected":
                 return await self._credit_exhausted_card(info)
             if status == "allowed_warning":
                 await self._progress("rate_warning", "⚠️",
@@ -314,7 +321,7 @@ class SdkAgentSession:
     # ── entry point ────────────────────────────────────────────────────────
 
     async def run(self) -> dict[str, Any]:
-        from claude_agent_sdk import query, ClaudeAgentOptions
+        from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
 
         _warn_if_api_key()
         opts = ClaudeAgentOptions(
@@ -328,11 +335,22 @@ class SdkAgentSession:
         await self._progress("dispatching_agent", "🤖",
                              f"dispatching agent ({self.permission_mode})")
 
+        # Use ClaudeSDKClient, NOT a one-shot query(): the native permission
+        # protocol (can_use_tool) needs the bidirectional stdio stream to stay
+        # OPEN for the whole turn. With query() the input stream closes as soon
+        # as the prompt is sent, so any permission request then fails with
+        # "Stream closed" and can_use_tool never fires (verified on-box
+        # 2026-05-30). The client also keeps the session alive for
+        # interrupt()=kill and multi-turn modify (Phase 2); receive_response()
+        # ends right after the ResultMessage, so there's no early-close race.
+        client = ClaudeSDKClient(options=opts)
+        self._client = client
         result: dict[str, Any] | None = None
         try:
             async def _drain() -> dict[str, Any] | None:
-                nonlocal result
-                async for msg in query(prompt=self.brief, options=opts):
+                await client.connect()
+                await client.query(self.brief)
+                async for msg in client.receive_response():
                     terminal = await self._handle_message(msg)
                     if terminal is not None:
                         return terminal
@@ -349,6 +367,11 @@ class SdkAgentSession:
             return {"ok": False, "error": str(e), "session_id": self.session_id,
                     "structured": None, "result_text": "", "is_checkpoint": False,
                     "n_tool_uses": self.n_tool_uses}
+        finally:
+            try:
+                await client.disconnect()
+            except Exception as e:
+                log.debug("sdk_agent.disconnect_noisy", error=str(e))
 
         if result is None:
             # stream ended without a ResultMessage (unexpected)
