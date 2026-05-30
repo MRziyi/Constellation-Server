@@ -376,26 +376,32 @@ def _vision_detail_for(text: str) -> str:
 #     auto-accepts file edits but PROMPTS for Bash/exec/other — and those prompts
 #     surface to Zack as checkpoint cards (Piece 2). Answer-needs (AskUserQuestion)
 #     surface as question cards (Piece 3).
-_AUTO_RUN_PATTERNS = [
-    re.compile(
-        r"(全自动|都自动|自动跑|全部(自动|批准|放行|跑)|都(批准|放行)|不用(问|确认)我?|"
-        r"无需确认|不用经过我|放手去做|你看着办|随便你|"
-        r"auto[-\s]?(run|approve|pilot|execute)|run\s+everything|"
-        r"don'?t\s+ask|no\s+confirm|without\s+asking|just\s+do\s+it|yolo)",
-        re.IGNORECASE,
-    ),
-]
+# Full-auto (bypassPermissions) is opt-in ONLY via the explicit phrase "自动模式"
+# (Zack 2026-05-30: "有'自动模式'这四个字的时候，才能开"). No other phrasing enables it —
+# everything else stays acceptEdits, so permission requests surface as cards.
+_AUTO_RUN_PATTERNS = [re.compile(r"自动模式")]
 
 
 def _permission_mode_for(text: str) -> str:
     """Decide the CC permission mode for a fresh conversation from its first
-    utterance. Explicit auto-run → 'bypassPermissions'; otherwise 'acceptEdits'
-    (the default 'edit mode' — prompts for non-edit tools, which become cards)."""
+    utterance (Zack 2026-05-30):
+      - 'bypassPermissions' (full auto, no permission cards) ONLY when the
+        utterance literally contains "自动模式" — the sole opt-in.
+      - otherwise 'acceptEdits' (the DEFAULT): file edits auto-apply, but every
+        other tool surfaces a checkpoint card and AskUserQuestion a question card."""
     if text:
         for p in _AUTO_RUN_PATTERNS:
             if p.search(text):
                 return "bypassPermissions"
     return "acceptEdits"
+
+
+def _use_sdk_agent() -> bool:
+    """P1 flag — route complex tasks through the in-process Claude Agent SDK
+    single-source path (claude_sdk_agent) instead of the tmux dual-worker
+    adapter. Default OFF: the tmux path stays the default and the fallback.
+    Set USE_SDK_AGENT=1 (env) to enable."""
+    return os.environ.get("USE_SDK_AGENT", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _card_type_for(options: list[str]) -> str:
@@ -715,6 +721,13 @@ class CortexServer:
         # {transcript, intent, orig_cmd_id, session_id, lang_hint}. Iron rule:
         # raw STT never reaches a downstream without an explicit approve.
         self._pending_stt_review: dict[str, dict[str, Any]] = {}
+        # P1 — outstanding Agent-SDK permission/question cards keyed by cmd_id;
+        # each holds the can_use_tool future that _handle_user_decision resolves
+        # (see claude_sdk_agent). Empty unless USE_SDK_AGENT is on.
+        self._sdk_pending: dict[str, dict[str, Any]] = {}
+        # P2 — in-flight SDK agent runs keyed by event.id, so a kill decision
+        # can interrupt the running turn (SdkAgentSession.interrupt()).
+        self._sdk_active: dict[str, Any] = {}
         # R-13 / C-55: server-pull-on-demand vision. When router selects a
         # vision-aware tool but `event.payload.image` is None, Cortex emits
         # `request_image` to glass and awaits a matching `image_attached`
@@ -2014,6 +2027,27 @@ class CortexServer:
             os.path.expanduser("~/Code/Projects"),
             os.path.expanduser("~/.claude/projects"),
         ]
+        # P1 (SDK single-source): resume the ARCHIVED session via the SDK
+        # (resume=cc_sid) instead of a tmux `claude --resume` respawn. This is
+        # spec point 8's "find a past session and continue it" through one
+        # ordered stream + native permission gate.
+        if _use_sdk_agent():
+            from .claude_sdk_agent import SdkAgentSession
+            rpc_result = await SdkAgentSession(
+                self, event, brief=instruction,
+                schema_hint=CANONICAL_ACTIONS_SCHEMA, add_dirs=add_dirs,
+                working_dir=working_dir, permission_mode=_permission_mode_for(instruction),
+                timeout_s=240.0, resume_session_id=cc_sid,
+            ).run()
+            if not rpc_result or not rpc_result.get("ok", True):
+                await self._emit_info_card(
+                    event_id=event.id, title="Couldn't resume",
+                    body=f"That session couldn't be resumed ({(rpc_result or {}).get('error', 'unknown')}).",
+                    ttl_ms=8_000)
+                return
+            await self._send_agent_card_for_decision(rpc_result, event, working_dir, 240.0)
+            log.info("session_browse.resumed_sdk", cc_sid=cc_sid[:8])
+            return
         try:
             rpc = await self._dispatch_to_tool({
                 "tool": "claude_code", "action": "agent",
@@ -2241,6 +2275,36 @@ class CortexServer:
                 cc_session_id=cc_session_id, modify_text=modify_text[:300],
             )
 
+        # ── P1 (SDK single-source): modify-on-FINAL = resume the prior session
+        # via the SDK with a modify brief. Skips the tmux reuse / --resume logic. ─
+        if _use_sdk_agent():
+            from .claude_sdk_agent import SdkAgentSession
+            await self._emit_progress_to_glass(
+                parent_event_id=original_event.id, stage="resuming_agent", icon="✍️",
+                detail=f"resuming session {cc_session_id[:8]} with your correction",
+            )
+            brief = build_modify_brief(
+                prior_summary=prior_struct.get("summary"),
+                prior_actions=prior_struct.get("actions"),
+                prior_notes=prior_struct.get("notes"),
+                modify_text=modify_text,
+                now_iso=datetime.now(timezone.utc).astimezone().isoformat(),
+            )
+            add_dirs = [
+                os.path.expanduser("~/constellation/twin"),
+                os.path.expanduser("~/Code/Projects"),
+                os.path.expanduser("~/.claude/projects"),
+            ]
+            rpc_result = await SdkAgentSession(
+                self, original_event, brief=brief,
+                schema_hint=CANONICAL_ACTIONS_SCHEMA, add_dirs=add_dirs,
+                working_dir=working_dir, permission_mode=_permission_mode_for(modify_text),
+                timeout_s=timeout_s, resume_session_id=cc_session_id,
+            ).run()
+            await self._send_agent_card_for_decision(
+                rpc_result or {}, original_event, working_dir, timeout_s)
+            return
+
         # ── P0.1 preferred path: paste into live tmux via agent_continue ──
         reuse_entry = self._hud_tmux_lookup(sid) if sid else None
         if reuse_entry and reuse_entry.get("cc_session_id") == cc_session_id:
@@ -2373,6 +2437,31 @@ class CortexServer:
         # reaches us (parent re-surfaces the card and bails).
         kind, resolved_text = _classify_user_decision(decision, feedback_text)
         user_text = "continue" if kind == "approve" else (resolved_text or "continue")
+
+        # P1 (SDK single-source): resume the prior session with the user's text
+        # (continue, or a checkpoint correction) instead of pasting into tmux.
+        if _use_sdk_agent():
+            from .claude_sdk_agent import SdkAgentSession
+            from .agent_brief import CANONICAL_ACTIONS_SCHEMA
+            if not cc_session_id:
+                log.warning("agent.resume_phase.no_session_sdk")
+                return
+            await self._emit_progress_to_glass(
+                parent_event_id=original_event.id, stage="resuming_agent", icon="✍️",
+                detail=f"resuming session {cc_session_id[:8]}",
+            )
+            rpc_result = await SdkAgentSession(
+                self, original_event, brief=user_text,
+                schema_hint=CANONICAL_ACTIONS_SCHEMA,
+                add_dirs=[os.path.expanduser("~/constellation/twin"),
+                          os.path.expanduser("~/Code/Projects"),
+                          os.path.expanduser("~/.claude/projects")],
+                working_dir=working_dir, permission_mode=_permission_mode_for(user_text),
+                timeout_s=timeout_s, resume_session_id=cc_session_id,
+            ).run()
+            await self._send_agent_card_for_decision(
+                rpc_result or {}, original_event, working_dir, timeout_s)
+            return
 
         log.info("agent.resuming", tmux_session=tmux_session, user_text=user_text[:80])
 
@@ -2573,7 +2662,9 @@ class CortexServer:
         # existing CC TUI (no fresh spawn, no brief re-load). CC retains
         # the system context (output schema, R1-R5 rules, twin skills,
         # available_dirs) from the original brief.
-        reuse_entry = self._hud_tmux_lookup(sid) if sid else None
+        # USE_SDK_AGENT (P1): the in-process SDK path runs fresh each turn —
+        # tmux reuse is a tmux-only optimization, so skip it when the flag is on.
+        reuse_entry = None if _use_sdk_agent() else (self._hud_tmux_lookup(sid) if sid else None)
         if reuse_entry:
             await self._emit_progress_to_glass(
                 parent_event_id=event.id,
@@ -2706,6 +2797,40 @@ class CortexServer:
         permission_mode = _permission_mode_for(ask_text)
         log.info("agent.permission_mode", mode=permission_mode,
                  ask_preview=ask_text[:50])
+
+        # P1 — in-process Agent SDK single-source path (additive, behind
+        # USE_SDK_AGENT). Produces the SAME rpc_result shape the tmux adapter
+        # returns, so _send_agent_card_for_decision and the modify/kill paths
+        # below are unchanged. The tmux dispatch (below) stays the default+fallback.
+        if _use_sdk_agent():
+            from .claude_sdk_agent import SdkAgentSession
+            if sid:
+                self.sessions.append(
+                    sid, "agent_dispatch", event_id=event.id,
+                    brief_chars=len(brief), add_dirs=add_dirs,
+                    timeout_s=timeout_s, via="sdk",
+                )
+            rpc_result = await SdkAgentSession(
+                self, event, brief=brief, schema_hint=schema_hint,
+                add_dirs=add_dirs, working_dir=working_dir,
+                permission_mode=permission_mode, timeout_s=timeout_s,
+                # UC2 / modify-on-final: continue a prior CC session when the
+                # caller supplied one (same payload key the tmux path uses).
+                resume_session_id=(event.payload or {}).get("resume_cc_session_id"),
+            ).run()
+            if sid and rpc_result:
+                self.sessions.append(
+                    sid, "agent_completed", event_id=event.id,
+                    cc_session_id=rpc_result.get("session_id"),
+                    n_tool_uses=rpc_result.get("n_tool_uses"),
+                    terminate_reason=rpc_result.get("terminate_reason"),
+                    is_checkpoint=rpc_result.get("is_checkpoint"), via="sdk",
+                )
+            await self._send_agent_card_for_decision(
+                rpc_result or {}, event,
+                working_dir=working_dir, timeout_s=timeout_s,
+            )
+            return
 
         # Dispatch the agent action. RPC returns when CC end_turn's
         # (checkpoint or final).
@@ -3443,6 +3568,16 @@ class CortexServer:
         # every decision: an already-open gate is a no-op.
         if self._decision_gate is not None:
             self._decision_gate.set()
+
+        # P1 — SDK permission/question cards resolve an in-process future
+        # (see claude_sdk_agent). Drain before the tmux/preview paths since
+        # their cmd_ids live in a separate registry (_sdk_pending). modify/answer
+        # without text re-opens the mic and keeps the card pending. No-op (returns
+        # False) when this cmd_id isn't an SDK card.
+        if self._sdk_pending and cmd_id in self._sdk_pending:
+            from .claude_sdk_agent import resolve_sdk_decision
+            if await resolve_sdk_decision(self, cmd_id, decision, feedback_text):
+                return
 
         # R-14.c: drain session-route confirmation cards FIRST. The cmd_id
         # would match an entry we stashed in `_pending_session_routes` when
