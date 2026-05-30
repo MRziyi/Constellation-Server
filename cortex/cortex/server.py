@@ -725,6 +725,9 @@ class CortexServer:
         # each holds the can_use_tool future that _handle_user_decision resolves
         # (see claude_sdk_agent). Empty unless USE_SDK_AGENT is on.
         self._sdk_pending: dict[str, dict[str, Any]] = {}
+        # P2 — in-flight SDK agent runs keyed by event.id, so a kill decision
+        # can interrupt the running turn (SdkAgentSession.interrupt()).
+        self._sdk_active: dict[str, Any] = {}
         # R-13 / C-55: server-pull-on-demand vision. When router selects a
         # vision-aware tool but `event.payload.image` is None, Cortex emits
         # `request_image` to glass and awaits a matching `image_attached`
@@ -2735,6 +2738,9 @@ class CortexServer:
                 self, event, brief=brief, schema_hint=schema_hint,
                 add_dirs=add_dirs, working_dir=working_dir,
                 permission_mode=permission_mode, timeout_s=timeout_s,
+                # UC2 / modify-on-final: continue a prior CC session when the
+                # caller supplied one (same payload key the tmux path uses).
+                resume_session_id=(event.payload or {}).get("resume_cc_session_id"),
             ).run()
             if sid and rpc_result:
                 self.sessions.append(

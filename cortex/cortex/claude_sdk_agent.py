@@ -228,6 +228,7 @@ class SdkAgentSession:
         working_dir: str | None,
         permission_mode: str,
         timeout_s: float,
+        resume_session_id: str | None = None,
     ) -> None:
         self.server = server
         self.event = event
@@ -237,8 +238,12 @@ class SdkAgentSession:
         self.working_dir = working_dir or os.path.expanduser("~")
         self.permission_mode = permission_mode
         self.timeout_s = timeout_s
-        self.session_id: str | None = None
+        # Phase 2/3: when set, continue a prior CC session (modify-on-final +
+        # UC2 archive resume) instead of starting fresh — full history restored.
+        self.resume_session_id = resume_session_id
+        self.session_id: str | None = resume_session_id
         self.n_tool_uses = 0
+        self._client: Any = None  # set in run(); used by interrupt()=kill
         # tool_use_id → (name, input): lets a tool RESULT be labelled with the
         # right outcome (edit line counts) and dedupes repeated tool_use frames.
         self._tool_calls: dict[str, tuple[str, dict[str, Any]]] = {}
@@ -480,6 +485,7 @@ class SdkAgentSession:
             cwd=self.working_dir,
             add_dirs=[str(d) for d in self.add_dirs],
             max_budget_usd=_MAX_BUDGET_USD,
+            resume=self.resume_session_id,   # Phase 2/3: continue a prior session
         )
         await self._progress("dispatching_agent", "🤖",
                              f"dispatching agent ({self.permission_mode})")
@@ -494,6 +500,10 @@ class SdkAgentSession:
         # ends right after the ResultMessage, so there's no early-close race.
         client = ClaudeSDKClient(options=opts)
         self._client = client
+        # Register so a kill decision can interrupt this in-flight turn.
+        active = getattr(self.server, "_sdk_active", None)
+        if active is not None:
+            active[self.event.id] = self
         result: dict[str, Any] | None = None
         try:
             async def _drain() -> dict[str, Any] | None:
@@ -517,6 +527,9 @@ class SdkAgentSession:
                     "structured": None, "result_text": "", "is_checkpoint": False,
                     "n_tool_uses": self.n_tool_uses}
         finally:
+            if active is not None:
+                active.pop(self.event.id, None)
+            self._client = None
             try:
                 await client.disconnect()
             except Exception as e:
@@ -528,6 +541,19 @@ class SdkAgentSession:
                     "structured": None, "result_text": "", "is_checkpoint": False,
                     "n_tool_uses": self.n_tool_uses}
         return result
+
+    async def interrupt(self) -> None:
+        """KILL the running turn (point 6: a flow ends as kill or run-to-end).
+        Interrupts the in-flight SDK query; the session_id persists on disk so
+        the killed flow stays resumable later (reject→Esc semantics)."""
+        c = self._client
+        if c is None:
+            return
+        try:
+            await c.interrupt()
+            log.info("sdk_agent.interrupted", session=self.session_id)
+        except Exception as e:
+            log.warning("sdk_agent.interrupt_failed", error=str(e))
 
 
 def _parse_structured(text: str) -> dict[str, Any] | None:
