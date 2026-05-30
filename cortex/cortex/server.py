@@ -398,6 +398,14 @@ def _permission_mode_for(text: str) -> str:
     return "acceptEdits"
 
 
+def _use_sdk_agent() -> bool:
+    """P1 flag — route complex tasks through the in-process Claude Agent SDK
+    single-source path (claude_sdk_agent) instead of the tmux dual-worker
+    adapter. Default OFF: the tmux path stays the default and the fallback.
+    Set USE_SDK_AGENT=1 (env) to enable."""
+    return os.environ.get("USE_SDK_AGENT", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _card_type_for(options: list[str]) -> str:
     """Piece 4 — the 3 formal card types, derived from the options the glass
     will render (so the client can switch rendering + ring-mapping cleanly):
@@ -715,6 +723,10 @@ class CortexServer:
         # {transcript, intent, orig_cmd_id, session_id, lang_hint}. Iron rule:
         # raw STT never reaches a downstream without an explicit approve.
         self._pending_stt_review: dict[str, dict[str, Any]] = {}
+        # P1 — outstanding Agent-SDK permission/question cards keyed by cmd_id;
+        # each holds the can_use_tool future that _handle_user_decision resolves
+        # (see claude_sdk_agent). Empty unless USE_SDK_AGENT is on.
+        self._sdk_pending: dict[str, dict[str, Any]] = {}
         # R-13 / C-55: server-pull-on-demand vision. When router selects a
         # vision-aware tool but `event.payload.image` is None, Cortex emits
         # `request_image` to glass and awaits a matching `image_attached`
@@ -2573,7 +2585,9 @@ class CortexServer:
         # existing CC TUI (no fresh spawn, no brief re-load). CC retains
         # the system context (output schema, R1-R5 rules, twin skills,
         # available_dirs) from the original brief.
-        reuse_entry = self._hud_tmux_lookup(sid) if sid else None
+        # USE_SDK_AGENT (P1): the in-process SDK path runs fresh each turn —
+        # tmux reuse is a tmux-only optimization, so skip it when the flag is on.
+        reuse_entry = None if _use_sdk_agent() else (self._hud_tmux_lookup(sid) if sid else None)
         if reuse_entry:
             await self._emit_progress_to_glass(
                 parent_event_id=event.id,
@@ -2706,6 +2720,37 @@ class CortexServer:
         permission_mode = _permission_mode_for(ask_text)
         log.info("agent.permission_mode", mode=permission_mode,
                  ask_preview=ask_text[:50])
+
+        # P1 — in-process Agent SDK single-source path (additive, behind
+        # USE_SDK_AGENT). Produces the SAME rpc_result shape the tmux adapter
+        # returns, so _send_agent_card_for_decision and the modify/kill paths
+        # below are unchanged. The tmux dispatch (below) stays the default+fallback.
+        if _use_sdk_agent():
+            from .claude_sdk_agent import SdkAgentSession
+            if sid:
+                self.sessions.append(
+                    sid, "agent_dispatch", event_id=event.id,
+                    brief_chars=len(brief), add_dirs=add_dirs,
+                    timeout_s=timeout_s, via="sdk",
+                )
+            rpc_result = await SdkAgentSession(
+                self, event, brief=brief, schema_hint=schema_hint,
+                add_dirs=add_dirs, working_dir=working_dir,
+                permission_mode=permission_mode, timeout_s=timeout_s,
+            ).run()
+            if sid and rpc_result:
+                self.sessions.append(
+                    sid, "agent_completed", event_id=event.id,
+                    cc_session_id=rpc_result.get("session_id"),
+                    n_tool_uses=rpc_result.get("n_tool_uses"),
+                    terminate_reason=rpc_result.get("terminate_reason"),
+                    is_checkpoint=rpc_result.get("is_checkpoint"), via="sdk",
+                )
+            await self._send_agent_card_for_decision(
+                rpc_result or {}, event,
+                working_dir=working_dir, timeout_s=timeout_s,
+            )
+            return
 
         # Dispatch the agent action. RPC returns when CC end_turn's
         # (checkpoint or final).
@@ -3443,6 +3488,16 @@ class CortexServer:
         # every decision: an already-open gate is a no-op.
         if self._decision_gate is not None:
             self._decision_gate.set()
+
+        # P1 — SDK permission/question cards resolve an in-process future
+        # (see claude_sdk_agent). Drain before the tmux/preview paths since
+        # their cmd_ids live in a separate registry (_sdk_pending). modify/answer
+        # without text re-opens the mic and keeps the card pending. No-op (returns
+        # False) when this cmd_id isn't an SDK card.
+        if self._sdk_pending and cmd_id in self._sdk_pending:
+            from .claude_sdk_agent import resolve_sdk_decision
+            if await resolve_sdk_decision(self, cmd_id, decision, feedback_text):
+                return
 
         # R-14.c: drain session-route confirmation cards FIRST. The cmd_id
         # would match an entry we stashed in `_pending_session_routes` when
