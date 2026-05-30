@@ -38,7 +38,13 @@ CANONICAL_ACTIONS_SCHEMA: dict[str, Any] = {
             ),
             "items": {"type": "object", "required": ["type"]},
         },
-        "summary":    {"type": "string", "description": "one HUD line"},
+        "summary":    {"type": "string", "description": (
+            "Your reply to Zack on the HUD. For a QUESTION / lookup (he asked "
+            "something or wants info — no side effect) put the FULL answer here "
+            "(may be multi-line); actions stays []. For an execute task it's a "
+            "1-line recap. NEVER empty — empty summary + empty actions = Zack "
+            "sees nothing."
+        )},
         "notes":      {"type": "string", "description": "info NOT requiring action"},
         # Phase fields (only set at checkpoints):
         "phase_done": {"type": "boolean", "description": "true → just finished a phase; pause for Zack"},
@@ -121,13 +127,16 @@ def build_agent_brief(
         L.append("== OUTPUT (your FINAL message must be exactly this JSON; nothing around it) ==")
         L.append("```")
         L.append("{")
-        L.append('  "summary":    "1-line for HUD",                  // required')
+        L.append('  "summary":    "your reply to Zack — a QUESTION/lookup → the FULL answer here (multi-line ok), actions:[]; NEVER empty",  // required')
         L.append('  "actions":    [ ... ],                           // required; 0+ items, shapes below')
         L.append('  "notes":      "optional info Zack should know",  // optional')
         L.append('  "phase_done": true,                              // only at a phase checkpoint')
         L.append('  "next":       "1-line plan for next phase"       // only with phase_done')
         L.append("}")
         L.append("```")
+        L.append("ANSWER vs ACTION — if Zack ASKED something / wants info (no side effect):")
+        L.append("  actions:[] AND write the FULL answer in summary — that IS the deliverable")
+        L.append("  (multi-line ok). Empty summary + empty actions = Zack sees nothing. Never that.")
         L.append("Action shapes (omit fields not needed):")
         L.append("  " + _ACTION_APPENDIX.replace("\n", "\n  "))
         L.append("Self-check before emitting: parses cleanly · required fields per type · all times ISO 8601 with TZ.")

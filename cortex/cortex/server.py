@@ -302,16 +302,39 @@ _VISUAL_INTENT_PATTERNS = [
     # English: explicit "what's in front" / "what do you see"
     re.compile(r"\b(what'?s in front|what do you see|what am i looking at)\b", re.IGNORECASE),
     # Chinese: 看 (see/look) / 这是什么 / 那是什么 / 前面 / 屏幕
-    re.compile(r"(看一?下|这是什么|那是什么|前面|这个是|那个是|屏幕上)"),
+    # Wide on purpose (Zack 2026-05-30): over-capturing wastes ~70KB/1.5s, but
+    # UNDER-capturing (missing "我面前/眼前看到的是什么") leaves the agent
+    # blind → it stalls. So err toward capture.
+    re.compile(
+        r"(看一?下|看到|看见|看看|瞧|这是什么|那是什么|是什么|什么东西|什么牌子|"
+        r"前面|眼前|面前|跟前|眼睛?前|这个是|那个是|屏幕上|拍.{0,3}(照|图|张)|帮我看|认一?下)"
+    ),
 ]
+
+# Fixed VISION-TRIGGER cue (Zack 2026-05-30): rather than exhaust every "look at
+# the scene" phrasing with regex (always misses cases — real example "我眼前看到
+# 的是什么" slipped through, while "看我的profile" false-fired), the user opts
+# into a fixed word — 「视觉」 — that ALWAYS triggers a capture. Includes common
+# STT mishears (视角/试觉/世觉…) + pinyin + English so a slightly-misheard cue
+# still fires. The STT-review card is the backstop: if mangled beyond these the
+# user sees the (wrong) transcript and re-speaks. Kept ALONGSIDE the broad regex
+# above (still catches obvious scene asks even without the cue — over-capture is
+# cheap, under-capture stalls the agent).
+_VISION_KEYWORD_PATTERN = re.compile(
+    r"(视觉|视角|视\s?觉|视\s?决|试觉|事觉|世觉|实觉|是觉|vision|visual|sh[ií]?\s?ju[eé])",
+    re.IGNORECASE,
+)
 
 
 def _looks_visual_intent(text: str) -> bool:
-    """True iff the user's text reads like a visual question that would
-    benefit from a scene capture. Used to gate the C-55 upfront image pull.
-    Conservative regex; no LLM call."""
+    """True iff the text should trigger a scene capture. The fixed cue 「视觉」
+    (+ near-mishears, see _VISION_KEYWORD_PATTERN) ALWAYS triggers — the reliable
+    opt-in path the user controls; the broad _VISUAL_INTENT_PATTERNS regex is a
+    best-effort bonus. No LLM call."""
     if not text:
         return False
+    if _VISION_KEYWORD_PATTERN.search(text):
+        return True
     for pat in _VISUAL_INTENT_PATTERNS:
         if pat.search(text):
             return True
@@ -686,6 +709,12 @@ class CortexServer:
         # result per HUD session_id, so the wearer's follow-up ("continue #2 …")
         # can resolve a numbered pick → resume that archived CC session.
         self._pending_session_browse: dict[str, dict[str, Any]] = {}
+        # STT-review gate (Zack 2026-05-30): EVERY voice transcript surfaces an
+        # "STT review" card and waits for the wearer's approval BEFORE any
+        # GPT/router/Claude-Code/send. Keyed by the review card's cmd_id →
+        # {transcript, intent, orig_cmd_id, session_id, lang_hint}. Iron rule:
+        # raw STT never reaches a downstream without an explicit approve.
+        self._pending_stt_review: dict[str, dict[str, Any]] = {}
         # R-13 / C-55: server-pull-on-demand vision. When router selects a
         # vision-aware tool but `event.payload.image` is None, Cortex emits
         # `request_image` to glass and awaits a matching `image_attached`
@@ -693,6 +722,28 @@ class CortexServer:
         # image b64 string (or None on timeout/empty payload).
         self._pending_image_requests: dict[str, asyncio.Future[str | None]] = {}
         # cmd_id → { event_id, plan, current_subtask_results, [wake_response_map] }
+
+        # ── Unified glass OUTBOX (Zack 2026-05-30) ─────────────────────────
+        # ALL outbound glass frames — agent progress, cards, insights, mic, … —
+        # go through ONE ordered queue drained by a SINGLE sender coroutine.
+        # Handlers enqueue synchronously (put_nowait, never suspend), so enqueue
+        # order == event-processing order == send order. Kills the prior tech
+        # debt where many async paths each `await glass_conn.send(...)`
+        # independently could interleave / arrive out of order (a slow worker's
+        # earlier event landing AFTER a faster later one). Per-connection:
+        # created on connect, cancelled + dropped on disconnect.
+        # Outbox items are (payload, blocks_until_decision). When a decision card
+        # (checkpoint/question/stt_review/permission) is sent, the sender PAUSES
+        # after it until the wearer's decision arrives — later frames (progress)
+        # queue up behind it and are NEVER dropped or allowed to bury the card.
+        # `_decision_gate` is the pause latch: set = flow open, cleared = waiting.
+        self._glass_outbox: asyncio.Queue[tuple[str, bool]] | None = None
+        self._glass_sender_task: asyncio.Task[None] | None = None
+        self._decision_gate: asyncio.Event | None = None
+        # Background tasks spawned off the glass receive loop (agent runs etc.)
+        # so the loop never blocks and can always deliver a mid-run decision.
+        self._bg_tasks: set[asyncio.Task[Any]] = set()
+        self._glass_seq = 0
 
         # Available tools block for Router prompt + validation set.
         self._tools_block, self._allowed_tools = available_tools_block(
@@ -762,6 +813,25 @@ class CortexServer:
 
     # ── Glass-side handler ──
 
+    def _spawn_bg(self, coro: Any, label: str) -> "asyncio.Task[Any]":
+        """Run a coroutine off the current loop, keeping a strong ref (so it's
+        not GC'd mid-flight) and logging any exception (create_task swallows
+        them otherwise). Used to keep the glass receive loop non-blocking."""
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+
+        def _done(t: "asyncio.Task[Any]") -> None:
+            self._bg_tasks.discard(t)
+            try:
+                t.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                log.error("bg_task.failed", label=label, error=str(e), exc_info=True)
+
+        task.add_done_callback(_done)
+        return task
+
     async def handle_glass(self, ws: ServerConnection) -> None:
         # Phase 3b — parse client capabilities from the connect URL query.
         # Glass declares `?accept=hud_state,card,insight,mic_open,mic_close`
@@ -784,6 +854,13 @@ class CortexServer:
         log.info("glass.connected", remote=ws.remote_address, accept=sorted(accept_kinds))
         self._glass_conn = ws
         self._glass_accept = accept_kinds
+        # Spin up the single ordered sender for THIS connection — the only
+        # coroutine that writes the glass socket (see _glass_send).
+        self._glass_outbox = asyncio.Queue()
+        self._decision_gate = asyncio.Event()
+        self._decision_gate.set()  # open; cleared only while a decision card waits
+        self._glass_seq = 0
+        self._glass_sender_task = asyncio.create_task(self._glass_sender_loop(ws))
         # P2.3 — surface any pending startup card (e.g. TCC denials caught
         # before Glass was online). One-shot; clear after delivery.
         pending_startup = getattr(self, "_pending_startup_card", None)
@@ -800,7 +877,7 @@ class CortexServer:
                     },
                     requires_confirm=False, ttl_ms=60_000,
                 )
-                await ws.send(cmd.model_dump_json())
+                self._glass_send(cmd.model_dump_json())
                 log.info("startup_card.delivered", title=pending_startup["title"][:60])
             except Exception as e:
                 log.warning("startup_card.send_failed", error=str(e))
@@ -811,11 +888,27 @@ class CortexServer:
                 event_data.pop("id", None)  # Cortex assigns ids on ingress
                 event = Event(**event_data, id=ids.event_id())
                 log.info("glass.event", id=event.id, kind=event.kind)
-                await self._process_event(event)
+                # Audio frames must stay ordered + are fast → inline. Everything
+                # else (decisions, the synthesized invoke after STT-approve) may
+                # kick off a LONG agent run that itself awaits a FURTHER glass
+                # decision (permission / answer / modify). Running that inline
+                # blocks this receive loop, so that decision can never arrive →
+                # the agent waits forever for an approval it can't get (deadlock
+                # observed 2026-05-30 on the permission flow). Spawn it off-loop.
+                if event.kind in ("audio_chunk", "audio_end"):
+                    await self._process_event(event)
+                else:
+                    self._spawn_bg(self._process_event(event), f"glass:{event.kind}")
         except websockets.exceptions.ConnectionClosed:
             log.info("glass.disconnected")
         finally:
             self._glass_conn = None
+            # Tear down this connection's ordered sender + drop any queued frames
+            # (they belong to the peer that just left; the next peer starts clean).
+            if self._glass_sender_task is not None:
+                self._glass_sender_task.cancel()
+                self._glass_sender_task = None
+            self._glass_outbox = None
 
     async def _process_event(self, event: Event) -> None:
         if self.plane:
@@ -907,6 +1000,12 @@ class CortexServer:
         if not self._glass_conn:
             return  # nobody to tell; skip
 
+        # NOTE: the old "drop progress while a decision is pending" hack was
+        # removed (Zack 2026-05-30). The unified outbox now PARKS the sender
+        # after a decision card instead of discarding progress — nothing is
+        # dropped; queued progress simply waits behind the card and flows once
+        # the decision is made. No舍弃.
+
         # Frame shape — see AGENT-ARCHITECTURE-V2 §3. id starts with "prog_"
         # so the Glass client can distinguish from Command (which uses "cmd_").
         frame = {
@@ -923,7 +1022,7 @@ class CortexServer:
             "tool": payload.get("tool"),
         }
         try:
-            await self._glass_conn.send(json.dumps(frame, ensure_ascii=False))
+            self._glass_send(json.dumps(frame, ensure_ascii=False))
         except Exception as e:
             log.warning("progress.send_failed", error=str(e))
 
@@ -977,7 +1076,7 @@ class CortexServer:
             "tool": None,
         }
         try:
-            await self._glass_conn.send(json.dumps(frame, ensure_ascii=False))
+            self._glass_send(json.dumps(frame, ensure_ascii=False))
         except Exception as e:
             log.warning("local_progress.send_failed", error=str(e))
 
@@ -1011,7 +1110,7 @@ class CortexServer:
             # Optionally tell Glass that we noted but ignored — saves the user
             # from wondering "did it hear me?"
             if self._glass_conn:
-                await self._glass_conn.send(json.dumps({
+                self._glass_send(json.dumps({
                     "id": f"prog_{ids.event_id()[4:]}",
                     "kind": "progress",
                     "ts": datetime.now(timezone.utc).isoformat(),
@@ -1028,7 +1127,7 @@ class CortexServer:
             await self._inject_feedback_into_agent(tmux_session, text)
             log.info("progress_feedback.injected", parent=parent_event_id, text=text[:80])
             if self._glass_conn:
-                await self._glass_conn.send(json.dumps({
+                self._glass_send(json.dumps({
                     "id": f"prog_{ids.event_id()[4:]}",
                     "kind": "progress",
                     "ts": datetime.now(timezone.utc).isoformat(),
@@ -1151,7 +1250,7 @@ class CortexServer:
         # while we crunch). Reuses the existing progress channel.
         if self._glass_conn:
             try:
-                await self._glass_conn.send(json.dumps({
+                self._glass_send(json.dumps({
                     "id": f"prog_{ids.event_id()[4:]}",
                     "kind": "progress",
                     "ts": datetime.now(timezone.utc).isoformat(),
@@ -1177,50 +1276,99 @@ class CortexServer:
                  stream_id=sid, n_chars=len(transcript), intent=intent)
 
         if not transcript.strip():
+            # STILL surface an stt_review card — Glass already swapped to its
+            # loading placeholder on utterance-end (#3); without a card it would
+            # spin forever. Empty transcript → guide a re-speak (Zack 2026-05-30).
             log.info("audio_end.empty_transcript")
-            return
-
-        if intent == "modify" and cmd_id:
-            # User said "改 …" → treat as user_decision feedback for the
-            # pending card. Synthesize the event the existing handler expects.
-            synth = Event(
-                id=ids.event_id(),
-                kind="user_decision",
-                ts=datetime.now(timezone.utc),
-                payload={
-                    "in_reply_to": cmd_id,
-                    "decision": "Modify",
-                    "feedback_text": transcript,
-                },
+            review_cmd_id = ids.command_id()
+            self._pending_stt_review[review_cmd_id] = {
+                "transcript": "", "intent": intent, "orig_cmd_id": cmd_id,
+                "session_id": session_id, "lang_hint": lang_hint,
+            }
+            await self.emit_card(
+                cmd_id=review_cmd_id, title="STT review",
+                body_md="没听清 —— 长按重讲", options=["approve", "redo"],
+                card_type="stt_review", ttl_ms=120_000,
             )
-            await self._handle_user_decision(synth)
             return
 
-        if intent == "answer" and cmd_id:
-            # User spoke their answer to a QUESTION card → feed it as the
-            # card's "answer" decision; _handle_user_decision drives CC's
-            # AskUserQuestion "Other" with this text.
-            synth = Event(
-                id=ids.event_id(),
-                kind="user_decision",
-                ts=datetime.now(timezone.utc),
-                payload={
-                    "in_reply_to": cmd_id,
-                    "decision": "answer",
-                    "feedback_text": transcript,
-                },
-            )
-            await self._handle_user_decision(synth)
-            return
-
-        # Fresh user_invoke (from IDLE wake or first turn).
-        synth = Event(
-            id=ids.event_id(),
-            kind="user_invoke",
-            ts=datetime.now(timezone.utc),
-            payload={"text": transcript, "session_id": session_id},
+        # ── STT-REVIEW GATE (Zack 2026-05-30) ────────────────────────────────
+        # IRON RULE: raw STT never reaches a downstream (GPT classifier/router,
+        # Claude Code answer/modify, or any send) without the wearer's explicit
+        # approval. Whatever the intent (fresh / modify / answer), we FIRST
+        # surface an "STT review" card showing the transcript and stop here. On
+        # approve → `_route_stt_approved` runs the original routing; on redo →
+        # `_redo_stt` re-opens the right mic. This is the ONLY exit from
+        # audio_end now — no intent path bypasses the review.
+        review_cmd_id = ids.command_id()
+        self._pending_stt_review[review_cmd_id] = {
+            "transcript": transcript,
+            "intent": intent,
+            "orig_cmd_id": cmd_id,
+            "session_id": session_id,
+            "lang_hint": lang_hint,
+        }
+        await self.emit_card(
+            cmd_id=review_cmd_id,
+            title="STT review",
+            body_md=transcript,
+            options=["approve", "redo"],
+            card_type="stt_review",
+            ttl_ms=120_000,
         )
-        await self._handle_user_invoke(synth)
+        log.info("stt_review.surfaced", review_cmd_id=review_cmd_id,
+                 intent=intent, orig_cmd_id=cmd_id, n_chars=len(transcript))
+
+    async def _route_stt_approved(self, stt: dict[str, Any]) -> None:
+        """STT review APPROVED → now route the reviewed transcript per its
+        original intent. This is the single point where voice enters the real
+        pipeline (GPT / Claude Code). Mirrors the pre-gate audio_end routing."""
+        transcript = stt["transcript"]
+        intent = stt.get("intent", "fresh")
+        orig = stt.get("orig_cmd_id")
+        session_id = stt.get("session_id")
+        if not transcript.strip():
+            # Empty-transcript card was approved instead of redone — nothing to
+            # route. No-op (the wearer can re-speak from Idle). Never sends empty
+            # text downstream (Zack 2026-05-30).
+            log.info("stt_review.approved_empty_noop")
+            return
+        if intent == "modify" and orig:
+            synth = Event(
+                id=ids.event_id(), kind="user_decision",
+                ts=datetime.now(timezone.utc),
+                payload={"in_reply_to": orig, "decision": "Modify",
+                         "feedback_text": transcript},
+            )
+            await self._handle_user_decision(synth)
+        elif intent == "answer" and orig:
+            synth = Event(
+                id=ids.event_id(), kind="user_decision",
+                ts=datetime.now(timezone.utc),
+                payload={"in_reply_to": orig, "decision": "answer",
+                         "feedback_text": transcript},
+            )
+            await self._handle_user_decision(synth)
+        else:
+            synth = Event(
+                id=ids.event_id(), kind="user_invoke",
+                ts=datetime.now(timezone.utc),
+                payload={"text": transcript, "session_id": session_id},
+            )
+            await self._handle_user_invoke(synth)
+
+    async def _redo_stt(self, stt: dict[str, Any]) -> None:
+        """STT review REJECTED (重讲) → re-open the right mic to say it again,
+        preserving the original intent so the redo's transcript routes the same
+        way once re-approved."""
+        intent = stt.get("intent", "fresh")
+        orig = stt.get("orig_cmd_id")
+        if intent == "modify" and orig:
+            await self.emit_mic_open(stream_id=f"modify_{orig}", ttl_ms=30_000)
+        elif intent == "answer" and orig:
+            await self.emit_mic_open(stream_id=f"answer_{orig}", ttl_ms=30_000)
+        else:
+            await self.emit_mic_open(stream_id=f"fresh_{ids.event_id()[4:]}", ttl_ms=30_000)
 
     async def _handle_decision_voice(self, event: Event) -> None:
         """InstructSdk on the Glass fired a keyword for the current CARD.
@@ -1263,6 +1411,48 @@ class CortexServer:
 
     # ── Phase 3b: Glass-shaped command emitters ──────────────────────────
 
+    def _glass_send(self, payload: str, *, blocks: bool = False) -> None:
+        """Enqueue ONE serialized frame onto the unified glass outbox. Synchronous
+        and non-suspending (put_nowait) so enqueue order is preserved EXACTLY as
+        the send order by the single _glass_sender_loop — no interleaving, no
+        out-of-order arrival across async producers. `blocks=True` marks a
+        decision card: after sending it the sender pauses until the wearer
+        decides (later frames wait in the queue, never dropped). No-op if no
+        glass peer is connected (outbox is None)."""
+        ob = self._glass_outbox
+        if ob is None:
+            return
+        self._glass_seq += 1
+        ob.put_nowait((payload, blocks))
+
+    async def _glass_sender_loop(self, ws: Any) -> None:
+        """The SOLE writer to the glass socket. Drains the outbox in FIFO order
+        so frames reach the eyewear exactly in enqueue order. After a decision
+        card (blocks=True) it PARKS on _decision_gate until the wearer's decision
+        clears it — so a permission/checkpoint card is never buried by the
+        progress that the jsonl tail emits right after it (replaces the old
+        'drop the progress' hack; nothing is discarded, it just waits)."""
+        ob = self._glass_outbox
+        gate = self._decision_gate
+        if ob is None or gate is None:
+            return
+        try:
+            while True:
+                payload, blocks = await ob.get()
+                try:
+                    await ws.send(payload)
+                except Exception as e:
+                    log.warning("glass_send.failed", error=str(e))
+                if blocks:
+                    # Park until the decision arrives (gate set by
+                    # _handle_user_decision). Queued progress waits behind us.
+                    gate.clear()
+                    log.info("glass_sender.parked_for_decision")
+                    await gate.wait()
+                    log.info("glass_sender.resumed")
+        except asyncio.CancelledError:
+            pass
+
     async def _emit_glass_frame(self, kind: str, payload: dict[str, Any]) -> None:
         """Generic emit of a glass-shaped command frame. No-op if the current
         Glass peer didn't declare it in its `?accept=` handshake (i.e., we're
@@ -1275,11 +1465,13 @@ class CortexServer:
             "kind": kind,
             **payload,
         }
-        try:
-            await self._glass_conn.send(json.dumps(frame, ensure_ascii=False))
-            log.info("glass_frame.emit", kind=kind)
-        except Exception as e:
-            log.warning("glass_frame.emit_failed", kind=kind, error=str(e))
+        # A decision card (wearer must act) parks the sender until decided, so
+        # trailing progress can't bury it; notification (options=[]) does not.
+        blocks = kind == "card" and payload.get("card_type") in (
+            "checkpoint", "question", "stt_review",
+        )
+        self._glass_send(json.dumps(frame, ensure_ascii=False), blocks=blocks)
+        log.info("glass_frame.emit", kind=kind, blocks=blocks)
 
     async def emit_hud_state(
         self, *, stage: str, icon: str | None = None,
@@ -1299,6 +1491,8 @@ class CortexServer:
         scroll_total_lines: int = 0,
         options: list[str] | None = None,
         ttl_ms: int = 30_000,
+        echo: str | None = None,
+        card_type: str | None = None,
     ) -> None:
         from .markdown_runs import to_runs
         # `options is None` means "no caller preference — use the canonical
@@ -1306,17 +1500,25 @@ class CortexServer:
         # no actionable buttons" — must be preserved as empty (don't fall
         # through to the truthiness default).
         resolved_options = ["approve", "modify", "kill"] if options is None else options
-        await self._emit_glass_frame("card", {
+        frame: dict[str, Any] = {
             "cmd_id": cmd_id,
             "title_runs": to_runs(title),
             "body_runs": to_runs(body_md),
             "scroll_total_lines": scroll_total_lines,
             "options": resolved_options,
             # Piece 4: explicit card type so Glass renders + ring-maps cleanly
-            # (notification=dismiss · checkpoint=approve/modify/reject · question=answer).
-            "card_type": _card_type_for(resolved_options),
+            # (notification=dismiss · checkpoint=approve/modify/reject · question=answer
+            #  · stt_review=approve/redo). Caller may override the derived type.
+            "card_type": card_type or _card_type_for(resolved_options),
             "ttl_ms": ttl_ms,
-        })
+        }
+        # "Quote + body" layout (Zack 2026-05-30): when we know what triggered
+        # this card — the wearer's own words, or the upstream tool's ask — pass
+        # it as `echo` so Glass renders a dim quoted row above the title. Glass
+        # degrades gracefully (no row) when absent.
+        if echo and echo.strip():
+            frame["echo_runs"] = to_runs(echo.strip())
+        await self._emit_glass_frame("card", frame)
 
     async def emit_insight(
         self, *, title: str, body_md: str, insight_kind: str,
@@ -1437,11 +1639,17 @@ class CortexServer:
         )
         if not will_emit_glass:
             try:
-                await self._glass_conn.send(cmd.model_dump_json())
+                self._glass_send(cmd.model_dump_json())
             except Exception as e:
                 log.warning("command.send_failed", id=cmd.id, kind=cmd.kind, error=str(e))
                 return
-        # Glass-shaped frame, if the peer wants one.
+        # Glass-shaped frame, if the peer wants one. Pull the wearer's own words
+        # (when this card traces back to a user_invoke) so emit_card can render
+        # the "quote + body" layout. Cards with no user utterance behind them
+        # (some reverse-wake paths) get echo="" → no quote row (graceful).
+        _pending = self._pending_previews.get(cmd.id)
+        _ev = _pending.get("event") if _pending else None
+        echo_text = (getattr(_ev, "payload", None) or {}).get("text") or "" if _ev else ""
         if cmd.kind == "preview_action":
             options = cmd.payload.get("options") or []
             await self.emit_card(
@@ -1450,6 +1658,7 @@ class CortexServer:
                 body_md=cmd.payload.get("body", ""),
                 options=options,
                 ttl_ms=cmd.ttl_ms,
+                echo=echo_text,
             )
             # NB: the mic is NOT opened here. Under ring-exclusive control the
             # mic opens only when the wearer explicitly asks to Modify (ring
@@ -1480,6 +1689,7 @@ class CortexServer:
                     body_md=cmd.payload.get("body", ""),
                     options=[],  # info-only: caller relies on emit_card preserving []
                     ttl_ms=cmd.ttl_ms,
+                    echo=echo_text,
                 )
 
     # ── P0.1: HUD-session-scoped CC tmux registry ─────────────────────────
@@ -2263,18 +2473,25 @@ class CortexServer:
             title = f"Agent ready — {len(subtasks)} action{'s' if len(subtasks) != 1 else ''}"
         else:
             subtasks = []
-            # Prefer the structured `summary` field (clean prose CC was asked
-            # to produce) over the raw result_text (which is the whole JSON
-            # blob {summary, actions, notes} serialized — looks like raw JSON
-            # in the HUD body). Notes append if present, for context.
+            # No actions → this is an ANSWER (query/lookup), not a proposal.
+            # Show the agent's reply AS the body and DROP the old long
+            # "Agent finished — no actions" header (Zack 2026-05-30: low info,
+            # too long). Prefer structured.summary (clean prose) over raw
+            # result_text (which may be the serialized JSON blob).
             summary = (structured or {}).get("summary") if isinstance(structured, dict) else None
             notes = (structured or {}).get("notes") if isinstance(structured, dict) else None
             if summary:
                 body_md = summary if not notes else f"{summary}\n\n— {notes}"
+                title = ""  # the answer IS the body; no redundant header
             else:
-                body_md = (rpc_result.get("result_text") or "(no actions proposed)")
+                raw = (rpc_result.get("result_text") or "").strip()
+                if raw and not raw.lstrip().startswith("{"):
+                    body_md = raw      # plain final text → show it as the answer
+                    title = ""
+                else:
+                    body_md = "（这次没有产生结果)"
+                    title = "没有结果"
             body_md = body_md[:1500]
-            title = "Agent finished — no actions"
 
         cmd = Command(
             id=ids.command_id(), ts=datetime.now(timezone.utc),
@@ -2549,7 +2766,7 @@ class CortexServer:
                     },
                     requires_confirm=False, ttl_ms=20_000,
                 )
-                await self._glass_conn.send(err_cmd.model_dump_json())
+                self._glass_send(err_cmd.model_dump_json())
             return
 
         await self._send_agent_card_for_decision(
@@ -2618,10 +2835,23 @@ class CortexServer:
                     "args": {"session_id": session_id, "keys": keys, "literal": False},
                     "context_pack": [], "result_format": "execute",
                 }
-            allow_keys = ["Enter"]            # option 1 "Yes"
-            deny_keys = ["Down", "Down", "Enter"]  # option 3 "No"
-            wake_response_map = {"approve": _send(allow_keys), "reject": _send(deny_keys)}
-            wake_permission = {"session_id": session_id, "deny": _send(deny_keys)}
+            # Real CC permission menu (verified on-device 2026-05-30, Bash prompt):
+            #   "Do you want to proceed?  ❯ 1. Yes   2. No   · Tab to amend"
+            # approve = Yes (cursor starts on 1 → Enter); reject = No (Down,Enter);
+            # modify = CC's NATIVE "tell Claude what to do" = Tab to amend, then
+            # type Zack's spoken correction (cleaner than deny+reinject).
+            # Verified on-device 2026-05-30 — CC's menu is "❯1. Yes / 2. No"
+            # where selecting No → "What should Claude do instead?" (free text).
+            #   approve = Yes            → Enter
+            #   modify  = No + tell      → Down,Enter then type the correction
+            #   reject  = pure cancel    → Esc (the agent stops this flow but the
+            #             CC session stays ALIVE → Zack can `continue` back later)
+            wake_response_map = {"approve": _send(["Enter"])}
+            wake_permission = {
+                "session_id": session_id,
+                "no_keys": ["Down", "Enter"],
+                "cancel_keys": ["Escape"],
+            }
             option_labels = ["approve", "modify", "reject"]
 
         # An AskUserQuestion becomes a QUESTION card (Piece 3): a single "answer"
@@ -3024,7 +3254,7 @@ class CortexServer:
                 ttl_ms=15_000,
             )
             if self._glass_conn:
-                await self._glass_conn.send(denied_card.model_dump_json())
+                self._glass_send(denied_card.model_dump_json())
             self._write_receipt(plan, [{}] * len(plan["subtasks"]), event.id)
             return
 
@@ -3208,6 +3438,11 @@ class CortexServer:
         cmd_id = event.payload.get("in_reply_to")
         feedback_text = event.payload.get("feedback_text")
         log.info("user_decision.received", decision=decision, cmd_id=cmd_id, has_feedback=bool(feedback_text))
+        # The wearer decided → open the sender gate so any progress queued behind
+        # the decision card flows again (see _glass_sender_loop). Safe to set on
+        # every decision: an already-open gate is a no-op.
+        if self._decision_gate is not None:
+            self._decision_gate.set()
 
         # R-14.c: drain session-route confirmation cards FIRST. The cmd_id
         # would match an entry we stashed in `_pending_session_routes` when
@@ -3223,6 +3458,33 @@ class CortexServer:
                 cmd_id=cmd_id, kind=kind, candidate=session_route.get("candidate_session_id"),
             )
             await self._resolve_session_route_decision(session_route, kind)
+            return
+
+        # STT-review gate (Zack 2026-05-30): this cmd_id may be an "STT review"
+        # card. approve → route the reviewed transcript per its original intent
+        # (the ONLY place raw STT moves downstream); redo/reject → re-open the
+        # mic to say it again. Drained before _pending_previews so a review card
+        # never falls through to the generic preview handler.
+        stt = self._pending_stt_review.pop(cmd_id, None)
+        if stt:
+            d = (decision or "").strip().lower()
+            if d == "approve":
+                # ONLY an explicit approve routes the transcript downstream.
+                log.info("stt_review.approved", cmd_id=cmd_id, intent=stt.get("intent"))
+                await self._route_stt_approved(stt)
+            elif d == "redo":
+                # 重讲 (LONG): re-open the right mic, preserving intent.
+                log.info("stt_review.redo", cmd_id=cmd_id, intent=stt.get("intent"))
+                await self._redo_stt(stt)
+            else:
+                # kill (double-tap) / reject / anything else → TERMINATE the flow.
+                # The transcript is dropped (NEVER routed) and the pending entry is
+                # already popped, so the flow ENDS cleanly here. We do NOT fall
+                # through to "approve" — an unrecognized decision must never
+                # silently send raw STT. (Zack 2026-05-30: a flow ends only as
+                # approve=routed or kill=terminated; no dismiss, no dangling.)
+                log.info("stt_review.killed", cmd_id=cmd_id,
+                         decision=d, intent=stt.get("intent"))
             return
 
         # Peek (don't pop yet) — we may need to re-register if Modify lacks text.
@@ -3248,6 +3510,51 @@ class CortexServer:
                 raise
             return
 
+        # Permission card REJECT / MODIFY (approve went through wake_response_map
+        # above). CC's menu: Yes / No(→"What should Claude do instead?") / Esc.
+        #   reject → Esc: cancel this flow; the agent stops but the session stays
+        #            alive (resumable later via `continue`). NOT a full kill.
+        #   modify → No (Down,Enter) → type Zack's spoken correction (mic first).
+        wake_perm = pending.get("wake_permission")
+        if wake_perm:
+            d = (decision or "").strip().lower()
+            sess = wake_perm["session_id"]
+            if d in ("reject", "kill", "no"):
+                self._pending_previews.pop(cmd_id, None)
+                try:
+                    await self._dispatch_to_tool({
+                        "tool": "claude_code", "action": "send_keys",
+                        "args": {"session_id": sess,
+                                 "keys": wake_perm.get("cancel_keys", ["Escape"]),
+                                 "literal": False},
+                        "context_pack": [], "result_format": "execute",
+                    })
+                    log.info("reverse_wake.rejected_cancel", session=sess)
+                except Exception as e:
+                    log.error("reverse_wake.reject_failed", error=str(e), exc_info=True)
+                return
+            if d == "modify" and not feedback_text:
+                # Need the spoken correction → open the mic, keep the card pending.
+                await self.emit_mic_open(stream_id=f"modify_{cmd_id}", ttl_ms=30_000)
+                return
+            if d == "modify" and feedback_text:
+                self._pending_previews.pop(cmd_id, None)
+                try:
+                    await self._dispatch_to_tool({
+                        "tool": "claude_code", "action": "send_keys",
+                        "args": {"session_id": sess,
+                                 "keys": wake_perm.get("no_keys", ["Down", "Enter"]),
+                                 "literal": False},
+                        "context_pack": [], "result_format": "execute",
+                    })
+                    await asyncio.sleep(0.4)
+                    await self._inject_feedback_into_agent(sess, feedback_text)
+                    log.info("reverse_wake.modify_tell", session=sess,
+                             text=feedback_text[:60])
+                except Exception as e:
+                    log.error("reverse_wake.modify_failed", error=str(e), exc_info=True)
+                return
+
         # Question card ANSWER (Piece 3): the wearer answers an AskUserQuestion
         # in natural language. First "answer" (no text) opens the mic; the
         # follow-up carries feedback_text → we drive CC's AskUserQuestion to its
@@ -3260,7 +3567,7 @@ class CortexServer:
                 log.info("reverse_wake.answer_needs_text", cmd_id=cmd_id)
                 await self.emit_mic_open(stream_id=f"answer_{cmd_id}", ttl_ms=30_000)
                 if self._glass_conn:
-                    await self._glass_conn.send(json.dumps({
+                    self._glass_send(json.dumps({
                         "id": f"prog_{ids.event_id()[4:]}", "kind": "progress",
                         "ts": datetime.now(timezone.utc).isoformat(),
                         "parent_event_id": pending["event"].id,
@@ -3341,7 +3648,7 @@ class CortexServer:
             if sid:
                 self._active_hud_session_tmux.pop(sid, None)
             if self._glass_conn:
-                await self._glass_conn.send(json.dumps({
+                self._glass_send(json.dumps({
                     "id": f"prog_{ids.event_id()[4:]}",
                     "kind": "progress",
                     "ts": datetime.now(timezone.utc).isoformat(),
@@ -3358,7 +3665,7 @@ class CortexServer:
         if kind == "modify" and not resolved_text:
             log.info("decision.modify_needs_text", cmd_id=cmd_id)
             if self._glass_conn:
-                await self._glass_conn.send(json.dumps({
+                self._glass_send(json.dumps({
                     "id": f"prog_{ids.event_id()[4:]}",
                     "kind": "progress",
                     "ts": datetime.now(timezone.utc).isoformat(),
@@ -3373,30 +3680,8 @@ class CortexServer:
             await self.emit_mic_open(stream_id=f"modify_{cmd_id}", ttl_ms=30_000)
             return  # leave the card pending
 
-        # ── Permission card MODIFY (Piece 2): reject the proposed action, then
-        # inject Zack's spoken correction into the live CC so it re-plans.
-        # (approve/reject already went through the wake_response_map path above.)
-        wake_perm = pending.get("wake_permission")
-        if kind == "modify" and resolved_text and wake_perm:
-            self._pending_previews.pop(cmd_id, None)
-            try:
-                await self._dispatch_to_tool(wake_perm["deny"])  # press "No" on the prompt
-                await asyncio.sleep(0.4)
-                await self._inject_feedback_into_agent(
-                    wake_perm["session_id"], resolved_text)
-                log.info("reverse_wake.modify_injected",
-                         session=wake_perm["session_id"], text=resolved_text[:60])
-                if self._glass_conn:
-                    await self._glass_conn.send(json.dumps({
-                        "id": f"prog_{ids.event_id()[4:]}", "kind": "progress",
-                        "ts": datetime.now(timezone.utc).isoformat(),
-                        "parent_event_id": pending["event"].id,
-                        "stage": "feedback_injected", "icon": "💬",
-                        "detail": f"denied + redirected: \"{resolved_text[:50]}\"",
-                    }, ensure_ascii=False))
-            except Exception as e:
-                log.error("reverse_wake.modify_failed", error=str(e), exc_info=True)
-            return
+        # (Permission card reject/modify are handled earlier, right after the
+        # wake_response_map approve path.)
 
         # ── Multi-phase agent checkpoint: resume CC with the canonical outcome ──
         if pending.get("is_checkpoint") and pending.get("agent_result"):
