@@ -476,17 +476,9 @@ AVAILABLE_TOOLS: dict[str, dict[str, str]] = {
         "actions": "send",
         "description": "iMessage. send(to:phone_or_email, body). Preview-always.",
     },
-    "claude_code": {
-        "actions": "agent",
-        "description": (
-            "Escalate to the research-agent path (Claude Code in tmux). Use ONLY for asks "
-            "the classifier should have caught but didn't — reading/searching/composing/"
-            "multi-step. agent(text, working_dir?, add_dirs?) spawns the briefed CC session "
-            "and produces a phase-checkpoint card. (agent_continue / agent_kill are "
-            "orchestration-internal actions Cortex dispatches on user decisions; the "
-            "planner doesn't emit them.)"
-        ),
-    },
+    # claude_code escalation REMOVED (Rev 18 C-72): the classifier's complex
+    # branch is the designed complex-agent path (→ in-process SDK). The planner
+    # no longer escalates to a tmux research-agent.
     "vision_describe": {
         "actions": "describe",
         "description": (

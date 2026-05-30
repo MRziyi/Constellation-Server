@@ -397,11 +397,11 @@ def _permission_mode_for(text: str) -> str:
 
 
 def _use_sdk_agent() -> bool:
-    """P1 flag — route complex tasks through the in-process Claude Agent SDK
-    single-source path (claude_sdk_agent) instead of the tmux dual-worker
-    adapter. Default OFF: the tmux path stays the default and the fallback.
-    Set USE_SDK_AGENT=1 (env) to enable."""
-    return os.environ.get("USE_SDK_AGENT", "").strip().lower() in ("1", "true", "yes", "on")
+    """Complex tasks always run on the in-process Claude Agent SDK single source
+    (claude_sdk_agent). The tmux dual-worker is RETIRED (2026-05-30, Rev 18 C-72)
+    — there is no fallback. Kept as a function so the call sites read clearly;
+    the env var is no longer consulted."""
+    return True
 
 
 def _card_type_for(options: list[str]) -> str:
