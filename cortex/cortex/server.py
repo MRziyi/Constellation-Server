@@ -397,11 +397,11 @@ def _permission_mode_for(text: str) -> str:
 
 
 def _use_sdk_agent() -> bool:
-    """P1 flag — route complex tasks through the in-process Claude Agent SDK
-    single-source path (claude_sdk_agent) instead of the tmux dual-worker
-    adapter. Default OFF: the tmux path stays the default and the fallback.
-    Set USE_SDK_AGENT=1 (env) to enable."""
-    return os.environ.get("USE_SDK_AGENT", "").strip().lower() in ("1", "true", "yes", "on")
+    """Complex tasks always run on the in-process Claude Agent SDK single source
+    (claude_sdk_agent). The tmux dual-worker is RETIRED (2026-05-30, Rev 18 C-72)
+    — there is no fallback. Kept as a function so the call sites read clearly;
+    the env var is no longer consulted."""
+    return True
 
 
 def _card_type_for(options: list[str]) -> str:
@@ -734,7 +734,6 @@ class CortexServer:
         # event. Future keyed by req_id (server-minted); resolved with the
         # image b64 string (or None on timeout/empty payload).
         self._pending_image_requests: dict[str, asyncio.Future[str | None]] = {}
-        # cmd_id → { event_id, plan, current_subtask_results, [wake_response_map] }
 
         # ── Unified glass OUTBOX (Zack 2026-05-30) ─────────────────────────
         # ALL outbound glass frames — agent progress, cards, insights, mic, … —
@@ -935,8 +934,6 @@ class CortexServer:
             await self._handle_user_invoke(event)
         elif event.kind == "user_decision":
             await self._handle_user_decision(event)
-        elif event.kind == "tool_reverse_wake":
-            await self._handle_tool_reverse_wake(event)
         elif event.kind == "agent_progress":
             # CC mid-task event from tool_agent — forward to Glass as non-
             # blocking ticker frame, also keep latest agent metadata so
@@ -1134,23 +1131,13 @@ class CortexServer:
                 }, ensure_ascii=False))
             return
 
-        # Substantive: inject into CC via tmux send-keys + paste-buffer
-        tmux_session = active["tmux_session"]
-        try:
-            await self._inject_feedback_into_agent(tmux_session, text)
-            log.info("progress_feedback.injected", parent=parent_event_id, text=text[:80])
-            if self._glass_conn:
-                self._glass_send(json.dumps({
-                    "id": f"prog_{ids.event_id()[4:]}",
-                    "kind": "progress",
-                    "ts": datetime.now(timezone.utc).isoformat(),
-                    "parent_event_id": parent_event_id,
-                    "stage": "feedback_injected",
-                    "icon": "💬",
-                    "detail": f"correction sent: \"{text[:60]}\"",
-                }, ensure_ascii=False))
-        except Exception as e:
-            log.error("progress_feedback.inject_failed", error=str(e), exc_info=True)
+        # Substantive feedback during a progress window used to be pasted into
+        # the live CC tmux session via send-keys (the retired tmux dual-worker).
+        # That path is gone: the in-process SDK agent owns its own turn and never
+        # registers a tmux_session in _active_agents, so this branch is dead. The
+        # SDK surfaces mid-run input through its native permission/question cards
+        # (see claude_sdk_agent), not this progress-feedback channel.
+        log.info("progress_feedback.noop_no_tmux", parent=parent_event_id, text=text[:80])
 
     # ── Phase 3b: Glass client — audio + voice-fired decisions ─────────────
 
@@ -1712,103 +1699,6 @@ class CortexServer:
     # active conversation; longer and the user is likely on a new topic.
     _HUD_TMUX_TTL_S = 1800.0
 
-    def _hud_tmux_register(
-        self, session_id: str | None, agent_result: dict[str, Any],
-        *, working_dir: str | None, timeout_s: float,
-        ask_text: str | None = None,
-    ) -> None:
-        """Stash the (tmux, cc_session_id) so the next invoke in the same
-        HUD session can reuse it via agent_continue. Caller must have
-        dispatched the agent with keep_alive_on_final=True.
-
-        R-14: extended metadata used by `_route_session` to disambiguate
-        when the user voice-references "the email one" / "auth refactor".
-        `title` is preserved across turns; `turn_count` increments; other
-        fields refreshed each turn.
-        """
-        if not session_id:
-            return
-        tmux = agent_result.get("tmux_session")
-        cc_sid = agent_result.get("session_id")
-        if not tmux or not cc_sid:
-            return
-        now = time.time()
-        existing = self._active_hud_session_tmux.get(session_id)
-        new_summary = (
-            ((agent_result.get("structured") or {}).get("summary") or "")[:120]
-            if isinstance(agent_result.get("structured"), dict) else ""
-        )
-        # `title` is sticky — derived from the first prompt or summary; subsequent
-        # turns keep the original (so voice references like "the email one" still
-        # match even after many turns of follow-up). When neither ask_text nor a
-        # structured summary is available (agent returned plain text), fall back
-        # to the SessionStore-derived title (first turn's ask_text) so pin /
-        # confirmation cards never show "(untitled)".
-        if existing and existing.get("title"):
-            title = existing["title"]
-        else:
-            title = _derive_session_title(ask_text or new_summary)
-            if not title or title == "(untitled)":
-                title = self.sessions.title_for(session_id)
-        self._active_hud_session_tmux[session_id] = {
-            "tmux_session": tmux,
-            "cc_session_id": cc_sid,
-            "working_dir": working_dir,
-            "timeout_s": float(timeout_s),
-            "last_activity": now,
-            "last_summary": new_summary,
-            # ── R-14 additions ──
-            "title": title,
-            "created_at": (existing.get("created_at") if existing else now),
-            "turn_count": (int(existing.get("turn_count", 0)) if existing else 0) + 1,
-            "pinned": bool(existing.get("pinned")) if existing else False,
-        }
-        log.info(
-            "hud_tmux.registered",
-            session_id=session_id, tmux=tmux, cc_sid=cc_sid[:8],
-            title=title, turn=self._active_hud_session_tmux[session_id]["turn_count"],
-        )
-
-    async def _hud_tmux_evict(self, session_id: str, *, reason: str) -> None:
-        """Drop the entry and kill its tmux. Used on Kill, TTL eviction, or
-        when reuse fails (tmux gone, jsonl missing)."""
-        entry = self._active_hud_session_tmux.pop(session_id, None)
-        if not entry:
-            return
-        tmux = entry.get("tmux_session")
-        log.info("hud_tmux.evict", session_id=session_id, tmux=tmux, reason=reason)
-        if not tmux:
-            return
-        try:
-            await self._dispatch_to_tool({
-                "tool": "claude_code", "action": "agent_kill",
-                "args": {"tmux_session": tmux},
-                "result_format": "execute",
-            })
-        except Exception as e:
-            log.warning("hud_tmux.kill_failed", error=str(e), tmux=tmux)
-
-    def _hud_tmux_lookup(self, session_id: str | None) -> dict[str, Any] | None:
-        """Return the fresh entry, or None if absent / stale.
-
-        R-14.b: pinned sessions skip the TTL stale check — they live until
-        explicitly unpinned or Kill'd.
-        """
-        if not session_id:
-            return None
-        entry = self._active_hud_session_tmux.get(session_id)
-        if not entry:
-            return None
-        if entry.get("pinned"):
-            return entry  # pinned → never stale
-        if (time.time() - float(entry.get("last_activity") or 0)) > self._HUD_TMUX_TTL_S:
-            log.info(
-                "hud_tmux.stale_skipping",
-                session_id=session_id, tmux=entry.get("tmux_session"),
-            )
-            return None
-        return entry
-
     async def _handle_pin_command(
         self, event: Event, existing_sid: str | None, ask_text: str,
     ) -> None:
@@ -2048,49 +1938,6 @@ class CortexServer:
             await self._send_agent_card_for_decision(rpc_result, event, working_dir, 240.0)
             log.info("session_browse.resumed_sdk", cc_sid=cc_sid[:8])
             return
-        try:
-            rpc = await self._dispatch_to_tool({
-                "tool": "claude_code", "action": "agent",
-                "args": {
-                    "brief": instruction,
-                    "output_schema_hint": CANONICAL_ACTIONS_SCHEMA,
-                    "add_dirs": add_dirs,
-                    "working_dir": working_dir,
-                    "parent_event_id": event.id,
-                    "timeout_s": 240.0,
-                    "resume_cc_session_id": cc_sid,
-                    "keep_alive_on_final": True,
-                },
-                "result_format": "execute",
-            })
-        except Exception as e:
-            log.error("session_browse.resume_failed", error=str(e), cc_sid=cc_sid[:8])
-            await self._emit_info_card(
-                event_id=event.id, title="Couldn't resume",
-                body=f"Resume of that session failed: {e}", ttl_ms=8_000,
-            )
-            return
-
-        rpc_result = rpc.result or {}
-        if rpc_result.get("resume_failed") or not rpc_result.get("ok", True):
-            await self._emit_info_card(
-                event_id=event.id, title="Couldn't resume",
-                body=f"That session couldn't be rehydrated ({rpc_result.get('error','unknown')}).",
-                ttl_ms=8_000,
-            )
-            return
-        # Register so subsequent turns continue this (now-live) session.
-        new_sid = event.payload.get("session_id")
-        if new_sid:
-            self._hud_tmux_register(
-                new_sid, rpc_result, working_dir=working_dir,
-                timeout_s=240.0, ask_text=picked["title"],
-            )
-        await self._send_agent_card_for_decision(
-            rpc_result, event, working_dir, 240.0,
-        )
-        log.info("session_browse.resumed", cc_sid=cc_sid[:8],
-                 instruction_preview=instruction[:60])
 
     async def _emit_session_route_confirmation(
         self, *, event: Event, candidate_session_id: str,
@@ -2194,51 +2041,6 @@ class CortexServer:
         out.sort(key=lambda s: s["last_activity"], reverse=True)
         return out
 
-    # P0.1 patch — proactive TTL eviction. Without this, a user who fires
-    # one invoke then walks away leaves the tmux alive forever (lazy lookup
-    # only fires on the next invoke in the same session). Sweeper scans
-    # every 5 min and kills entries past TTL.
-    _HUD_TMUX_SWEEPER_INTERVAL_S = 300.0
-
-    async def _hud_tmux_sweeper_loop(self) -> None:
-        """Background task. Periodically evicts stale tmux entries so they
-        don't pile up across days of run-time."""
-        while True:
-            try:
-                await asyncio.sleep(self._HUD_TMUX_SWEEPER_INTERVAL_S)
-            except asyncio.CancelledError:
-                return
-            try:
-                now = time.time()
-                stale: list[str] = []
-                n_pinned_skipped = 0
-                for sid, entry in list(self._active_hud_session_tmux.items()):
-                    if entry.get("pinned"):
-                        n_pinned_skipped += 1
-                        continue  # R-14.b: pinned sessions never auto-evict
-                    age = now - float(entry.get("last_activity") or 0)
-                    if age > self._HUD_TMUX_TTL_S:
-                        stale.append(sid)
-                if stale or n_pinned_skipped:
-                    log.info(
-                        "hud_tmux.sweep",
-                        n_stale=len(stale), n_pinned_skipped=n_pinned_skipped,
-                    )
-                for sid in stale:
-                    await self._hud_tmux_evict(sid, reason="ttl_sweeper")
-                # R-14.c: drop confirmation-card entries the user never decided
-                # on. Card TTL is 30s; 2× that gives safe margin before reclaim.
-                stale_routes = [
-                    cid for cid, r in self._pending_session_routes.items()
-                    if (now - float(r.get("ts") or 0)) > 60.0
-                ]
-                for cid in stale_routes:
-                    self._pending_session_routes.pop(cid, None)
-                if stale_routes:
-                    log.info("pending_session_routes.swept", n=len(stale_routes))
-            except Exception as e:
-                log.warning("hud_tmux.sweep_failed", error=str(e), exc_info=True)
-
     async def _resume_agent_with_modify(
         self, pending: dict[str, Any], modify_text: str, event: Event,
     ) -> None:
@@ -2305,111 +2107,6 @@ class CortexServer:
                 rpc_result or {}, original_event, working_dir, timeout_s)
             return
 
-        # ── P0.1 preferred path: paste into live tmux via agent_continue ──
-        reuse_entry = self._hud_tmux_lookup(sid) if sid else None
-        if reuse_entry and reuse_entry.get("cc_session_id") == cc_session_id:
-            await self._emit_progress_to_glass(
-                parent_event_id=original_event.id,
-                stage="resuming_agent", icon="✍️",
-                detail=f"redirecting live CC session {cc_session_id[:8]} (no respawn)",
-            )
-            try:
-                rpc = await self._dispatch_to_tool({
-                    "tool": "claude_code", "action": "agent_continue",
-                    "args": {
-                        "tmux_session": reuse_entry["tmux_session"],
-                        "cc_session_id": cc_session_id,
-                        "user_text": modify_text,
-                        "working_dir": reuse_entry.get("working_dir") or working_dir,
-                        "parent_event_id": original_event.id,
-                        "timeout_s": timeout_s,
-                        "keep_alive_on_final": True,
-                    },
-                    "result_format": "execute",
-                })
-            except Exception as e:
-                log.warning("modify_resume.continue_failed", error=str(e), exc_info=True)
-                await self._hud_tmux_evict(sid, reason="modify_continue_failed")
-                reuse_entry = None
-            else:
-                rpc_result = rpc.result or {}
-                if rpc_result.get("error") or not rpc_result.get("ok"):
-                    log.warning(
-                        "modify_resume.continue_returned_error",
-                        error=rpc_result.get("error"),
-                    )
-                    await self._hud_tmux_evict(sid, reason="modify_continue_error")
-                    reuse_entry = None
-                else:
-                    self._hud_tmux_register(
-                        sid, rpc_result,
-                        working_dir=reuse_entry.get("working_dir") or working_dir,
-                        timeout_s=timeout_s,
-                    )
-                    await self._send_agent_card_for_decision(
-                        rpc_result, original_event,
-                        reuse_entry.get("working_dir") or working_dir,
-                        timeout_s,
-                    )
-                    return
-
-        # ── Fallback path: tmux gone, do the --resume spawn ──
-        await self._emit_progress_to_glass(
-            parent_event_id=original_event.id,
-            stage="resuming_agent", icon="✍️",
-            detail=f"resuming CC session {cc_session_id[:8]} with your correction",
-        )
-
-        brief = build_modify_brief(
-            prior_summary=prior_struct.get("summary"),
-            prior_actions=prior_struct.get("actions"),
-            prior_notes=prior_struct.get("notes"),
-            modify_text=modify_text,
-            now_iso=datetime.now(timezone.utc).astimezone().isoformat(),
-        )
-
-        add_dirs = [
-            os.path.expanduser("~/constellation/twin"),
-            os.path.expanduser("~/Code/Projects"),
-            os.path.expanduser("~/.claude/projects"),
-        ]
-
-        try:
-            rpc = await self._dispatch_to_tool({
-                "tool": "claude_code", "action": "agent",
-                "args": {
-                    "brief": brief,
-                    "output_schema_hint": CANONICAL_ACTIONS_SCHEMA,
-                    "add_dirs": add_dirs,
-                    "working_dir": working_dir,
-                    "parent_event_id": original_event.id,
-                    "timeout_s": timeout_s,
-                    "resume_cc_session_id": cc_session_id,
-                    "keep_alive_on_final": True,
-                },
-                "result_format": "execute",
-            })
-        except Exception as e:
-            log.error("modify_resume.dispatch_failed", error=str(e), exc_info=True)
-            raise
-
-        rpc_result = rpc.result or {}
-        # If resume failed (jsonl gone, CC crashed at spawn) → raise so
-        # the caller falls back to _replan_with_feedback.
-        if rpc_result.get("resume_failed"):
-            raise ResumeFailed(
-                f"prior CC session {cc_session_id} could not be resumed "
-                f"(jsonl missing or CC spawn failed)"
-            )
-
-        if sid:
-            self._hud_tmux_register(
-                sid, rpc_result,
-                working_dir=working_dir, timeout_s=timeout_s,
-            )
-
-        await self._send_agent_card_for_decision(rpc_result, original_event, working_dir, timeout_s)
-
     async def _resume_agent_phase(
         self, pending: dict[str, Any], decision: str, feedback_text: str | None, event: Event,
     ) -> None:
@@ -2462,42 +2159,6 @@ class CortexServer:
             await self._send_agent_card_for_decision(
                 rpc_result or {}, original_event, working_dir, timeout_s)
             return
-
-        log.info("agent.resuming", tmux_session=tmux_session, user_text=user_text[:80])
-
-        try:
-            rpc = await self._dispatch_to_tool({
-                "tool": "claude_code", "action": "agent_continue",
-                "args": {
-                    "tmux_session": tmux_session,
-                    "cc_session_id": cc_session_id,
-                    "user_text": user_text,
-                    "working_dir": working_dir,
-                    "parent_event_id": original_event.id,
-                    "timeout_s": timeout_s,
-                    "keep_alive_on_final": True,
-                },
-                "result_format": "execute",
-            })
-        except Exception as e:
-            log.error("agent_continue.failed", error=str(e), exc_info=True)
-            return
-
-        # Build + send the next card (could be checkpoint or final)
-        # We re-use the same helper as the initial dispatch; need to import
-        # locally to avoid a circular reference at module-import time.
-        from .http import make_app  # noqa: F401 — ensures the helper module is loaded
-        # The helper lives inside make_app's closure, so we recreate the logic
-        # here directly rather than digging through closure vars. Cheap dup.
-        rpc_result = rpc.result or {}
-        # Refresh the HUD-session registry — both checkpoint and final
-        # keep tmux alive now, so the next turn can paste into it.
-        sid = pending.get("session_id")
-        if sid:
-            self._hud_tmux_register(
-                sid, rpc_result, working_dir=working_dir, timeout_s=timeout_s,
-            )
-        await self._send_agent_card_for_decision(rpc_result, original_event, working_dir, timeout_s)
 
     async def _send_agent_card_for_decision(
         self, rpc_result: dict, event: Event, working_dir: str | None, timeout_s: float,
@@ -2657,82 +2318,6 @@ class CortexServer:
         ]
 
         sid = (event.payload or {}).get("session_id")
-        # P0.1 — reuse a still-alive CC tmux from a previous turn in the
-        # same HUD session. agent_continue pastes the new ask into the
-        # existing CC TUI (no fresh spawn, no brief re-load). CC retains
-        # the system context (output schema, R1-R5 rules, twin skills,
-        # available_dirs) from the original brief.
-        # USE_SDK_AGENT (P1): the in-process SDK path runs fresh each turn —
-        # tmux reuse is a tmux-only optimization, so skip it when the flag is on.
-        reuse_entry = None if _use_sdk_agent() else (self._hud_tmux_lookup(sid) if sid else None)
-        if reuse_entry:
-            await self._emit_progress_to_glass(
-                parent_event_id=event.id,
-                stage="reusing_agent", icon="♻️",
-                detail=(
-                    f"reusing CC session {reuse_entry['cc_session_id'][:8]} "
-                    f"(prior: {reuse_entry.get('last_summary') or 'idle'})"
-                ),
-            )
-            if sid:
-                self.sessions.append(
-                    sid, "agent_dispatch",
-                    event_id=event.id, reused=True,
-                    cc_session_id=reuse_entry["cc_session_id"],
-                    tmux_session=reuse_entry["tmux_session"],
-                )
-            try:
-                rpc = await self._dispatch_to_tool({
-                    "tool": "claude_code", "action": "agent_continue",
-                    "args": {
-                        "tmux_session": reuse_entry["tmux_session"],
-                        "cc_session_id": reuse_entry["cc_session_id"],
-                        "user_text": ask_text,
-                        "working_dir": reuse_entry.get("working_dir") or working_dir,
-                        "parent_event_id": event.id,
-                        "timeout_s": timeout_s,
-                        "keep_alive_on_final": True,
-                    },
-                    "result_format": "execute",
-                })
-            except Exception as e:
-                log.warning("hud_tmux.reuse_failed", error=str(e), exc_info=True)
-                await self._hud_tmux_evict(sid, reason="reuse_dispatch_failed")
-                reuse_entry = None
-            else:
-                rpc_result = rpc.result or {}
-                if not rpc_result.get("ok") or rpc_result.get("error"):
-                    # Tmux gone, jsonl missing, or other reuse failure.
-                    # Evict and fall through to fresh dispatch.
-                    log.warning(
-                        "hud_tmux.reuse_returned_error",
-                        error=rpc_result.get("error"),
-                    )
-                    await self._hud_tmux_evict(sid, reason="reuse_returned_error")
-                    reuse_entry = None
-                else:
-                    if sid:
-                        self.sessions.append(
-                            sid, "agent_completed",
-                            event_id=event.id, reused=True,
-                            cc_session_id=rpc_result.get("session_id"),
-                            tmux_session=rpc_result.get("tmux_session"),
-                            n_tool_uses=rpc_result.get("n_tool_uses"),
-                            terminate_reason=rpc_result.get("terminate_reason"),
-                            is_checkpoint=rpc_result.get("is_checkpoint"),
-                        )
-                    # Re-register (refresh last_activity + last_summary).
-                    self._hud_tmux_register(
-                        sid, rpc_result,
-                        working_dir=reuse_entry.get("working_dir") or working_dir,
-                        timeout_s=timeout_s,
-                    )
-                    await self._send_agent_card_for_decision(
-                        rpc_result, event,
-                        working_dir=reuse_entry.get("working_dir") or working_dir,
-                        timeout_s=timeout_s,
-                    )
-                    return
 
         # UC1: if a photo rode in with this turn (e.g. a sendPhoto shortcut or a
         # "save this poster" memo), persist it under twin/ now and hand the agent
@@ -2798,10 +2383,9 @@ class CortexServer:
         log.info("agent.permission_mode", mode=permission_mode,
                  ask_preview=ask_text[:50])
 
-        # P1 — in-process Agent SDK single-source path (additive, behind
-        # USE_SDK_AGENT). Produces the SAME rpc_result shape the tmux adapter
-        # returns, so _send_agent_card_for_decision and the modify/kill paths
-        # below are unchanged. The tmux dispatch (below) stays the default+fallback.
+        # The complex agent runs in-process on the Claude Agent SDK single
+        # source (claude_sdk_agent). The retired tmux dual-worker dispatch is
+        # gone — _use_sdk_agent() always returns True, so this is the only path.
         if _use_sdk_agent():
             from .claude_sdk_agent import SdkAgentSession
             if sid:
@@ -2831,230 +2415,6 @@ class CortexServer:
                 working_dir=working_dir, timeout_s=timeout_s,
             )
             return
-
-        # Dispatch the agent action. RPC returns when CC end_turn's
-        # (checkpoint or final).
-        try:
-            await self._emit_progress_to_glass(
-                parent_event_id=event.id,
-                stage="dispatching_agent", icon="🤖",
-                detail=f"dispatching agent ({permission_mode})",
-            )
-            if sid:
-                self.sessions.append(
-                    sid, "agent_dispatch",
-                    event_id=event.id, brief_chars=len(brief),
-                    add_dirs=add_dirs, timeout_s=timeout_s,
-                )
-            rpc = await self._dispatch_to_tool({
-                "tool": "claude_code", "action": "agent",
-                "args": {
-                    "brief": brief,
-                    "output_schema_hint": schema_hint,
-                    "add_dirs": add_dirs,
-                    "working_dir": working_dir,
-                    "parent_event_id": event.id,
-                    "timeout_s": timeout_s,
-                    "permission_mode": permission_mode,
-                    # P0.1: leave tmux alive so the next turn in this HUD
-                    # session can paste into it via agent_continue.
-                    "keep_alive_on_final": True,
-                },
-                "result_format": "execute",
-            })
-            # On RPC success, record the spawned CC session for the archive view.
-            if sid and rpc.result:
-                self.sessions.append(
-                    sid, "agent_completed",
-                    event_id=event.id,
-                    cc_session_id=rpc.result.get("session_id"),
-                    tmux_session=rpc.result.get("tmux_session"),
-                    n_tool_uses=rpc.result.get("n_tool_uses"),
-                    terminate_reason=rpc.result.get("terminate_reason"),
-                    is_checkpoint=rpc.result.get("is_checkpoint"),
-                )
-                # Register for reuse on next turn.
-                self._hud_tmux_register(
-                    sid, rpc.result,
-                    working_dir=working_dir, timeout_s=timeout_s,
-                )
-        except Exception as e:
-            log.error("agent_dispatch.failed", error=str(e), exc_info=True)
-            if self._glass_conn:
-                err_cmd = Command(
-                    id=ids.command_id(), ts=datetime.now(timezone.utc),
-                    kind="hud_show",
-                    payload={
-                        "title": "Agent failed",
-                        "body": f"Couldn't dispatch agent: {e}",
-                        "icon": "✗", "options": [],
-                    },
-                    requires_confirm=False, ttl_ms=20_000,
-                )
-                self._glass_send(err_cmd.model_dump_json())
-            return
-
-        await self._send_agent_card_for_decision(
-            rpc.result or {}, event,
-            working_dir=working_dir, timeout_s=timeout_s,
-        )
-
-    async def _inject_feedback_into_agent(self, tmux_session: str, text: str) -> None:
-        """Use the existing claude_code tmux machinery to paste user feedback
-        into the active CC session. Dispatched via the tool-agent so the same
-        socket / set-buffer / paste-buffer logic is shared."""
-        # Reuse claude_code adapter via the tool RPC. send_keys with literal
-        # text + trailing Enter mimics how the user typing in the TUI works.
-        # (paste-buffer is more reliable for multi-line; but most feedbacks are
-        # one line, so send_keys with explicit Enter is fine.)
-        await self._dispatch_to_tool({
-            "tool": "claude_code", "action": "send_keys",
-            "args": {"session_id": tmux_session, "keys": text + "\n", "literal": True},
-            "result_format": "execute",
-        })
-
-    async def _handle_tool_reverse_wake(self, event: Event) -> None:
-        """A Tool Agent adapter pushed a wake event (e.g. claude_code permission prompt).
-
-        Build a `tool_card` HUD Command directly from the payload and ship it to Glass.
-        When Glass replies with a user_decision matching one of the option ids, we look up
-        a response action and dispatch (e.g., send_keys 'y\\n' to the claude_code session).
-        """
-        payload = event.payload or {}
-        wake_kind = payload.get("wake_kind", "permission_request")
-        from_tool = payload.get("from_tool", "unknown")
-        context_str = payload.get("context") or "(no context)"
-        options = payload.get("options") or []
-        session_id = payload.get("session_id")
-
-        log.info(
-            "reverse_wake.received",
-            from_tool=from_tool,
-            wake_kind=wake_kind,
-            session_id=session_id,
-            n_options=len(options),
-        )
-
-        # Build option label list + a map from chosen option id → follow-up dispatch.
-        # CC v2.1.x permission UI is a 3-option arrow-key menu:
-        #   1. Yes                                            → Enter
-        #   2. Yes, and always allow access to <scope>        → Down, Enter
-        #   3. No                                             → Down, Down, Enter
-        # We use tmux named-key mode (literal=False) for these.
-        # A permission_request becomes a CHECKPOINT card with the same 3-way
-        # semantics Zack uses everywhere (approve / modify / reject), so the ring
-        # drives it (TAP / LONG / DOUBLE). We translate those to CC's arrow-key
-        # permission menu under the hood:
-        #   approve → "Yes" (Enter)
-        #   reject  → "No"  (Down, Down, Enter)
-        #   modify  → reject the action, then inject Zack's spoken correction
-        #             (handled in _handle_user_decision; needs his text first).
-        # (CC v2.1.x menu: 1.Yes=Enter · 2.Yes,always=Down,Enter · 3.No=Down,Down,Enter)
-        option_labels = [opt.get("label", opt.get("id", "?")) for opt in options]
-        wake_response_map: dict[str, dict[str, Any]] = {}
-        wake_permission: dict[str, Any] | None = None
-        if from_tool == "claude_code" and wake_kind == "permission_request" and options:
-            def _send(keys: list[str]) -> dict[str, Any]:
-                return {
-                    "tool": "claude_code", "action": "send_keys",
-                    "args": {"session_id": session_id, "keys": keys, "literal": False},
-                    "context_pack": [], "result_format": "execute",
-                }
-            # Real CC permission menu (verified on-device 2026-05-30, Bash prompt):
-            #   "Do you want to proceed?  ❯ 1. Yes   2. No   · Tab to amend"
-            # approve = Yes (cursor starts on 1 → Enter); reject = No (Down,Enter);
-            # modify = CC's NATIVE "tell Claude what to do" = Tab to amend, then
-            # type Zack's spoken correction (cleaner than deny+reinject).
-            # Verified on-device 2026-05-30 — CC's menu is "❯1. Yes / 2. No"
-            # where selecting No → "What should Claude do instead?" (free text).
-            #   approve = Yes            → Enter
-            #   modify  = No + tell      → Down,Enter then type the correction
-            #   reject  = pure cancel    → Esc (the agent stops this flow but the
-            #             CC session stays ALIVE → Zack can `continue` back later)
-            wake_response_map = {"approve": _send(["Enter"])}
-            wake_permission = {
-                "session_id": session_id,
-                "no_keys": ["Down", "Enter"],
-                "cancel_keys": ["Escape"],
-            }
-            option_labels = ["approve", "modify", "reject"]
-
-        # An AskUserQuestion becomes a QUESTION card (Piece 3): a single "answer"
-        # action. CC's options are laid out in the body; Zack answers in natural
-        # language (ring → mic) and we drive CC's AskUserQuestion to its free-text
-        # "Other" slot and type his answer. (other_idx / nav key-count are a
-        # best-effort default — calibrate against a real AskUserQuestion TUI in
-        # the device session.)
-        wake_question: dict[str, Any] | None = None
-        if from_tool == "claude_code" and wake_kind == "question" and options:
-            other_idx = next(
-                (i for i, o in enumerate(options)
-                 if str(o.get("id", "")).lower() == "other"
-                 or str(o.get("label", "")).lower() == "other"),
-                len(options) - 1,
-            )
-            wake_question = {"session_id": session_id, "other_idx": other_idx,
-                             "n_options": len(options)}
-            option_labels = ["answer"]
-
-        # User-facing name: never surface the internal "claude_code" tool id on a
-        # card — it's just "Claude" to the wearer (Zack 2026-05-30).
-        who = "Claude" if from_tool == "claude_code" else from_tool
-        title_map = {
-            "permission_request": "Claude Needs You",
-            "question": "Claude Needs You",
-            "completion_notice": f"{who} done",
-            "error": f"{who} error",
-            "surprising_event": who,
-        }
-        icon_map = {
-            "permission_request": "⚙",
-            "question": "❓",
-            "completion_notice": "✓",
-            "error": "✗",
-            "surprising_event": "✦",
-        }
-
-        cmd = Command(
-            id=ids.command_id(),
-            ts=datetime.now(timezone.utc),
-            kind="hud_show" if not options else "preview_action",
-            payload={
-                "title": title_map.get(wake_kind, from_tool),
-                "body": context_str[:600],
-                "icon": icon_map.get(wake_kind, "✦"),
-                "options": option_labels,
-            },
-            requires_confirm=bool(options),
-            ttl_ms=120_000,  # longer TTL — user might be away from Glass
-        )
-        # Synthetic "plan" so the receipt-writer path still has structure
-        synthetic_plan = {
-            "primary_intent": f"reverse_wake_{wake_kind}",
-            "subtasks": [],
-            "hud_response": {
-                "kind": cmd.kind, "title": cmd.payload["title"], "body_template": context_str[:600],
-                "options": option_labels, "icon": icon_map.get(wake_kind, "✦"),
-            },
-            "reasoning": f"reverse-wake event from {from_tool} ({wake_kind})",
-        }
-        self._pending_previews[cmd.id] = {
-            "event": event,
-            "plan": synthetic_plan,
-            "subtask_results": [],
-            "wake_response_map": wake_response_map,
-            "wake_session_id": session_id,
-            "wake_permission": wake_permission,
-            "wake_question": wake_question,
-        }
-        await self._send_command(cmd)
-        log.info("command.sent", id=cmd.id, kind=cmd.kind, source="reverse_wake")
-
-        # If there's no actionable choice (e.g. completion_notice), this is a one-shot
-        # info card; write the receipt now.
-        if not options:
-            self._pending_previews.pop(cmd.id, None)
-            self._write_receipt(synthetic_plan, [], event.id)
 
     async def _handle_user_invoke(self, event: Event) -> None:
         # Session linkage: every ask begins or extends a HUD session.
@@ -3122,8 +2482,8 @@ class CortexServer:
         # so the routed target dictates which session the turn extends. Short-
         # circuits when 0 or 1 sessions are active (caller behavior unchanged).
         # On `decision="continue"` → mutate existing_sid to the routed target;
-        # downstream `_dispatch_complex_agent` then naturally uses agent_continue
-        # via the existing `_hud_tmux_lookup` reuse path.
+        # downstream `_dispatch_complex_agent` then runs the SDK agent for that
+        # session (resuming the prior CC session when one is supplied).
         #
         # R-14.c: when re-injected from a confirmation-card decision, the
         # event carries `_skip_session_router=True` so we don't loop on the
@@ -3351,9 +2711,9 @@ class CortexServer:
         )
 
         # Router occasionally slips kind="tool_card" for normal user_invoke; that
-        # kind is reserved for reverse-wake (see _handle_tool_reverse_wake which
-        # builds Commands directly). Normalize to preview_action so the SEND
-        # gate still applies and confirm-policies fire below.
+        # kind is a legacy reverse-wake shape we no longer emit. Normalize to
+        # preview_action so the SEND gate still applies and confirm-policies fire
+        # below.
         hud = plan.get("hud_response", {})
         if hud.get("kind") == "tool_card":
             log.warning("router.tool_card_normalized_to_preview", primary_intent=plan["primary_intent"])
@@ -3628,104 +2988,6 @@ class CortexServer:
             log.warning("user_decision.no_pending", cmd_id=cmd_id, known=list(self._pending_previews.keys()))
             return
 
-        # Reverse-wake follow-up: option id matches the wake_response_map keys.
-        # Keep the legacy literal path so allow_once / allow_always / deny still work.
-        wake_response_map = pending.get("wake_response_map") or {}
-        if wake_response_map and decision in wake_response_map:
-            self._pending_previews.pop(cmd_id, None)
-            try:
-                follow_up = wake_response_map[decision]
-                log.info("reverse_wake.responding", decision=decision, follow_up=follow_up)
-                rpc_result = await self._dispatch_to_tool(follow_up)
-                pending["subtask_results"] = [rpc_result.result]
-                pending["plan"]["subtasks"] = [follow_up]
-                self._write_receipt(pending["plan"], pending["subtask_results"], event.id)
-            except Exception as e:
-                log.error("reverse_wake_followup.failed", error=str(e), exc_info=True)
-                raise
-            return
-
-        # Permission card REJECT / MODIFY (approve went through wake_response_map
-        # above). CC's menu: Yes / No(→"What should Claude do instead?") / Esc.
-        #   reject → Esc: cancel this flow; the agent stops but the session stays
-        #            alive (resumable later via `continue`). NOT a full kill.
-        #   modify → No (Down,Enter) → type Zack's spoken correction (mic first).
-        wake_perm = pending.get("wake_permission")
-        if wake_perm:
-            d = (decision or "").strip().lower()
-            sess = wake_perm["session_id"]
-            if d in ("reject", "kill", "no"):
-                self._pending_previews.pop(cmd_id, None)
-                try:
-                    await self._dispatch_to_tool({
-                        "tool": "claude_code", "action": "send_keys",
-                        "args": {"session_id": sess,
-                                 "keys": wake_perm.get("cancel_keys", ["Escape"]),
-                                 "literal": False},
-                        "context_pack": [], "result_format": "execute",
-                    })
-                    log.info("reverse_wake.rejected_cancel", session=sess)
-                except Exception as e:
-                    log.error("reverse_wake.reject_failed", error=str(e), exc_info=True)
-                return
-            if d == "modify" and not feedback_text:
-                # Need the spoken correction → open the mic, keep the card pending.
-                await self.emit_mic_open(stream_id=f"modify_{cmd_id}", ttl_ms=30_000)
-                return
-            if d == "modify" and feedback_text:
-                self._pending_previews.pop(cmd_id, None)
-                try:
-                    await self._dispatch_to_tool({
-                        "tool": "claude_code", "action": "send_keys",
-                        "args": {"session_id": sess,
-                                 "keys": wake_perm.get("no_keys", ["Down", "Enter"]),
-                                 "literal": False},
-                        "context_pack": [], "result_format": "execute",
-                    })
-                    await asyncio.sleep(0.4)
-                    await self._inject_feedback_into_agent(sess, feedback_text)
-                    log.info("reverse_wake.modify_tell", session=sess,
-                             text=feedback_text[:60])
-                except Exception as e:
-                    log.error("reverse_wake.modify_failed", error=str(e), exc_info=True)
-                return
-
-        # Question card ANSWER (Piece 3): the wearer answers an AskUserQuestion
-        # in natural language. First "answer" (no text) opens the mic; the
-        # follow-up carries feedback_text → we drive CC's AskUserQuestion to its
-        # free-text "Other" slot and type the answer. (nav key-count is a
-        # best-effort default; calibrate against a real AskUserQuestion TUI.)
-        wake_question = pending.get("wake_question")
-        if wake_question and ((decision or "").strip().lower() == "answer" or feedback_text):
-            answer_text = (feedback_text or "").strip()
-            if not answer_text:
-                log.info("reverse_wake.answer_needs_text", cmd_id=cmd_id)
-                await self.emit_mic_open(stream_id=f"answer_{cmd_id}", ttl_ms=30_000)
-                if self._glass_conn:
-                    self._glass_send(json.dumps({
-                        "id": f"prog_{ids.event_id()[4:]}", "kind": "progress",
-                        "ts": datetime.now(timezone.utc).isoformat(),
-                        "parent_event_id": pending["event"].id,
-                        "stage": "answer_needs_text", "icon": "❓",
-                        "detail": "Answer — say your reply.",
-                    }, ensure_ascii=False))
-                return  # leave the card pending for the spoken answer
-            self._pending_previews.pop(cmd_id, None)
-            try:
-                sess = wake_question["session_id"]
-                nav = ["Down"] * int(wake_question.get("other_idx", 0)) + ["Enter"]
-                await self._dispatch_to_tool({
-                    "tool": "claude_code", "action": "send_keys",
-                    "args": {"session_id": sess, "keys": nav, "literal": False},
-                    "context_pack": [], "result_format": "execute",
-                })
-                await asyncio.sleep(0.4)
-                await self._inject_feedback_into_agent(sess, answer_text)
-                log.info("reverse_wake.answer_injected", session=sess, text=answer_text[:60])
-            except Exception as e:
-                log.error("reverse_wake.answer_failed", error=str(e), exc_info=True)
-            return
-
         # "dismiss" is a non-UI signal — fired by the web client on TTL
         # expiry or by programmatic callers. Drops the pending card and
         # kills any active agent tmux session. No button surfaces it.
@@ -3767,17 +3029,11 @@ class CortexServer:
                 self.twin, event=pending["event"], pending=pending,
                 decision_kind="kill", correction_text=None,
             )
-            agent_result = pending.get("agent_result")
-            tmux_session = (agent_result or {}).get("tmux_session")
-            if tmux_session:
-                try:
-                    await self._dispatch_to_tool({
-                        "tool": "claude_code", "action": "agent_kill",
-                        "args": {"tmux_session": tmux_session},
-                        "result_format": "execute",
-                    })
-                except Exception as e:
-                    log.warning("agent_kill.failed", error=str(e))
+            # SDK path: a kill on a FINAL/checkpoint card has nothing to tear down
+            # (the in-process run already ended at its ResultMessage); a mid-run
+            # kill arrives on a permission card and is handled by
+            # resolve_sdk_decision → PermissionResultDeny(interrupt). (tmux
+            # agent_kill retired, Rev 18 C-72.)
             # P0.1 — drop registry entry so the next invoke in this HUD
             # session spawns fresh (Kill is an explicit reset signal).
             if sid:
@@ -3814,9 +3070,6 @@ class CortexServer:
             # hard cap (C-37) regardless of this ttl hint.
             await self.emit_mic_open(stream_id=f"modify_{cmd_id}", ttl_ms=30_000)
             return  # leave the card pending
-
-        # (Permission card reject/modify are handled earlier, right after the
-        # wake_response_map approve path.)
 
         # ── Multi-phase agent checkpoint: resume CC with the canonical outcome ──
         if pending.get("is_checkpoint") and pending.get("agent_result"):
@@ -4234,10 +3487,6 @@ async def serve(
     server.insight_engine = InsightEngine(server)
     register_default_providers(server.insight_engine)
     server.insight_engine.start()
-    # P0.1 patch — background TTL sweeper for the per-HUD-session tmux registry.
-    # Lazy eviction (in _hud_tmux_lookup) misses sessions whose owner never
-    # comes back — this loop is what guarantees the upper bound on process count.
-    server._hud_tmux_sweeper_task = asyncio.create_task(server._hud_tmux_sweeper_loop())
     # P2.3 — TCC self-check. Runs in background; if any Apple app is denied,
     # stash a hud_show that fires on the next Glass connect.
     from .tcc_check import run_and_surface as _tcc_run_and_surface

@@ -252,24 +252,23 @@ class Distiller:
                 detail=f"reviewing {len(filtered)} recent interactions for patterns",
             )
             try:
-                rpc = await self.server._dispatch_to_tool({
-                    "tool": "claude_code", "action": "agent",
-                    "args": {
-                        "brief": brief,
-                        "output_schema_hint": CANONICAL_ACTIONS_SCHEMA,
-                        "add_dirs": available_dirs,
-                        "working_dir": os.path.expanduser("~"),
-                        "parent_event_id": event.id,
-                        "timeout_s": 180.0,
-                    },
-                    "result_format": "execute",
-                })
+                # Twin auto-distillation runs the complex agent in-process via the
+                # SDK single source (Rev 18 C-72) — same rpc_result shape as the
+                # retired tmux dispatch. Background work, no wearer to approve →
+                # bypassPermissions (no permission cards).
+                from .claude_sdk_agent import SdkAgentSession
+                rpc_result = await SdkAgentSession(
+                    self.server, event, brief=brief,
+                    schema_hint=CANONICAL_ACTIONS_SCHEMA, add_dirs=available_dirs,
+                    working_dir=os.path.expanduser("~"),
+                    permission_mode="bypassPermissions", timeout_s=180.0,
+                ).run()
             except Exception as e:
                 log.warning("distiller.dispatch_failed", error=str(e))
                 self.server.sessions.append(sid, "distiller_failed", error=str(e))
                 return
 
-            rpc_result = rpc.result or {}
+            rpc_result = rpc_result or {}
             structured = rpc_result.get("structured") or {}
             actions = structured.get("actions") if isinstance(structured.get("actions"), list) else []
 
