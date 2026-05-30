@@ -376,21 +376,19 @@ def _vision_detail_for(text: str) -> str:
 #     auto-accepts file edits but PROMPTS for Bash/exec/other — and those prompts
 #     surface to Zack as checkpoint cards (Piece 2). Answer-needs (AskUserQuestion)
 #     surface as question cards (Piece 3).
-_AUTO_RUN_PATTERNS = [
-    re.compile(
-        r"(全自动|都自动|自动跑|全部(自动|批准|放行|跑)|都(批准|放行)|不用(问|确认)我?|"
-        r"无需确认|不用经过我|放手去做|你看着办|随便你|"
-        r"auto[-\s]?(run|approve|pilot|execute)|run\s+everything|"
-        r"don'?t\s+ask|no\s+confirm|without\s+asking|just\s+do\s+it|yolo)",
-        re.IGNORECASE,
-    ),
-]
+# Full-auto (bypassPermissions) is opt-in ONLY via the explicit phrase "自动模式"
+# (Zack 2026-05-30: "有'自动模式'这四个字的时候，才能开"). No other phrasing enables it —
+# everything else stays acceptEdits, so permission requests surface as cards.
+_AUTO_RUN_PATTERNS = [re.compile(r"自动模式")]
 
 
 def _permission_mode_for(text: str) -> str:
     """Decide the CC permission mode for a fresh conversation from its first
-    utterance. Explicit auto-run → 'bypassPermissions'; otherwise 'acceptEdits'
-    (the default 'edit mode' — prompts for non-edit tools, which become cards)."""
+    utterance (Zack 2026-05-30):
+      - 'bypassPermissions' (full auto, no permission cards) ONLY when the
+        utterance literally contains "自动模式" — the sole opt-in.
+      - otherwise 'acceptEdits' (the DEFAULT): file edits auto-apply, but every
+        other tool surfaces a checkpoint card and AskUserQuestion a question card."""
     if text:
         for p in _AUTO_RUN_PATTERNS:
             if p.search(text):

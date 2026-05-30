@@ -52,39 +52,152 @@ log = structlog.get_logger("cortex.sdk_agent")
 # Per-run hard cost ceiling (belt; usage-credits-off is the real guarantee).
 _MAX_BUDGET_USD = float(os.environ.get("CORTEX_SDK_MAX_BUDGET_USD", "2.0"))
 
-# tool name → (icon, which arg to show) for human-readable progress.
-_TOOL_HINT: dict[str, tuple[str, str | None]] = {
-    "Bash": ("🔧", "command"),
-    "Read": ("📖", "file_path"),
-    "Edit": ("✏️", "file_path"),
-    "Write": ("✏️", "file_path"),
-    "Glob": ("🔍", "pattern"),
-    "Grep": ("🔍", "pattern"),
-    "WebFetch": ("🌐", "url"),
-    "WebSearch": ("🌐", "query"),
-    "Task": ("🤖", "description"),
-    "TodoWrite": ("🗂", None),
-}
+# ── progress distillation (port of the tmux worker's _tool_glance et al.) ──
+# White-box rule (Zack 2026-05-30, point 4): EVERY step says concretely what
+# Claude is doing — reading X / editing Y / running Z / its narration text —
+# and "thinking" appears ONLY for a real ThinkingBlock, never for plain text.
+
+def _shorten(s: str, n: int = 70) -> str:
+    s = (s or "").strip()
+    return s if len(s) <= n else s[: n - 1] + "…"
 
 
-def _summarize_tool(tool_name: str, tool_input: dict[str, Any]) -> str:
-    """A short, specific progress label — never a bare icon (HUD transparency
-    rule [[hud-transparency-no-preempt]]: always say what the system is doing)."""
-    _, arg = _TOOL_HINT.get(tool_name, ("🔧", None))
-    val = ""
-    if arg and isinstance(tool_input, dict):
-        raw = tool_input.get(arg)
-        if isinstance(raw, str):
-            val = raw.strip().replace("\n", " ")
-            # show only the basename for paths to keep it tight
-            if arg == "file_path" and "/" in val:
-                val = val.rsplit("/", 1)[-1]
-            val = val[:60]
-    return f"{tool_name}: {val}" if val else tool_name
+def _basename_path(p: str) -> str:
+    """Filename or last 2 path components — HUD friendly."""
+    if not p:
+        return "?"
+    parts = p.split("/")
+    return p if len(parts) <= 2 else ".../" + "/".join(parts[-2:])
 
 
-def _tool_icon(tool_name: str) -> str:
-    return _TOOL_HINT.get(tool_name, ("🔧", None))[0]
+def _mcp_pretty(tool: str) -> str:
+    """`mcp__<server>__<action>` → glanceable verb (drop the noisy server prefix)."""
+    seg = tool.split("__")[-1] if "__" in tool else tool
+    return seg.replace("_", " ").strip() or tool
+
+
+def _tool_glance(tool: str, inp: dict[str, Any]) -> tuple[str, str]:
+    """(emoji, ≤70-char glanceable label) for one tool invocation. Exhaustive
+    over classic + harness tool names so the wearer never sees a raw
+    `ToolName(arg=…)` for a common action. Ported from the tmux adapter."""
+    inp = inp or {}
+    fp = inp.get("file_path") or inp.get("path") or inp.get("notebook_path") or "?"
+
+    if tool in ("Bash", "PowerShell"):
+        desc = inp.get("description") or ""
+        if desc:
+            return "🔧", _shorten(desc, 70)
+        cmd = inp.get("command", "")
+        first = (cmd.split() or ["?"])[0]
+        return "🔧", _shorten(f"{first}: {cmd}", 70)
+    if tool == "BashOutput":
+        return "🔧", "reading shell output"
+    if tool in ("KillShell", "KillBash"):
+        return "🛑", "stopping background shell"
+    if tool == "Monitor":
+        return "👀", _shorten(f"monitoring: {inp.get('command') or inp.get('description') or '?'}", 70)
+    if tool == "Read":
+        rng = ""
+        if inp.get("offset") or inp.get("limit"):
+            a = inp.get("offset") or 0
+            b = (a or 0) + (inp.get("limit") or 0)
+            rng = f" (lines {a}-{b})" if b else ""
+        return "📖", "reading " + _basename_path(fp) + rng
+    if tool == "Write":
+        return "✍️", "writing " + _basename_path(fp)
+    if tool in ("Edit", "MultiEdit"):
+        return "📝", "editing " + _basename_path(fp)
+    if tool == "NotebookEdit":
+        return "📓", _shorten(f"editing notebook {_basename_path(fp)}", 70)
+    if tool == "LS":
+        return "📂", "listing " + _basename_path(inp.get("path") or ".")
+    if tool == "Glob":
+        return "🔍", _shorten(f"glob {inp.get('pattern','?')}", 70)
+    if tool == "Grep":
+        return "🔍", _shorten(f"grep '{inp.get('pattern') or inp.get('query') or '?'}'", 70)
+    if tool == "ToolSearch":
+        return "🔍", _shorten(f"finding tools: {inp.get('query','?')}", 70)
+    if tool == "WebFetch":
+        return "🌐", _shorten(f"fetching {inp.get('url') or '?'}", 70)
+    if tool == "WebSearch":
+        return "🌐", _shorten(f"searching: {inp.get('query') or '?'}", 70)
+    if tool in ("TodoWrite", "TodoRead"):
+        return "📋", "updating todo list" if tool == "TodoWrite" else "checking todos"
+    if tool in ("Task", "Agent"):
+        sub = inp.get("subagent_type") or inp.get("agent_type") or "agent"
+        return "🧵", _shorten(f"sub-agent: {sub}", 70)
+    if tool == "Workflow":
+        return "🧵", _shorten(f"workflow: {inp.get('name') or inp.get('title') or '?'}", 70)
+    if tool == "EnterPlanMode":
+        return "📋", "entering plan mode"
+    if tool == "ExitPlanMode":
+        return "✔️", "presenting a plan"
+    if tool == "Skill":
+        return "🎯", _shorten(f"skill: {inp.get('skill') or inp.get('command') or '?'}", 70)
+    if tool == "SlashCommand":
+        return "⌘", _shorten(f"/{(inp.get('command') or '?').lstrip('/')}", 70)
+    if tool == "AskUserQuestion":
+        qs = inp.get("questions")
+        q = (qs[0].get("question") if isinstance(qs, list) and qs and isinstance(qs[0], dict)
+             else inp.get("question")) or "?"
+        return "❓", _shorten(f"asking: {q}", 70)
+    if tool == "StructuredOutput":
+        return "📦", "finalising result"
+    if tool.startswith("mcp__") or "__" in tool or ":" in tool:
+        return "🔌", _shorten(_mcp_pretty(tool), 70)
+    if inp:
+        k, v = next(iter(inp.items()))
+        return "·", _shorten(f"{tool}({k}={v})", 70)
+    return "·", _shorten(tool, 70)
+
+
+def _edit_line_delta(tool: str, inp: dict[str, Any]) -> str | None:
+    """For Edit/Write/MultiEdit, the net lines added/removed — the "Added 5 lines"
+    / "Removed 3 lines" outcome line Zack wants under an edit."""
+    def _lines(s: str) -> int:
+        return (s.count("\n") + 1) if s else 0
+    net = 0
+    if tool == "Write":
+        net = _lines(inp.get("content") or "")
+    elif tool == "Edit":
+        net = _lines(inp.get("new_string") or "") - _lines(inp.get("old_string") or "")
+    elif tool == "MultiEdit":
+        for e in (inp.get("edits") or []):
+            if isinstance(e, dict):
+                net += _lines(e.get("new_string") or "") - _lines(e.get("old_string") or "")
+    else:
+        return None
+    if net > 0:
+        return f"Added {net} line{'s' if net != 1 else ''}"
+    if net < 0:
+        return f"Removed {-net} line{'s' if -net != 1 else ''}"
+    return "edited"
+
+
+def _summarise_tool_result(content: str, is_err: bool) -> str:
+    """Compress a tool result to a glanceable line (Bash output is the variable
+    one). Ported from the tmux adapter."""
+    if is_err:
+        return _shorten(content.replace("\n", " ⏎ "), 70)
+    text = (content or "").strip()
+    if not text:
+        return "(no output)"
+    lines = text.split("\n")
+    if len(lines) == 1:
+        return _shorten(lines[0], 70)
+    if len(lines) <= 3:
+        return _shorten(" ⏎ ".join(lines), 70)
+    return _shorten(f"{len(lines)} lines · 1st: {lines[0]}", 70)
+
+
+def _flatten_tool_result(content: Any) -> str:
+    """ToolResultBlock.content may be a str or a list of {type,text} blocks."""
+    if isinstance(content, list):
+        parts = []
+        for x in content:
+            parts.append(str(x.get("text", x)) if isinstance(x, dict) else str(x))
+        return " ".join(parts)
+    return str(content or "")
 
 
 def _warn_if_api_key() -> None:
@@ -126,6 +239,10 @@ class SdkAgentSession:
         self.timeout_s = timeout_s
         self.session_id: str | None = None
         self.n_tool_uses = 0
+        # tool_use_id → (name, input): lets a tool RESULT be labelled with the
+        # right outcome (edit line counts) and dedupes repeated tool_use frames.
+        self._tool_calls: dict[str, tuple[str, dict[str, Any]]] = {}
+        self._emitted_tool_ids: set[str] = set()
 
     # ── permission gate (replaces pane-watch + send_keys) ──────────────────
 
@@ -223,8 +340,8 @@ class SdkAgentSession:
         """Translate one stream message → glass progress; return a terminal
         rpc_result dict when the stream ends, else None."""
         from claude_agent_sdk import (
-            AssistantMessage, ResultMessage, RateLimitEvent, SystemMessage,
-            TextBlock, ThinkingBlock, ToolUseBlock,
+            AssistantMessage, UserMessage, ResultMessage, RateLimitEvent,
+            SystemMessage, TextBlock, ThinkingBlock, ToolUseBlock, ToolResultBlock,
         )
 
         if isinstance(msg, SystemMessage):
@@ -261,13 +378,45 @@ class SdkAgentSession:
                     "认证失败", "Claude 认证失败——检查是否用订阅登录、且无 API key。")
             for block in (msg.content or []):
                 if isinstance(block, ToolUseBlock):
+                    # record for the matching tool_result; dedupe (partial +
+                    # final envelopes can repeat the same tool_use id).
+                    self._tool_calls[block.id] = (block.name, block.input or {})
+                    if block.id in self._emitted_tool_ids:
+                        continue
+                    self._emitted_tool_ids.add(block.id)
                     self.n_tool_uses += 1
-                    await self._progress(
-                        "tool", _tool_icon(block.name),
-                        _summarize_tool(block.name, block.input or {}),
-                    )
+                    icon, label = _tool_glance(block.name, block.input or {})
+                    await self._progress("tool_call", icon, label)
+                elif isinstance(block, TextBlock):
+                    # Claude's own narration / direct text output — NOT thinking.
+                    # Show it verbatim (white-box). Only ThinkingBlock is ever
+                    # labelled "thinking" (point 4, Zack 2026-05-30).
+                    text = (block.text or "").strip()
+                    if text:
+                        await self._progress("assistant_text", "💬", text[:200])
                 elif isinstance(block, ThinkingBlock):
-                    await self._progress("thinking", "💭", "thinking…")
+                    think = (getattr(block, "thinking", "") or "").strip()
+                    detail = ("thinking… " + think[:80]) if think else "thinking…"
+                    await self._progress("thinking", "💭", detail)
+            return None
+
+        if isinstance(msg, UserMessage):
+            # Tool results returning to Claude → show the OUTCOME (edit line
+            # counts / command-output snippet / error). The other half of the
+            # white-box stream (mirrors the tmux worker's tool_result frame).
+            for block in (msg.content or []):
+                if not isinstance(block, ToolResultBlock):
+                    continue
+                name, tin = self._tool_calls.get(
+                    getattr(block, "tool_use_id", "") or "", (None, {}))
+                is_err = bool(getattr(block, "is_error", False))
+                if not is_err and name in ("Edit", "Write", "MultiEdit"):
+                    await self._progress("tool_result", "✓",
+                                         _edit_line_delta(name, tin) or "edited")
+                else:
+                    content = _flatten_tool_result(getattr(block, "content", ""))
+                    await self._progress("tool_result", "✗" if is_err else "✓",
+                                         _summarise_tool_result(content, is_err))
             return None
 
         if isinstance(msg, ResultMessage):
