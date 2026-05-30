@@ -2027,6 +2027,27 @@ class CortexServer:
             os.path.expanduser("~/Code/Projects"),
             os.path.expanduser("~/.claude/projects"),
         ]
+        # P1 (SDK single-source): resume the ARCHIVED session via the SDK
+        # (resume=cc_sid) instead of a tmux `claude --resume` respawn. This is
+        # spec point 8's "find a past session and continue it" through one
+        # ordered stream + native permission gate.
+        if _use_sdk_agent():
+            from .claude_sdk_agent import SdkAgentSession
+            rpc_result = await SdkAgentSession(
+                self, event, brief=instruction,
+                schema_hint=CANONICAL_ACTIONS_SCHEMA, add_dirs=add_dirs,
+                working_dir=working_dir, permission_mode=_permission_mode_for(instruction),
+                timeout_s=240.0, resume_session_id=cc_sid,
+            ).run()
+            if not rpc_result or not rpc_result.get("ok", True):
+                await self._emit_info_card(
+                    event_id=event.id, title="Couldn't resume",
+                    body=f"That session couldn't be resumed ({(rpc_result or {}).get('error', 'unknown')}).",
+                    ttl_ms=8_000)
+                return
+            await self._send_agent_card_for_decision(rpc_result, event, working_dir, 240.0)
+            log.info("session_browse.resumed_sdk", cc_sid=cc_sid[:8])
+            return
         try:
             rpc = await self._dispatch_to_tool({
                 "tool": "claude_code", "action": "agent",
