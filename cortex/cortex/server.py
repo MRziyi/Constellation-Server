@@ -2254,6 +2254,36 @@ class CortexServer:
                 cc_session_id=cc_session_id, modify_text=modify_text[:300],
             )
 
+        # ── P1 (SDK single-source): modify-on-FINAL = resume the prior session
+        # via the SDK with a modify brief. Skips the tmux reuse / --resume logic. ─
+        if _use_sdk_agent():
+            from .claude_sdk_agent import SdkAgentSession
+            await self._emit_progress_to_glass(
+                parent_event_id=original_event.id, stage="resuming_agent", icon="✍️",
+                detail=f"resuming session {cc_session_id[:8]} with your correction",
+            )
+            brief = build_modify_brief(
+                prior_summary=prior_struct.get("summary"),
+                prior_actions=prior_struct.get("actions"),
+                prior_notes=prior_struct.get("notes"),
+                modify_text=modify_text,
+                now_iso=datetime.now(timezone.utc).astimezone().isoformat(),
+            )
+            add_dirs = [
+                os.path.expanduser("~/constellation/twin"),
+                os.path.expanduser("~/Code/Projects"),
+                os.path.expanduser("~/.claude/projects"),
+            ]
+            rpc_result = await SdkAgentSession(
+                self, original_event, brief=brief,
+                schema_hint=CANONICAL_ACTIONS_SCHEMA, add_dirs=add_dirs,
+                working_dir=working_dir, permission_mode=_permission_mode_for(modify_text),
+                timeout_s=timeout_s, resume_session_id=cc_session_id,
+            ).run()
+            await self._send_agent_card_for_decision(
+                rpc_result or {}, original_event, working_dir, timeout_s)
+            return
+
         # ── P0.1 preferred path: paste into live tmux via agent_continue ──
         reuse_entry = self._hud_tmux_lookup(sid) if sid else None
         if reuse_entry and reuse_entry.get("cc_session_id") == cc_session_id:
@@ -2386,6 +2416,31 @@ class CortexServer:
         # reaches us (parent re-surfaces the card and bails).
         kind, resolved_text = _classify_user_decision(decision, feedback_text)
         user_text = "continue" if kind == "approve" else (resolved_text or "continue")
+
+        # P1 (SDK single-source): resume the prior session with the user's text
+        # (continue, or a checkpoint correction) instead of pasting into tmux.
+        if _use_sdk_agent():
+            from .claude_sdk_agent import SdkAgentSession
+            from .agent_brief import CANONICAL_ACTIONS_SCHEMA
+            if not cc_session_id:
+                log.warning("agent.resume_phase.no_session_sdk")
+                return
+            await self._emit_progress_to_glass(
+                parent_event_id=original_event.id, stage="resuming_agent", icon="✍️",
+                detail=f"resuming session {cc_session_id[:8]}",
+            )
+            rpc_result = await SdkAgentSession(
+                self, original_event, brief=user_text,
+                schema_hint=CANONICAL_ACTIONS_SCHEMA,
+                add_dirs=[os.path.expanduser("~/constellation/twin"),
+                          os.path.expanduser("~/Code/Projects"),
+                          os.path.expanduser("~/.claude/projects")],
+                working_dir=working_dir, permission_mode=_permission_mode_for(user_text),
+                timeout_s=timeout_s, resume_session_id=cc_session_id,
+            ).run()
+            await self._send_agent_card_for_decision(
+                rpc_result or {}, original_event, working_dir, timeout_s)
+            return
 
         log.info("agent.resuming", tmux_session=tmux_session, user_text=user_text[:80])
 
