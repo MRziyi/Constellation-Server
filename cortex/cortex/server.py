@@ -1121,11 +1121,31 @@ class CortexServer:
         if entry is None or len(entry.buffer) == 0:
             log.warning("audio_end.no_buffer", stream_id=sid)
             return
+        # Signal-level probe (diagnosing "whisper gets nothing from N s of audio"):
+        # rms≈0 → the captured channel is silent (mic/deinterleave issue); high
+        # rms but empty transcript → noise / wrong channel content.
+        try:
+            import audioop
+            _rms = audioop.rms(bytes(entry.buffer), 2)
+            _peak = audioop.max(bytes(entry.buffer), 2)
+            log.info("audio_end.signal", stream_id=sid, bytes=len(entry.buffer),
+                     sample_rate=entry.sample_rate, channels=entry.channels,
+                     rms=_rms, peak=_peak)
+        except Exception as e:
+            log.warning("audio_end.signal_probe_failed", error=str(e))
 
         lang_hint = (p.get("lang_hint") or "auto").lower()
         intent = (p.get("intent") or "fresh").lower()
         cmd_id = p.get("cmd_id")
         session_id = p.get("session_id")
+        # A mic opened FOR a card encodes its purpose + cmd_id in the stream_id
+        # (modify_<cmd_id> / answer_<cmd_id>). Derive intent + cmd_id from that so
+        # the transcript routes back to the right card instead of falling through
+        # to a fresh invoke (the bug that sent question answers to the classifier).
+        if sid.startswith("modify_"):
+            intent, cmd_id = "modify", cmd_id or sid[len("modify_"):]
+        elif sid.startswith("answer_"):
+            intent, cmd_id = "answer", cmd_id or sid[len("answer_"):]
 
         # Bridge: announce we're transcribing (Glass keeps HUD in THINKING
         # while we crunch). Reuses the existing progress channel.
@@ -1170,6 +1190,23 @@ class CortexServer:
                 payload={
                     "in_reply_to": cmd_id,
                     "decision": "Modify",
+                    "feedback_text": transcript,
+                },
+            )
+            await self._handle_user_decision(synth)
+            return
+
+        if intent == "answer" and cmd_id:
+            # User spoke their answer to a QUESTION card → feed it as the
+            # card's "answer" decision; _handle_user_decision drives CC's
+            # AskUserQuestion "Other" with this text.
+            synth = Event(
+                id=ids.event_id(),
+                kind="user_decision",
+                ts=datetime.now(timezone.utc),
+                payload={
+                    "in_reply_to": cmd_id,
+                    "decision": "answer",
                     "feedback_text": transcript,
                 },
             )
