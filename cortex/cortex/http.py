@@ -8,10 +8,8 @@ Zack's tailnet (per Tailscale ACL) can hit these endpoints; in v1 that's just
 the Linux edge proxy + Zack's own devices.
 
 Priority routes (per Zack's emphasis on "see what the agent is running"):
-  - GET  /api/cc/sessions             list both Track A + Track B CC sessions
-  - GET  /api/cc/pane?session_id=     live tmux pane content (snapshot)
-  - POST /api/cc/send_keys            drive a tmux CC (e.g. answer permission)
-  - POST /api/cc/kill                 terminate a session
+  - GET  /api/cc/sessions             list Track A (claude -p) CC sessions
+  - GET  /api/cc-archive              on-disk CC jsonl archive (list + detail)
   - SSE  /api/trace/stream            live event/router/dispatch stream
 
 Twin / receipts / LLM inspector / dispatch log endpoints round out the picture.
@@ -105,7 +103,7 @@ def make_app(plane: ControlPlane) -> web.Application:
             "tool_conn": bool(plane.server and plane.server._tool_conn is not None),
         })
 
-    # ── claude_code (priority surfaces) ──
+    # ── claude_code (Track A: `claude -p` session list) ──
     async def cc_sessions(_request: web.Request) -> web.Response:
         if plane.server is None:
             return _err("server not bound", 503)
@@ -114,60 +112,7 @@ def make_app(plane: ControlPlane) -> web.Application:
                 "tool": "claude_code", "action": "list_sessions",
                 "args": {}, "result_format": "query",
             })
-            track_b = await plane.server._dispatch_to_tool({
-                "tool": "claude_code", "action": "list_tmux",
-                "args": {}, "result_format": "query",
-            })
-            return _json({
-                "track_a": track_a.result,
-                "track_b": track_b.result,
-            })
-        except Exception as e:
-            return _err(f"dispatch failed: {e}", 500)
-
-    async def cc_pane(request: web.Request) -> web.Response:
-        sid = request.query.get("session_id")
-        if not sid:
-            return _err("session_id required")
-        try:
-            rpc = await plane.server._dispatch_to_tool({
-                "tool": "claude_code", "action": "get_pane",
-                "args": {"session_id": sid},
-                "result_format": "query",
-            })
-            return _json(rpc.result)
-        except Exception as e:
-            return _err(f"dispatch failed: {e}", 500)
-
-    async def cc_send_keys(request: web.Request) -> web.Response:
-        body = await request.json()
-        sid = body.get("session_id")
-        keys = body.get("keys")
-        literal = bool(body.get("literal", True))
-        if not sid or keys is None:
-            return _err("session_id + keys required")
-        try:
-            rpc = await plane.server._dispatch_to_tool({
-                "tool": "claude_code", "action": "send_keys",
-                "args": {"session_id": sid, "keys": keys, "literal": literal},
-                "result_format": "execute",
-            })
-            return _json(rpc.result)
-        except Exception as e:
-            return _err(f"dispatch failed: {e}", 500)
-
-    async def cc_kill(request: web.Request) -> web.Response:
-        body = await request.json()
-        sid = body.get("session_id")
-        if not sid:
-            return _err("session_id required")
-        try:
-            rpc = await plane.server._dispatch_to_tool({
-                "tool": "claude_code", "action": "kill",
-                "args": {"session_id": sid},
-                "result_format": "execute",
-            })
-            return _json(rpc.result)
+            return _json({"track_a": track_a.result})
         except Exception as e:
             return _err(f"dispatch failed: {e}", 500)
 
@@ -367,9 +312,10 @@ def make_app(plane: ControlPlane) -> web.Application:
 
     # ── dev/test helpers ──
     async def dev_agent_invoke(request: web.Request) -> web.Response:
-        """Dispatch an agentic task via claude_code.agent directly, bypassing
-        the Router. Used to test the streaming-progress + mid-flight-correction
-        pipeline before the full Router classifier (Phase 5c) lands.
+        """Dispatch an agentic task via the in-process SDK agent
+        (_dispatch_complex_agent) directly, bypassing the Router. Used to test
+        the streaming-progress + mid-flight-correction pipeline before the full
+        Router classifier (Phase 5c) lands.
 
         POST body: {
           "text": "<user ask>",                  # what Zack said
@@ -462,27 +408,6 @@ def make_app(plane: ControlPlane) -> web.Application:
         asyncio.create_task(_bg_tick())
         return _json({"ok": True, "queued": True, "n_providers": len(engine._providers),
                       "enabled": engine.enabled})
-
-    async def dev_inject_wake(request: web.Request) -> web.Response:
-        """Synthesise a tool_reverse_wake event (without going through Router)
-        so end-to-end tests can verify the wake → tool_card → glass flow without
-        spawning a real Claude Code session.
-        """
-        if plane.server is None:
-            return _err("server not bound", 503)
-        try:
-            try:
-                body = await request.json()
-            except Exception:
-                body = {}
-            rpc = await plane.server._dispatch_to_tool({
-                "tool": "claude_code", "action": "__test_inject_wake__",
-                "args": body if isinstance(body, dict) else {},
-                "result_format": "execute",
-            })
-            return _json({"injected": True, "result": rpc.result})
-        except Exception as e:
-            return _err(f"inject failed: {e}", 500)
 
     # ── SSE trace stream ──
     async def trace_stream(request: web.Request) -> web.StreamResponse:
@@ -696,9 +621,6 @@ def make_app(plane: ControlPlane) -> web.Application:
     app.router.add_get("/api/cc-archive/{session_id}", cc_archive_detail)
 
     app.router.add_get("/api/cc/sessions", cc_sessions)
-    app.router.add_get("/api/cc/pane", cc_pane)
-    app.router.add_post("/api/cc/send_keys", cc_send_keys)
-    app.router.add_post("/api/cc/kill", cc_kill)
 
     app.router.add_get("/api/twin/tree", twin_tree)
     app.router.add_get("/api/twin/read", twin_read)
@@ -718,7 +640,6 @@ def make_app(plane: ControlPlane) -> web.Application:
     app.router.add_get("/api/system/status", system_status)
 
     app.router.add_post("/api/test/invoke", test_invoke)
-    app.router.add_post("/api/dev/inject_wake", dev_inject_wake)
     app.router.add_post("/api/dev/agent_invoke", dev_agent_invoke)
     app.router.add_post("/api/dev/distill_now", dev_distill_now)
     app.router.add_post("/api/dev/insight_tick", dev_insight_tick)

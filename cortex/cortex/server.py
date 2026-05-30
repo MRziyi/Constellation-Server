@@ -3029,17 +3029,11 @@ class CortexServer:
                 self.twin, event=pending["event"], pending=pending,
                 decision_kind="kill", correction_text=None,
             )
-            agent_result = pending.get("agent_result")
-            tmux_session = (agent_result or {}).get("tmux_session")
-            if tmux_session:
-                try:
-                    await self._dispatch_to_tool({
-                        "tool": "claude_code", "action": "agent_kill",
-                        "args": {"tmux_session": tmux_session},
-                        "result_format": "execute",
-                    })
-                except Exception as e:
-                    log.warning("agent_kill.failed", error=str(e))
+            # SDK path: a kill on a FINAL/checkpoint card has nothing to tear down
+            # (the in-process run already ended at its ResultMessage); a mid-run
+            # kill arrives on a permission card and is handled by
+            # resolve_sdk_decision → PermissionResultDeny(interrupt). (tmux
+            # agent_kill retired, Rev 18 C-72.)
             # P0.1 — drop registry entry so the next invoke in this HUD
             # session spawns fresh (Kill is an explicit reset signal).
             if sid:
