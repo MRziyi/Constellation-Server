@@ -318,10 +318,18 @@ class SdkAgentSession:
                  has_feedback=bool(fb))
 
         if is_question:
-            # Answer-only: hand Claude the spoken reply. Best-effort shape for
-            # AskUserQuestion — refine against a real question on first E2E.
+            # Answer-only: inject the spoken reply as the AskUserQuestion answer.
+            # Verified contract (2026-05-30 on-box): updated_input["answers"] is a
+            # dict keyed by the QUESTION TEXT, value = the answer string; CC then
+            # continues with 'answered: "<question>"="<answer>"'. (Passthrough or
+            # header-keyed answers come through EMPTY — must be question-text-keyed.)
             updated = dict(tool_input or {})
-            updated["_answer"] = fb or ""
+            ans = fb or ""
+            updated["answers"] = {
+                q.get("question", ""): ans
+                for q in (tool_input.get("questions") or [])
+                if isinstance(q, dict)
+            }
             return PermissionResultAllow(updated_input=updated)
 
         if action == "approve":
