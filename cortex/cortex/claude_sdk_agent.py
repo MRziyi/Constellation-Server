@@ -287,7 +287,7 @@ class SdkAgentSession:
             )
         else:
             display = getattr(ctx, "display_name", None) or getattr(ctx, "title", None) or tool_name
-            desc = getattr(ctx, "description", None) or _summarize_tool(tool_name, tool_input)
+            desc = getattr(ctx, "description", None) or _tool_glance(tool_name, tool_input)[1]
             body = f"**{display}**\n\n{desc}"
             await self.server.emit_card(
                 cmd_id=cmd_id, title="Claude Needs You", body_md=body[:1500],
