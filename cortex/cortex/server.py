@@ -2605,12 +2605,15 @@ class CortexServer:
                              "n_options": len(options)}
             option_labels = ["answer"]
 
+        # User-facing name: never surface the internal "claude_code" tool id on a
+        # card — it's just "Claude" to the wearer (Zack 2026-05-30).
+        who = "Claude" if from_tool == "claude_code" else from_tool
         title_map = {
-            "permission_request": f"{from_tool} needs you",
-            "question": f"{from_tool} is asking",
-            "completion_notice": f"{from_tool} done",
-            "error": f"{from_tool} error",
-            "surprising_event": from_tool,
+            "permission_request": "Claude Needs You",
+            "question": "Claude Needs You",
+            "completion_notice": f"{who} done",
+            "error": f"{who} error",
+            "surprising_event": who,
         }
         icon_map = {
             "permission_request": "⚙",
