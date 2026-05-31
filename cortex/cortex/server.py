@@ -908,6 +908,15 @@ class CortexServer:
                     await self._handle_binary_image_frame(bytes(raw))
                     continue
                 event_data = json.loads(raw)
+                # Liveness preflight (glass → cortex → glass): the glass pings
+                # before a wake to confirm the WSS path is live (BT-PAN idle-drops
+                # silently). Reply immediately — bypasses the accept filter and
+                # isn't gated, so it flows whenever no decision is parked (true on
+                # a wake from Idle). Skip Event construction + log spam.
+                if event_data.get("kind") == "ping":
+                    self._glass_send(json.dumps(
+                        {"kind": "pong", "ts": datetime.now(timezone.utc).isoformat()}))
+                    continue
                 event_data.pop("id", None)  # Cortex assigns ids on ingress
                 event = Event(**event_data, id=ids.event_id())
                 log.info("glass.event", id=event.id, kind=event.kind)
