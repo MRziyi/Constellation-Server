@@ -55,6 +55,10 @@ RULES
    `email:` / `phone:` from frontmatter. Never invent a contact.
 4. Fewest subtasks that do the job.
 5. ISO 8601 for date/time args; resolve "tomorrow" / "3pm" against NOW.
+6. Photo attached? You can see it — read it to answer ("what is this", "what
+   does it say") or to fill an adapter's args (e.g. the time on a poster). A pure
+   visual answer → put it in hud_show body_template (subtasks:[]); an ask that
+   ACTS on the image → plan the adapter subtask with the values you read off it.
 
 result_format
   query   — bounded state read (battery, current tab, today's events), no side effect
@@ -344,12 +348,27 @@ async def route(
         feedback_iteration=feedback_iteration,
     )
 
+    # 2026-05-31: when a photo rode in with this turn, hand it to the planner as a
+    # multimodal image block (gpt-5.2 is multimodal). The planner reads the image
+    # directly — to answer a "what is this" in hud_show, or to fill an adapter's
+    # args ("the time on this"). There is NO image→text pre-step. `user_content`
+    # is a plain string when there's no image (unchanged behaviour).
+    image_b64 = (event.payload or {}).get("image")
+    if image_b64:
+        user_content: Any = [
+            {"type": "text", "text": user_prompt},
+            {"type": "image_url",
+             "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+        ]
+    else:
+        user_content = user_prompt
+
     try:
         raw = await cached_chat_create(
             model=model,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
+                {"role": "user", "content": user_content},
             ],
             purpose="router",
             # No response_format=json_object: we want reasoning preamble + JSON
@@ -479,23 +498,11 @@ AVAILABLE_TOOLS: dict[str, dict[str, str]] = {
     # claude_code escalation REMOVED (Rev 18 C-72): the classifier's complex
     # branch is the designed complex-agent path (→ in-process SDK). The planner
     # no longer escalates to a tmux research-agent.
-    "vision_describe": {
-        "actions": "describe",
-        "description": (
-            "Vision-aware image description / identification / OCR / 'what's in front'. "
-            "describe(prompt). Pick ONLY when the ask line ends with '(photo attached)' "
-            "AND the prompt is vision-shaped: describe / identify / read / what's-in-front "
-            "/ who-is-this / what-does-X-say / OCR. Single-call bounded query. "
-            "DO NOT pick when no '(photo attached)' tag is present — even if the prompt "
-            "mentions an image, the photo isn't there. DO NOT pick for non-vision asks "
-            "(mail / reminders / search) even when a photo is attached — the photo is "
-            "incidental in those cases. Cortex's dispatcher gates image passthrough on "
-            "this tool's name; routing here is the ONLY way image bytes reach any tool. "
-            "RESULT SHAPE: returns {description: str, model: str, tokens: {...}, had_image: bool} "
-            "— the body_template should be exactly `{{subtasks[i].result.description}}` "
-            "so the visible card body is just the clean prose, not the JSON wrapper."
-        ),
-    },
+    #
+    # vision_describe REMOVED (2026-05-31): there is no "image → text" tool. When
+    # a photo is attached it rides into THIS planner as a multimodal image block
+    # (see route()); the planner reads it directly to answer (hud_show) or to fill
+    # an adapter's args. Both models are multimodal — never reduce an image to text.
 }
 
 

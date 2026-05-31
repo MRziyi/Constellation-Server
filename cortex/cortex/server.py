@@ -277,39 +277,12 @@ class ResumeFailed(Exception):
 # Kill    = abandon: kill any agent tmux + drop pending + log a kill signal.
 _THREE_OPTIONS = ["Approve", "Modify", "Kill"]
 
-# Q.4.5 / C-47: tools that opt into receiving event.payload.image as
-# `_image_b64` in their args. The router decides per-prompt whether to route
-# to one of these (text-prompt-based, NEVER inspects image content). Other
-# tools never see the image even when one is attached — that's the
-# "default-off" guarantee Zack asked for (image is a passthrough, not a
-# broadcast). Extend this set when new vision tools land (OCR, face-id, etc.).
-_VISION_AWARE_TOOLS: set[str] = {"vision_describe"}
-
-# R-13 / C-55: regex heuristic for "user's text looks like a visual question".
-# Used by _handle_user_invoke to decide whether to pre-pull a scene capture
-# from glass before classification. Intentionally generous on both English
-# and Chinese — false positives waste a single capture (~70 KB / ~1.5s),
-# false negatives just yield text-only answers. Both acceptable.
-_VISUAL_INTENT_PATTERNS = [
-    # English: what/which/can-you-see/describe/read/recognize + reference to
-    # something in front of / on the desk / in the picture
-    re.compile(
-        r"\b(what(?:'s| is)?|describe|read|recognize|identify|see|look at|tell me about)\b"
-        r".*\b(this|that|these|those|here|there|in front|on (?:the|my) (?:desk|table|screen|wall|monitor)|"
-        r"the (?:screen|monitor|image|picture|photo|sign|text|object|thing|menu|page|document))\b",
-        re.IGNORECASE,
-    ),
-    # English: explicit "what's in front" / "what do you see"
-    re.compile(r"\b(what'?s in front|what do you see|what am i looking at)\b", re.IGNORECASE),
-    # Chinese: 看 (see/look) / 这是什么 / 那是什么 / 前面 / 屏幕
-    # Wide on purpose (Zack 2026-05-30): over-capturing wastes ~70KB/1.5s, but
-    # UNDER-capturing (missing "我面前/眼前看到的是什么") leaves the agent
-    # blind → it stalls. So err toward capture.
-    re.compile(
-        r"(看一?下|看到|看见|看看|瞧|这是什么|那是什么|是什么|什么东西|什么牌子|"
-        r"前面|眼前|面前|跟前|眼睛?前|这个是|那个是|屏幕上|拍.{0,3}(照|图|张)|帮我看|认一?下)"
-    ),
-]
+# 2026-05-31: vision is a DETERMINISTIC keyword opt-in (Zack). He knows when he
+# wants vision — when he says the cue word 「视觉」 (or "vision"), Cortex captures a
+# frame and hands it, UNCHANGED, to whichever path runs (planner or agent). There
+# is no "image → text" tool and no broad intent heuristic: the cue below is the
+# only trigger, and the photo always rides the turn as a real image block (the
+# models are multimodal — never reduce a frame to text).
 
 # Fixed VISION-TRIGGER cue (Zack 2026-05-30): rather than exhaust every "look at
 # the scene" phrasing with regex (always misses cases — real example "我眼前看到
@@ -327,45 +300,13 @@ _VISION_KEYWORD_PATTERN = re.compile(
 
 
 def _looks_visual_intent(text: str) -> bool:
-    """True iff the text should trigger a scene capture. The fixed cue 「视觉」
-    (+ near-mishears, see _VISION_KEYWORD_PATTERN) ALWAYS triggers — the reliable
-    opt-in path the user controls; the broad _VISUAL_INTENT_PATTERNS regex is a
-    best-effort bonus. No LLM call."""
-    if not text:
-        return False
-    if _VISION_KEYWORD_PATTERN.search(text):
-        return True
-    for pat in _VISUAL_INTENT_PATTERNS:
-        if pat.search(text):
-            return True
-    return False
-
-
-# Cues that the user wants to READ TEXT in the frame (poster / sign / menu /
-# document / "what does it say"). These justify OpenAI `detail:"high"` (image
-# tiled at 512px so small text is legible). Everything else → `detail:"low"`
-# (flat ~85 input tokens — enough for a scene glance, much cheaper). See
-# vision_describe DEFAULT_DETAIL note.
-_VISION_TEXT_READ_PATTERNS = [
-    re.compile(
-        r"\b(read|reads?|says?|written|text|word|wording|caption|title|label|"
-        r"poster|sign|menu|document|page|paper|slide|receipt|card|book|article|"
-        r"headline|paragraph|spell|transcribe|ocr)\b",
-        re.IGNORECASE,
-    ),
-    re.compile(r"(读|念|写的什么|写着什么|上面.*字|文字|海报|招牌|牌子|菜单|文件|文档|标题|说明|条款|这段|这页|纸上)"),
-]
-
-
-def _vision_detail_for(text: str) -> str:
-    """Pick OpenAI vision `detail` by intent: `high` when the user wants to read
-    text in the frame (poster/sign/menu/doc), else `low` to save tokens. No LLM
-    call — a regex on the ask text."""
-    if text:
-        for pat in _VISION_TEXT_READ_PATTERNS:
-            if pat.search(text):
-                return "high"
-    return "low"
+    """True iff the text contains the fixed vision cue 「视觉」 (+ near-mishears /
+    pinyin / "vision", see _VISION_KEYWORD_PATTERN) — the deterministic opt-in
+    Zack controls. No LLM call, no broad heuristic: the cue is the only trigger.
+    On a hit, Cortex captures a frame and hands it (unchanged) to the planner or
+    the agent; the model reads the image at full fidelity (no detail/downsample
+    knob — that died with vision_describe)."""
+    return bool(text and _VISION_KEYWORD_PATTERN.search(text))
 
 
 # Per-conversation permission mode (Zack 2026-05-30). The agent's CC permission
@@ -777,8 +718,8 @@ class CortexServer:
                 "imessage",
                 "safari_state",
                 "claude_code",
-                "vision_describe",  # Q.4.5 — receives image bytes only when
-                                    # router selects it (gated by _VISION_AWARE_TOOLS)
+                # vision_describe REMOVED (2026-05-31): no image→text tool. A photo
+                # rides into the planner (route()) as a multimodal image block.
             }
         )
 
@@ -1580,8 +1521,8 @@ class CortexServer:
         Returns the b64-encoded JPEG string on success, or None on timeout /
         peer-not-glass / peer-missing-capability.
 
-        Used by `_dispatch_complex_agent` when the router routed to a tool
-        in [_VISION_AWARE_TOOLS] but the originating event had no image.
+        Used at the top of `_handle_user_invoke` when the 「视觉」 vision cue fired
+        but the originating event had no image attached.
         Glass-side handler: `StateMachine.dispatch` `"request_image"` →
         CameraGate.captureViaGate → `wss.sendEvent(ImageAttached(req_id, b64))`.
         """
@@ -2378,8 +2319,8 @@ class CortexServer:
         # the agent can embed it in a memo, and Zack keeps a copy) and hand the
         # agent the relative path. The image itself rides INTO the agent as a
         # content block (Claude is natively multimodal) — there is NO separate
-        # vision_describe/OCR pre-step. The agent SEES the photo and decides,
-        # from Zack's prompt, what to do with it (memo / read text / describe).
+        # image→text pre-step. The agent SEES the photo and decides, from Zack's
+        # prompt, what to do with it (memo, read text off it, answer about it).
         photo_path: str | None = None
         if payload.get("image"):
             persisted = _persist_image_to_twin(
@@ -2651,21 +2592,14 @@ class CortexServer:
         from .sessions import current_session_id as _csid
         _csid.set(session_id_for_turn)
 
-        # R-13 / C-55: voice-with-vision detection. If the user's text looks
-        # like a visual question but no image was attached (typical for a
-        # voice-only invoke from glass), pull a scene capture from glass
-        # NOW — before classifier + router. Reason: router refuses to pick
-        # `vision_describe` when no image is in the event ("n_subtasks=0
-        # primary_intent=unsupported"); classifier may correctly flag
-        # "vision intent without photo" but then dispatches to CC which also
-        # can't help. By prefetching, classifier sees has_image=True and
-        # everything downstream just works.
-        #
-        # Heuristic is intentionally simple (regex) — no extra LLM call. False
-        # positives waste a capture (~70KB, ~1.5s); false negatives just mean
-        # the user gets a text-only answer. Both acceptable. Disabled when no
-        # glass peer is connected (lookup needs the WSS) or when the event
-        # already has an image (e.g. came from a photo shortcut).
+        # Vision capture (2026-05-31): the deterministic cue 「视觉」 / "vision"
+        # (see _looks_visual_intent / _VISION_KEYWORD_PATTERN) means Zack wants a
+        # frame. Pull a scene capture from glass NOW — before classifier + router —
+        # so the photo rides into whichever path runs (planner as a multimodal
+        # image block, or the agent as a content block). One capture, hands the
+        # image unchanged downstream; never reduced to text.
+        # Skipped when no glass peer is connected (capture needs the WSS) or when
+        # the event already carries an image (e.g. a photo shortcut).
         if (
             ask_text
             and not payload.get("image")
@@ -2786,38 +2720,11 @@ class CortexServer:
         #   - hud_show:       confirm-policy says auto. Dispatch ALL subtasks now so the
         #                     hud_show body can reflect real results; receipt written immediately.
         #
-        # Q.4.5 / C-47: image bytes flow ONLY to tools the router explicitly
-        # routed to that are declared vision-aware (see _VISION_AWARE_TOOLS).
-        # Default = image goes nowhere; router has to opt in by routing to a
-        # vision-capable tool based on the text prompt. The dispatcher itself
-        # never decodes/inspects the image — it just hands the opaque bytes to
-        # the selected vision tool's args.
-        image_b64 = (event.payload or {}).get("image")
-        # R-13 / C-55: if the router selected a vision-aware tool but the
-        # originating event had no image attached, ask the glass peer to
-        # capture one now (server-pull-on-demand). One round-trip per turn
-        # regardless of how many vision-aware subtasks the plan has.
-        if not image_b64 and any(
-            st.get("tool") in _VISION_AWARE_TOOLS for st in plan["subtasks"]
-        ):
-            log.info(
-                "vision.request_image",
-                event_id=event.id,
-                tools=[st.get("tool") for st in plan["subtasks"] if st.get("tool") in _VISION_AWARE_TOOLS],
-            )
-            await self._emit_progress_to_glass(
-                parent_event_id=event.id,
-                stage="capturing", icon="📷",
-                detail="capturing scene…",
-            )
-            image_b64 = await self._request_image_from_glass(
-                parent_event_id=event.id,
-                hint="scene in front",
-            )
-            if image_b64:
-                log.info("vision.image_received", event_id=event.id, bytes_b64=len(image_b64))
-            else:
-                log.warning("vision.image_unavailable_fallback_to_textonly", event_id=event.id)
+        # Vision (2026-05-31): if a frame was captured for this turn (the 「视觉」
+        # cue fired at the top of _handle_user_invoke), it already rode into the
+        # planner as a multimodal image block (router.route()) — the planner read
+        # it to answer or to fill an adapter's args. Adapters never receive image
+        # bytes; there is no image→text tool, so nothing to inject here.
         subtask_results: list[dict[str, Any]] = []
         for i, st in enumerate(plan["subtasks"]):
             if st["result_format"] in ("draft", "query") or hud_kind == "hud_show":
@@ -2828,15 +2735,6 @@ class CortexServer:
                 )
                 # Re-interpolate args (subtask N may reference N-1's result)
                 args = self._interpolate_args(st.get("args", {}), subtask_results, plan=plan)
-                if image_b64 and st["tool"] in _VISION_AWARE_TOOLS:
-                    args = {
-                        **args,
-                        "_image_b64": image_b64,
-                        # Intent-driven cost control: high only when reading text.
-                        "detail": args.get("detail") or _vision_detail_for(
-                            (event.payload or {}).get("text") or ""
-                        ),
-                    }
                 rpc_result = await self._dispatch_to_tool({**st, "args": args})
                 subtask_results.append(rpc_result.result)
             else:

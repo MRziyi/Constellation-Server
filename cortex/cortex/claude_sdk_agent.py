@@ -236,7 +236,7 @@ class SdkAgentSession:
         self.event = event
         self.brief = brief
         # UC1: a glasses photo handed straight to Claude as an image content
-        # block on the opening turn (Claude is multimodal — no vision_describe
+        # block on the opening turn (Claude is multimodal — no image→text
         # pre-step). Empty string = capture failed → treated as no image.
         self.image_b64 = image_b64 or None
         self.image_media_type = image_media_type

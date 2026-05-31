@@ -52,10 +52,9 @@ adapters:
     class: tool_agent.adapters.claude_code.ClaudeCodeAdapter
     enabled: true   # Slice C — uses `claude -p` (no tmux); draft/run/continue/list_sessions
 
-  - name: vision_describe
-    class: tool_agent.adapters.vision_describe.VisionDescribeAdapter
-    enabled: true   # Q.4.5 — vision-aware tool; receives `_image_b64` only when the
-                    # router routes here (gated by cortex._VISION_AWARE_TOOLS allowlist)
+  # vision_describe REMOVED (2026-05-31): no image→text adapter. A photo rides into
+  # the planner (cortex.router.route) / agent (claude_sdk_agent) as a multimodal
+  # image block — the model reads it directly. There is no pre-digest-to-text step.
 
   # Phase 6:
   # - name: local_face_recognition

@@ -107,15 +107,15 @@ def build_agent_brief(
     if now_iso:
         L.append(f"NOW: {now_iso}")
     if photo_path:
-        # UC1: the glasses photo is ATTACHED to this message as an image block —
-        # the agent sees it directly (it's Claude, natively multimodal). NO
-        # pre-digested OCR/简介: the agent reads the image itself and decides,
-        # from Zack's request, what to do (memo / read its text / describe /
-        # act on it). The on-disk copy is for embedding into a memo.
-        L.append("PHOTO: a glasses photo is ATTACHED to this message — look at it directly.")
-        L.append(f"  It's also saved on disk at twin/memos/{photo_path} (Zack's kept copy).")
-        L.append(f"  → if Zack wants a memo, write it under twin/memos/<slug>.md with:")
-        L.append(f"    his note + what YOU see in the photo + the image embedded: ![]({photo_path})")
+        # The glasses photo is ATTACHED to this message as an image block — the
+        # agent sees it directly (Claude is multimodal). Do NOT pre-digest it to
+        # text and do NOT tell the model what to "see": just hand it Zack's ask
+        # + the image and let it do exactly that. The on-disk copy is so a memo
+        # can embed the picture.
+        L.append("PHOTO: a glasses photo is ATTACHED to this message — look at it directly")
+        L.append(f"  and do exactly what Zack asked, nothing extra. It's also saved at")
+        L.append(f"  twin/memos/{photo_path}; if a memo is the right output, write it under")
+        L.append(f"  twin/memos/<slug>.md and embed the image: ![]({photo_path})")
     elif has_photo:
         L.append("PHOTO: attached to this message (glass camera) — look at it directly.")
     L.append("")
