@@ -26,6 +26,7 @@ from .agent_brief import (
 from .control_plane import ControlPlane
 from .prompts import (
     VISION_KEYWORD_PATTERN as _VISION_KEYWORD_PATTERN,
+    VISION_DETAIL_PATTERN as _VISION_DETAIL_PATTERN,
     AUTO_RUN_PATTERNS as _AUTO_RUN_PATTERNS,
     PIN_INTENT_PATTERNS as _PIN_INTENT_PATTERNS,
     UNPIN_INTENT_PATTERNS as _UNPIN_INTENT_PATTERNS,
@@ -298,6 +299,15 @@ def _looks_visual_intent(text: str) -> bool:
     the agent; the model reads the image at full fidelity (no detail/downsample
     knob — that died with vision_describe)."""
     return bool(text and _VISION_KEYWORD_PATTERN.search(text))
+
+
+def _vision_tier_for(text: str) -> str:
+    """When the vision cue fired, pick the CAPTURE tier (Zack 2026-05-31):
+    'detail' (high-res 2K, for reading fine text — poster/sign/document) when the
+    ask carries a detail qualifier (细节 / detail / 高清 / 2k); else 'standard'
+    (1080p scene glance). Deterministic regex, no LLM. Only the tier NAME goes to
+    the glasses (in the request_image frame); the glasses map name → px."""
+    return "detail" if (text and _VISION_DETAIL_PATTERN.search(text)) else "standard"
 
 
 # Per-conversation permission mode (Zack 2026-05-30). The agent's CC permission
@@ -1477,6 +1487,8 @@ class CortexServer:
 
     async def _request_image_from_glass(
         self, parent_event_id: str, hint: str | None = None,
+        tier: str = "standard",    # 'standard' (1080p) | 'detail' (2K) — the
+        # glasses map the tier name → (long-edge px, jpeg quality).
         timeout_s: float = 18.0,   # CameraGate warmup+capture measured ~10.6–11.4s
         # on-device (2026-05-30); 10s clipped valid frames. 18s gives margin.
     ) -> str | None:
@@ -1501,11 +1513,12 @@ class CortexServer:
         payload: dict[str, Any] = {
             "req_id": req_id,
             "parent_event_id": parent_event_id,
+            "tier": tier,
         }
         if hint:
             payload["hint"] = hint
         await self._emit_glass_frame("request_image", payload)
-        log.info("request_image.sent", req_id=req_id, parent=parent_event_id, hint=hint)
+        log.info("request_image.sent", req_id=req_id, parent=parent_event_id, hint=hint, tier=tier)
         try:
             return await asyncio.wait_for(fut, timeout=timeout_s)
         except asyncio.TimeoutError:
@@ -1748,10 +1761,12 @@ class CortexServer:
             "prompt": cfg["prompt"],
             "send_photo": cfg["send_photo"],
             "label": cfg["label"],
+            "tier": cfg["tier"],   # capture tier for photo-bearing fires
         })
         log.info(
             "shortcut_config.emitted",
             slot=cfg["slot"], send_photo=cfg["send_photo"], label=cfg["label"],
+            tier=cfg["tier"],
         )
         photo = "📷 + " if cfg["send_photo"] else ""
         await self._emit_info_card(
@@ -2570,15 +2585,18 @@ class CortexServer:
             and "card" in self._glass_accept
             and _looks_visual_intent(ask_text)
         ):
-            log.info("vision.upfront_request_image", event_id=event.id, ask_preview=ask_text[:60])
+            tier = _vision_tier_for(ask_text)
+            log.info("vision.upfront_request_image", event_id=event.id,
+                     ask_preview=ask_text[:60], tier=tier)
             await self._emit_progress_to_glass(
                 parent_event_id=event.id,
                 stage="capturing", icon="📷",
-                detail="capturing scene…",
+                detail="capturing scene…" if tier == "standard" else "capturing scene (hi-res)…",
             )
             img = await self._request_image_from_glass(
                 parent_event_id=event.id,
                 hint="scene in front",
+                tier=tier,
             )
             if img:
                 event.payload["image"] = img

@@ -69,6 +69,18 @@ VISION_KEYWORD_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Vision DETAIL tier (Zack 2026-05-31): the cue above captures a frame; a detail
+# qualifier (细节 / detail / 高清 / 2k) selects the high-res 'detail' tier
+# (2048px / q90 — the legible-text sweet spot for poster / sign / document, per
+# the Claude+GPT vision docs), vs the 'standard' tier (1024px / q85 — a fast,
+# low-bandwidth scene glance). Cortex sends only the tier NAME in the
+# request_image frame; the glasses map name → (long-edge px, jpeg quality). Kept
+# lean (Zack: don't pile on keywords) — explicit words + a couple of synonyms.
+VISION_DETAIL_PATTERN = re.compile(
+    r"(细节|detail|高清|高分辨率|高解析|2k)",
+    re.IGNORECASE,
+)
+
 # ── Permission mode (full-auto opt-in) ─────────────────────────────────────
 # Full-auto (bypassPermissions) is opt-in ONLY via the explicit phrase "自动模式"
 # (Zack 2026-05-30: "有'自动模式'这四个字的时候，才能开"). No other phrasing enables it —

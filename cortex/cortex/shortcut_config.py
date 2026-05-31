@@ -30,6 +30,7 @@ from .prompts import (
     SHORTCUT_PARSER_SYSTEM as SYSTEM_PROMPT,
     SLOT_RE as _SLOT_RE,
     CONFIG_VERB_RE as _CONFIG_VERB_RE,
+    VISION_DETAIL_PATTERN as _VISION_DETAIL_PATTERN,
 )
 
 log = structlog.get_logger(__name__)
@@ -92,11 +93,18 @@ async def parse_shortcut_config(text: str) -> dict[str, Any] | None:
             return None
         send_photo = bool(parsed.get("send_photo", False))
         label = str(parsed.get("label") or "").strip()[:40] or prompt[:24]
+        # Capture TIER (Zack 2026-05-31): when a photo-bearing slot fires, the
+        # glasses capture at this tier. Deterministic — infer from the wording
+        # (prompt + the config utterance), same VISION_DETAIL_PATTERN the live
+        # vision path uses: a detail qualifier (细节 / detail / 高清 / 2k) → 'detail'
+        # (2048px/q90, legible text); else 'standard' (1024px/q85, fast glance).
+        tier = "detail" if _VISION_DETAIL_PATTERN.search(f"{prompt} {text}") else "standard"
         result = {
             "slot": slot,
             "prompt": prompt,
             "send_photo": send_photo,
             "label": label,
+            "tier": tier,
         }
         log.info("shortcut_config.parsed", **result)
         return result
