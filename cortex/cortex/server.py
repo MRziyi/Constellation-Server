@@ -1083,6 +1083,7 @@ class CortexServer:
         stage: str,
         icon: str,
         detail: str,
+        meta: str | None = None,
     ) -> None:
         """Cortex-side internal progress emit. Same wire shape as the
         agent_progress frames from tool_agent, just sourced locally — used to
@@ -1118,7 +1119,9 @@ class CortexServer:
                 stage=stage,
                 icon=icon,
                 detail_runs=[{"text": detail or "", "style": "normal"}],
-                meta_runs=[],
+                # Persistent model tag (Zack 2026-05-31): the wearer should always
+                # know whether GPT (classify/route) or Claude (agent) is working.
+                meta_runs=([{"text": meta, "style": "dim"}] if meta else []),
             )
 
     async def _handle_progress_feedback(self, event: Event) -> None:
@@ -2698,7 +2701,7 @@ class CortexServer:
             await self._emit_progress_to_glass(
                 parent_event_id=event.id,
                 stage="classifying", icon="🧭",
-                detail="classifying intent (gpt-5.2)",
+                detail="classifying intent", meta="GPT-5.2",
             )
             try:
                 decision = await classify_intent(event)
@@ -2712,7 +2715,7 @@ class CortexServer:
                     await self._emit_progress_to_glass(
                         parent_event_id=event.id,
                         stage="classified", icon="🧭",
-                        detail=f"intent: complex → agent — {why}",
+                        detail=f"intent: complex → agent — {why}", meta="GPT-5.2",
                     )
                     # R-13 / C-55: vision upfront-pull happened before
                     # classifier (see top of _handle_user_invoke). By the time
@@ -2724,7 +2727,7 @@ class CortexServer:
                 await self._emit_progress_to_glass(
                     parent_event_id=event.id,
                     stage="classified", icon="🧭",
-                    detail=f"intent: simple → planner — {why}",
+                    detail=f"intent: simple → planner — {why}", meta="GPT-5.2",
                 )
             except Exception as e:
                 log.warning("classifier.errored_falling_through", error=str(e))
@@ -2733,7 +2736,7 @@ class CortexServer:
         await self._emit_progress_to_glass(
             parent_event_id=event.id,
             stage="planning", icon="🧠",
-            detail="planning dispatch (gpt-5.2 router)",
+            detail="planning dispatch (router)", meta="GPT-5.2",
         )
         plan = await self._route(event)
         log.info("plan.generated", primary_intent=plan["primary_intent"])

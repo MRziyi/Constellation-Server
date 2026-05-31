@@ -352,8 +352,12 @@ class SdkAgentSession:
     # ── stream consumption ─────────────────────────────────────────────────
 
     async def _progress(self, stage: str, icon: str, detail: str) -> None:
+        # All agent progress carries the "Claude" model tag (the persistent HUD
+        # meta line) so the wearer can tell it apart from the GPT classify/route
+        # phase. (Zack 2026-05-31.)
         await self.server._emit_progress_to_glass(
             parent_event_id=self.event.id, stage=stage, icon=icon, detail=detail,
+            meta="Claude",
         )
 
     async def _handle_message(self, msg: Any) -> dict[str, Any] | None:
@@ -395,7 +399,7 @@ class SdkAgentSession:
                 return await self._credit_exhausted_card(None, reason=err)
             if err == "authentication_failed":
                 return await self._error_card(
-                    "认证失败", "Claude 认证失败——检查是否用订阅登录、且无 API key。")
+                    "Auth failed", "Claude auth failed — check you're logged in via subscription with no API key.")
             for block in (msg.content or []):
                 if isinstance(block, ToolUseBlock):
                     # record for the matching tool_result; dedupe (partial +
