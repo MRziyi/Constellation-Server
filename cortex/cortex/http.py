@@ -384,6 +384,32 @@ def make_app(plane: ControlPlane) -> web.Application:
         result = plane.server.distiller.force_run()
         return _json(result)
 
+    async def dev_capture_image(request: web.Request) -> web.Response:
+        """Directly trigger ONE glass camera capture (request_image) with a long
+        timeout, in isolation — to test the camera. Returns whether a usable image
+        came back, its b64 size, and how long the capture actually took."""
+        if plane.server is None:
+            return _err("server not bound", 503)
+        srv = plane.server
+        if not srv._glass_conn:
+            return _err("no glass connected (server_bound false)", 503)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        timeout_s = float(body.get("timeout_s", 30.0))
+        loop = asyncio.get_event_loop()
+        t0 = loop.time()
+        img = await srv._request_image_from_glass(
+            parent_event_id=ids.event_id(), hint="dev camera test",
+            timeout_s=timeout_s,
+        )
+        return _json({
+            "ok": True, "has_image": bool(img),
+            "bytes_b64": len(img) if img else 0,
+            "elapsed_s": round(loop.time() - t0, 2),
+        })
+
     async def dev_insight_tick(request: web.Request) -> web.Response:
         """Force one tick of the Insight Engine, bypassing cron schedule
         + global cooldown. Used to dogfood-test insight providers; surfaces
@@ -642,6 +668,7 @@ def make_app(plane: ControlPlane) -> web.Application:
     app.router.add_post("/api/test/invoke", test_invoke)
     app.router.add_post("/api/dev/agent_invoke", dev_agent_invoke)
     app.router.add_post("/api/dev/distill_now", dev_distill_now)
+    app.router.add_post("/api/dev/capture_image", dev_capture_image)
     app.router.add_post("/api/dev/insight_tick", dev_insight_tick)
     app.router.add_get("/api/trace/stream", trace_stream)
 

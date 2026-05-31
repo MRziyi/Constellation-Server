@@ -1550,7 +1550,8 @@ class CortexServer:
 
     async def _request_image_from_glass(
         self, parent_event_id: str, hint: str | None = None,
-        timeout_s: float = 10.0,
+        timeout_s: float = 18.0,   # CameraGate warmup+capture measured ~10.6–11.4s
+        # on-device (2026-05-30); 10s clipped valid frames. 18s gives margin.
     ) -> str | None:
         """Ask the current glass peer to capture a photo and send it back.
         Returns the b64-encoded JPEG string on success, or None on timeout /
