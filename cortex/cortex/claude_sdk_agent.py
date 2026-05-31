@@ -283,6 +283,8 @@ class SdkAgentSession:
 
         # Human-readable card content straight from the SDK context — no pane
         # scraping. ToolPermissionContext carries title/display_name/description.
+        # Card source: the agent is Claude (Vision when a photo rode in).
+        src = "Claude Vision" if self.image_b64 else "Claude"
         if is_question:
             qs = (tool_input or {}).get("questions") or []
             first_q = (qs[0].get("question") if qs and isinstance(qs[0], dict) else "") or "Claude has a question."
@@ -295,7 +297,7 @@ class SdkAgentSession:
             body = first_q + (("\n\n" + "\n".join(opts_lines)) if opts_lines else "")
             await self.server.emit_card(
                 cmd_id=cmd_id, title="Claude Needs You", body_md=body[:1500],
-                options=["answer"], card_type="question", ttl_ms=600_000,
+                options=["answer"], card_type="question", source=src, ttl_ms=600_000,
             )
         else:
             display = getattr(ctx, "display_name", None) or getattr(ctx, "title", None) or tool_name
@@ -304,7 +306,7 @@ class SdkAgentSession:
             await self.server.emit_card(
                 cmd_id=cmd_id, title="Claude Needs You", body_md=body[:1500],
                 options=["approve", "modify", "reject"], card_type="checkpoint",
-                ttl_ms=600_000,
+                source=src, ttl_ms=600_000,
             )
 
         log.info("sdk_agent.permission_card", cmd_id=cmd_id, tool=tool_name,
@@ -475,7 +477,7 @@ class SdkAgentSession:
         await self.server.emit_card(
             cmd_id=ids.command_id(), title="SDK 额度用尽",
             body_md=f"Claude Agent SDK 这个月的额度用尽了{when}。已停止，未产生 API 费用。",
-            options=[], card_type="notification", ttl_ms=30_000,
+            options=[], card_type="notification", source="Claude", ttl_ms=30_000,
         )
         log.warning("sdk_agent.credit_exhausted", reason=reason, resets_at=resets)
         return {"ok": False, "error": f"sdk_credit_{reason}", "session_id": self.session_id,
@@ -485,7 +487,7 @@ class SdkAgentSession:
     async def _error_card(self, title: str, body: str) -> dict[str, Any]:
         await self.server.emit_card(
             cmd_id=ids.command_id(), title=title, body_md=body,
-            options=[], card_type="notification", ttl_ms=30_000,
+            options=[], card_type="notification", source="Claude", ttl_ms=30_000,
         )
         return {"ok": False, "error": title, "session_id": self.session_id,
                 "structured": None, "result_text": "", "is_checkpoint": False,

@@ -1225,7 +1225,7 @@ class CortexServer:
             await self.emit_card(
                 cmd_id=review_cmd_id, title="STT review",
                 body_md="没听清 —— 长按重讲", options=["approve", "redo"],
-                card_type="stt_review", ttl_ms=120_000,
+                card_type="stt_review", source="Whisper", ttl_ms=120_000,
             )
             return
 
@@ -1251,6 +1251,7 @@ class CortexServer:
             body_md=transcript,
             options=["approve", "redo"],
             card_type="stt_review",
+            source="Whisper",
             ttl_ms=120_000,
         )
         log.info("stt_review.surfaced", review_cmd_id=review_cmd_id,
@@ -1402,6 +1403,12 @@ class CortexServer:
             "kind": kind,
             **payload,
         }
+        # Card-source guarantee (Zack 2026-05-31): every card must be attributed.
+        # emit_card sets `source`; this backstops any future bypass so a card is
+        # never shipped blank.
+        if kind == "card" and not frame.get("source"):
+            frame["source"] = "Cortex"
+            log.warning("card.missing_source", cmd_id=frame.get("cmd_id"))
         # A decision card (wearer must act) parks the sender until decided, so
         # trailing progress can't bury it; notification (options=[]) does not.
         blocks = kind == "card" and payload.get("card_type") in (
@@ -1425,6 +1432,7 @@ class CortexServer:
     async def emit_card(
         self, *, cmd_id: str,
         title: str, body_md: str,
+        source: str,
         scroll_total_lines: int = 0,
         options: list[str] | None = None,
         ttl_ms: int = 30_000,
@@ -1447,6 +1455,7 @@ class CortexServer:
             # (notification=dismiss · checkpoint=approve/modify/reject · question=answer
             #  · stt_review=approve/redo). Caller may override the derived type.
             "card_type": card_type or _card_type_for(resolved_options),
+            "source": source,
             "ttl_ms": ttl_ms,
         }
         # "Quote + body" layout (Zack 2026-05-30): when we know what triggered
@@ -1629,6 +1638,7 @@ class CortexServer:
                 title=cmd.payload.get("title", ""),
                 body_md=cmd.payload.get("body", ""),
                 options=options,
+                source=cmd.payload.get("source") or "Cortex",
                 ttl_ms=cmd.ttl_ms,
                 echo=echo_text,
             )
@@ -1660,6 +1670,7 @@ class CortexServer:
                     title=cmd.payload.get("title", ""),
                     body_md=cmd.payload.get("body", ""),
                     options=[],  # info-only: caller relies on emit_card preserving []
+                    source=cmd.payload.get("source") or "Cortex",
                     ttl_ms=cmd.ttl_ms,
                     echo=echo_text,
                 )
@@ -1726,6 +1737,7 @@ class CortexServer:
 
     async def _emit_info_card(
         self, *, event_id: str, title: str, body: str, ttl_ms: int = 5_000,
+        source: str = "Cortex",
     ) -> None:
         """Lightweight info-only card (no options) used for confirmation
         feedback. Goes through `emit_card` (with options=[]) so the glass-side
@@ -1737,6 +1749,7 @@ class CortexServer:
             title=title,
             body_md=body,
             options=[],
+            source=source,
             ttl_ms=ttl_ms,
         )
 
@@ -1947,6 +1960,7 @@ class CortexServer:
             title="🧭 Continue this session?",
             body_md=body,
             options=["approve", "modify", "kill"],
+            source="Cortex",
             ttl_ms=30_000,
         )
         log.info(
@@ -2142,6 +2156,8 @@ class CortexServer:
         from .schema import Command
         structured = rpc_result.get("structured") if isinstance(rpc_result.get("structured"), dict) else None
         is_checkpoint = _is_checkpoint(structured) or bool(rpc_result.get("is_checkpoint"))
+        # Card-source: complex path = the Claude agent (Vision if a photo rode in).
+        agent_source = "Claude Vision" if (event.payload or {}).get("image") else "Claude"
 
         if is_checkpoint and structured is not None:
             summary = (structured.get("summary") or "phase done").strip()
@@ -2159,6 +2175,7 @@ class CortexServer:
                     "body": "\n".join(lines)[:2000],
                     "icon": "⏸",
                     "options": list(_THREE_OPTIONS),
+                    "source": agent_source,
                 },
                 requires_confirm=True, ttl_ms=600_000,
             )
@@ -2223,6 +2240,7 @@ class CortexServer:
             payload={
                 "title": title, "body": body_md[:2000], "icon": "✦",
                 "options": (list(_THREE_OPTIONS) if subtasks else []),
+                "source": agent_source,
             },
             requires_confirm=bool(subtasks), ttl_ms=300_000,
         )
@@ -2726,7 +2744,8 @@ class CortexServer:
             stage="preparing_card", icon="🎴",
             detail=f"preparing {hud_kind}",
         )
-        cmd = self._build_command(plan, subtask_results)
+        cmd = self._build_command(plan, subtask_results,
+                                 "GPT Vision" if (event.payload or {}).get("image") else "GPT")
         sid = (event.payload or {}).get("session_id")
         self._pending_previews[cmd.id] = {
             "event": event,  # full event kept so we can re-route on Modify feedback
@@ -2777,7 +2796,10 @@ class CortexServer:
             feedback_iteration=feedback_iteration,
         )
 
-    def _build_command(self, plan: dict[str, Any], results: list[dict[str, Any]]) -> Command:
+    def _build_command(
+        self, plan: dict[str, Any], results: list[dict[str, Any]],
+        source: str = "GPT",
+    ) -> Command:
         hud = plan["hud_response"]
         body = self._interpolate(hud["body_template"], results, plan=plan)
         # Three-option contract (Zack 2026-05-25 v2): every blocking card has
@@ -2798,6 +2820,7 @@ class CortexServer:
                 "body": body,
                 "icon": hud.get("icon", ""),
                 "options": options,
+                "source": source,
             },
             requires_confirm=kind == "preview_action",
             ttl_ms=30_000,
@@ -3170,7 +3193,8 @@ class CortexServer:
             stage="preparing_card", icon="🎴",
             detail=f"preparing {hud_kind}",
         )
-        cmd = self._build_command(next_plan, subtask_results)
+        cmd = self._build_command(next_plan, subtask_results,
+                                 "GPT Vision" if (original_event.payload or {}).get("image") else "GPT")
         sid = (original_event.payload or {}).get("session_id")
         self._pending_previews[cmd.id] = {
             "event": original_event,
