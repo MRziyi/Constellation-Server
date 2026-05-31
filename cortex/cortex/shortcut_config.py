@@ -20,32 +20,25 @@ duplicate capture).
 
 from __future__ import annotations
 
-import os
-import re
 from typing import Any
 
 import structlog
 
 from .llm_cache import cached_chat_create, parse_json_response
+from .prompts import (
+    SHORTCUT_PARSER_MODEL as PARSER_MODEL,
+    SHORTCUT_PARSER_SYSTEM as SYSTEM_PROMPT,
+    SLOT_RE as _SLOT_RE,
+    CONFIG_VERB_RE as _CONFIG_VERB_RE,
+)
 
 log = structlog.get_logger(__name__)
 
-PARSER_MODEL = os.environ.get(
-    "CORTEX_CLASSIFIER_MODEL",
-    os.environ.get("CORTEX_ROUTER_MODEL", "gpt-5.2"),
-)
-
 N_SLOTS = 3
 
-# Detection: utterance names a slot (shortcut N / 快捷方式 N) AND has a config
-# verb. Anchored loosely — a fire ("run shortcut 2") has no config verb, so it
-# falls through to the normal path.
-_SLOT_RE = re.compile(r"(?:shortcut|快捷(?:方式|键)?)\s*([1-3])", re.IGNORECASE)
-_CONFIG_VERB_RE = re.compile(
-    r"(set|change|configure|update|edit|rename|make|定义|设为|设成|设置|"
-    r"改成|改为|换成|配置|绑定|编辑)",
-    re.IGNORECASE,
-)
+# Detection patterns (_SLOT_RE / _CONFIG_VERB_RE) now live in prompts.py
+# (imported at the top): a slot-config utterance names a slot (shortcut N) AND
+# has a config verb; a fire ("run shortcut 2") has no verb → falls through.
 
 
 def detect_slot(text: str) -> int | None:
@@ -65,29 +58,6 @@ def looks_shortcut_config(text: str) -> bool:
     if not text:
         return False
     return detect_slot(text) is not None and bool(_CONFIG_VERB_RE.search(text))
-
-
-SYSTEM_PROMPT = """\
-You configure one of the user's 3 voice shortcut slots. The user's utterance
-edits a slot — extract what it should become. The slot, when later fired,
-sends a PRESET PROMPT to the assistant (optionally with a photo attached).
-
-Output JSON ONLY:
-{"slot": 1|2|3, "prompt": "<the preset prompt to send when fired>", "send_photo": true|false, "label": "<≤4-word name>"}
-
-Rules:
-- `slot`: the slot number the user named (1, 2, or 3).
-- `prompt`: the actual prompt the shortcut will SEND when fired — NOT the
-  configuration command. E.g. for "set shortcut 2 to ask what's in front of
-  me", prompt = "What's in front of me?" (not "set shortcut 2 …").
-- `send_photo`: true if firing should attach a camera photo — set true when the
-  user says to send/attach a photo, OR when the prompt inherently needs to see
-  the scene (what's in front, read this, identify this). Else false.
-- `label`: a short human name for the slot (≤4 words), derived from the prompt.
-- Preserve the user's language for `prompt` + `label` (Chinese in → Chinese out).
-
-JSON ONLY. No fence. No prose.
-"""
 
 
 async def parse_shortcut_config(text: str) -> dict[str, Any] | None:

@@ -24,6 +24,16 @@ from .agent_brief import (
     build_agent_brief as _assemble_agent_brief,
 )
 from .control_plane import ControlPlane
+from .prompts import (
+    VISION_KEYWORD_PATTERN as _VISION_KEYWORD_PATTERN,
+    AUTO_RUN_PATTERNS as _AUTO_RUN_PATTERNS,
+    PIN_INTENT_PATTERNS as _PIN_INTENT_PATTERNS,
+    UNPIN_INTENT_PATTERNS as _UNPIN_INTENT_PATTERNS,
+    THREE_OPTIONS as _THREE_OPTIONS,
+    APPROVE_BUTTON_TOKENS as _APPROVE_BUTTON_TOKENS,
+    MODIFY_BUTTON_TOKENS as _MODIFY_BUTTON_TOKENS,
+    KILL_BUTTON_TOKENS as _KILL_BUTTON_TOKENS,
+)
 from .schema import Command, Event, RPCDispatch, RPCResult
 from .router import available_tools_block, route, route_stub, select_twin_paths
 from .twin import Twin
@@ -274,29 +284,10 @@ class ResumeFailed(Exception):
 #
 # Approve = proceed exactly as previewed (send / continue / execute / yes).
 # Modify  = redirect with details (the text is the redirection).
-# Kill    = abandon: kill any agent tmux + drop pending + log a kill signal.
-_THREE_OPTIONS = ["Approve", "Modify", "Kill"]
-
-# 2026-05-31: vision is a DETERMINISTIC keyword opt-in (Zack). He knows when he
-# wants vision — when he says the cue word 「视觉」 (or "vision"), Cortex captures a
-# frame and hands it, UNCHANGED, to whichever path runs (planner or agent). There
-# is no "image → text" tool and no broad intent heuristic: the cue below is the
-# only trigger, and the photo always rides the turn as a real image block (the
-# models are multimodal — never reduce a frame to text).
-
-# Fixed VISION-TRIGGER cue (Zack 2026-05-30): rather than exhaust every "look at
-# the scene" phrasing with regex (always misses cases — real example "我眼前看到
-# 的是什么" slipped through, while "看我的profile" false-fired), the user opts
-# into a fixed word — 「视觉」 — that ALWAYS triggers a capture. Includes common
-# STT mishears (视角/试觉/世觉…) + pinyin + English so a slightly-misheard cue
-# still fires. The STT-review card is the backstop: if mangled beyond these the
-# user sees the (wrong) transcript and re-speaks. Kept ALONGSIDE the broad regex
-# above (still catches obvious scene asks even without the cue — over-capture is
-# cheap, under-capture stalls the agent).
-_VISION_KEYWORD_PATTERN = re.compile(
-    r"(视觉|视角|视\s?觉|视\s?决|试觉|事觉|世觉|实觉|是觉|vision|visual|sh[ií]?\s?ju[eé])",
-    re.IGNORECASE,
-)
+# Kill    = abandon: kill any agent + drop pending + log a kill signal.
+# _THREE_OPTIONS and the vision cue _VISION_KEYWORD_PATTERN now live in
+# prompts.py (imported at the top). Vision is a deterministic keyword opt-in:
+# saying 「视觉」 captures a frame and hands it, unchanged, to whichever path runs.
 
 
 def _looks_visual_intent(text: str) -> bool:
@@ -320,7 +311,7 @@ def _looks_visual_intent(text: str) -> bool:
 # Full-auto (bypassPermissions) is opt-in ONLY via the explicit phrase "自动模式"
 # (Zack 2026-05-30: "有'自动模式'这四个字的时候，才能开"). No other phrasing enables it —
 # everything else stays acceptEdits, so permission requests surface as cards.
-_AUTO_RUN_PATTERNS = [re.compile(r"自动模式")]
+# _AUTO_RUN_PATTERNS now lives in prompts.py (imported at the top).
 
 
 def _permission_mode_for(text: str) -> str:
@@ -397,21 +388,8 @@ def _persist_image_to_twin(b64: str, tag: str) -> dict[str, str] | None:
 # `pinned` flag, emit a confirmation card, and stop. Pin patterns cover EN
 # + ZH; the test is "is the ENTIRE prompt a pin instruction?" — not "does
 # it contain pin words" (which would false-positive on "pin a reminder
-# about X").
-_PIN_INTENT_PATTERNS = [
-    # English
-    re.compile(r"^\s*(please\s+)?(pin|keep)( this| it| this one| this session)?\.?\s*$", re.IGNORECASE),
-    re.compile(r"^\s*keep( this)? alive\.?\s*$", re.IGNORECASE),
-    re.compile(r"^\s*don'?t (kill|drop|evict) this\.?\s*$", re.IGNORECASE),
-    # Chinese
-    re.compile(r"^\s*(请\s*)?(钉住|留着|保留|别(关|掐|杀)|不要(关|掐|杀))\s*(这个|此|它|这条|这个会话|这个对话|这个 session)?\s*[。.!！]?\s*$"),
-]
-_UNPIN_INTENT_PATTERNS = [
-    re.compile(r"^\s*(please\s+)?unpin( this| it| this one| this session)?\.?\s*$", re.IGNORECASE),
-    re.compile(r"^\s*release( this)?\.?\s*$", re.IGNORECASE),
-    # Chinese
-    re.compile(r"^\s*(取消(钉住|保留)|不(钉|留)了|解除(钉住|保留))\s*(这个|此|它)?\s*[。.!！]?\s*$"),
-]
+# about X"). _PIN_INTENT_PATTERNS / _UNPIN_INTENT_PATTERNS live in prompts.py
+# (imported at the top).
 
 
 def _looks_pin_intent(text: str) -> bool:
@@ -458,22 +436,7 @@ def _derive_session_title(text: str) -> str:
     return t or "(untitled)"
 
 
-_APPROVE_BUTTON_TOKENS = {
-    # English
-    "approve", "send", "send all", "continue", "ok", "yes", "go", "go ahead",
-    "proceed", "confirm", "looks good", "lgtm",
-    # 中文
-    "确认", "确定", "继续", "没问题", "好的", "好", "对", "可以", "行", "通过",
-}
-_MODIFY_BUTTON_TOKENS = {
-    "modify", "feedback", "adjust", "edit", "fix", "change",
-    "修改", "改", "编辑",
-}
-_KILL_BUTTON_TOKENS = {
-    "kill", "stop", "abort", "abandon", "cancel", "nevermind", "drop", "scrap",
-    "掐断", "停", "停下", "取消", "算了", "别做了", "终止", "中断", "撤销",
-}
-# Phrases that, even when sent as free text, mean "approve as-is".
+# _APPROVE/_MODIFY/_KILL_BUTTON_TOKENS now live in prompts.py (imported at top).
 _LEARNING_QUEUE_REL = "_system/learning_queue.jsonl"
 
 

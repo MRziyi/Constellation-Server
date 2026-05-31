@@ -32,19 +32,19 @@ from typing import Any
 
 import structlog
 
+from .prompts import (
+    BROWSE_PATTERNS as _BROWSE_PATTERNS,
+    BROWSE_STOPWORDS as _BROWSE_STOPWORDS,
+    PICK_NUM as _PICK_NUM,
+    PICK_ORDINAL as _PICK_ORDINAL,
+    ZH_NUM as _ZH_NUM,
+    PICK_STRIP as _PICK_STRIP,
+    PICK_STRIP_ZH as _PICK_STRIP_ZH,
+)
+
 log = structlog.get_logger(__name__)
 
 _PROJECTS_ROOT = Path.home() / ".claude" / "projects"
-
-# Voice triggers for "show me my sessions in <project>". EN + ZH. Kept narrow so
-# it doesn't shadow ordinary asks; the project name is extracted separately.
-_BROWSE_PATTERNS = [
-    re.compile(
-        r"\b(list|show|what|which|recent)\b.*\b(session|sessions|conversation|conversations|chat|chats|threads?)\b",
-        re.IGNORECASE,
-    ),
-    re.compile(r"(列(一?下)?|看(一?下)?|有哪些|最近).*(session|会话|对话|聊天|线程)"),
-]
 
 
 def looks_session_browse(text: str) -> bool:
@@ -52,15 +52,6 @@ def looks_session_browse(text: str) -> bool:
     if not text:
         return False
     return any(p.search(text) for p in _BROWSE_PATTERNS)
-
-
-# Stopwords stripped when guessing the project name out of a browse utterance.
-_BROWSE_STOPWORDS = {
-    "list", "show", "me", "my", "the", "recent", "last", "few", "what", "which",
-    "are", "is", "in", "of", "for", "project", "projects", "folder", "session",
-    "sessions", "conversation", "conversations", "chat", "chats", "thread",
-    "threads", "under", "from", "please", "go", "into",
-}
 
 
 def extract_project_query(text: str) -> str:
@@ -75,15 +66,6 @@ def extract_project_query(text: str) -> str:
     toks = [w for w in re.split(r"[\s,，。:：'\"]+", zh) if w]
     toks = [w for w in toks if w.lower() not in _BROWSE_STOPWORDS]
     return " ".join(toks).strip()
-
-
-_PICK_NUM = re.compile(r"#\s*(\d+)|\bnumber\s+(\d+)|\bsession\s+(\d+)\b|第\s*([0-9一二两三四五六])\s*[个条]?", re.IGNORECASE)
-_PICK_ORDINAL = {
-    "first": 1, "1st": 1, "second": 2, "2nd": 2, "third": 3, "3rd": 3,
-    "fourth": 4, "4th": 4, "fifth": 5, "5th": 5, "last": -1,
-    "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
-}
-_ZH_NUM = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6}
 
 
 def parse_pick(text: str, n_sessions: int) -> tuple[int | None, str]:
@@ -263,13 +245,6 @@ def list_project_sessions(project_query: str, limit: int = 5) -> dict[str, Any]:
         "working_dir": _bucket_to_path(bucket),
         "sessions": sessions,
     }
-
-
-_PICK_STRIP = re.compile(
-    r"\b(continue|go|in|into|open|resume|the|one|that|this|session|sessions|conversation|please)\b",
-    re.IGNORECASE,
-)
-_PICK_STRIP_ZH = re.compile(r"(接着|继续|到|进|那个|这个|里(边|面)?|跑|去|会话|对话|的)")
 
 
 def match_pick_by_title(text: str, sessions: list[dict[str, Any]]) -> int | None:

@@ -31,64 +31,23 @@ Output schema:
 
 from __future__ import annotations
 
-import os
 import time
 from typing import Any
 
 import structlog
 
 from .llm_cache import cached_chat_create, parse_json_response
+from .prompts import (
+    SESSION_ROUTER_MODEL as ROUTER_MODEL,
+    SESSION_ROUTER_SYSTEM as SYSTEM_PROMPT,
+)
 
 log = structlog.get_logger(__name__)
 
 
-# Same model as classifier (gpt-5.2 + diskcache by default). No new dependency.
-ROUTER_MODEL = os.environ.get(
-    "CORTEX_SESSION_ROUTER_MODEL",
-    os.environ.get("CORTEX_CLASSIFIER_MODEL",
-                   os.environ.get("CORTEX_ROUTER_MODEL", "gpt-5.2")),
-)
-
 # Confidence ≥ this → silently route. Below → for now, also route (R-14.a);
 # in R-14.c we'll emit a confirmation CARD between 0.4 and this threshold.
 HIGH_CONFIDENCE = 0.7
-
-
-SYSTEM_PROMPT = """\
-You're Cortex's session router. Two jobs:
-
-(1) ROUTING — given a new user prompt and a list of currently-active CC sessions,
-    decide which session the prompt belongs to OR whether to create a new one.
-
-(2) CROSS-SESSION CONTEXT (R-14.d) — if the prompt asks to USE INFORMATION FROM
-    other session(s) while continuing/starting THIS one, list those OTHER
-    session_ids in `context_from`. Example: a user in session B saying "draft
-    an email using the auth-refactor session's action items" → continue B and
-    set context_from=[<auth-refactor session_id>]. NEVER include the target
-    session in context_from. NEVER use context_from to "do work in" another
-    session — context_from only LENDS context to the chosen target.
-
-Output JSON ONLY: {"decision": "continue"|"new", "target_session_id": "ses_..."|null, "confidence": 0.0-1.0, "why": "≤15 words", "context_from": ["ses_...", ...]}
-
-Routing rules:
-- If the prompt clearly references an existing session's topic (subject overlap,
-  pronouns like "the email one"/"that auth refactor"/"那个邮件"/"那个 auth"),
-  pick decision="continue" + that session_id. High confidence (0.8-1.0).
-- If the prompt is a clearly new topic unrelated to all active sessions,
-  pick decision="new" + target_session_id=null. High confidence.
-- If the prompt is a short follow-up ("yes", "more", "next", "嗯", "继续") AND
-  there's exactly one recently-active session (last activity < 5 min), continue
-  that one with high confidence.
-- If ambiguous (prompt could plausibly belong to multiple existing sessions or
-  could equally be new), pick the most-recently-active matching session with
-  medium confidence (0.5-0.7). The orchestrator may show a confirmation card.
-- When in doubt, prefer "continue" the current session (the caller passes
-  current_session_id in the input; weight it heavily).
-- Default `context_from`: empty list `[]`. Only populate when the prompt
-  explicitly cross-references another session.
-
-JSON ONLY. No fence. No prose.
-"""
 
 
 def _build_user_prompt(

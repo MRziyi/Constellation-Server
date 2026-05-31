@@ -21,56 +21,15 @@ narrow: one bit + a 15-word reason for telemetry.
 from __future__ import annotations
 
 import json
-import os
 from typing import Any, Literal
 
 import structlog
 
 from .llm_cache import cached_chat_create, parse_json_response
+from .prompts import CLASSIFIER_MODEL, CLASSIFIER_SYSTEM
 from .schema import Event
 
 log = structlog.get_logger(__name__)
-
-
-# Classifier model: defaults to the same model Router uses (Cortex's OpenAI
-# key is already configured for that). If/when an Anthropic API key gets
-# added, switch the default to a haiku alias for cheaper + faster classification.
-CLASSIFIER_MODEL = os.environ.get(
-    "CORTEX_CLASSIFIER_MODEL",
-    os.environ.get("CORTEX_ROUTER_MODEL", "gpt-5.2"),
-)
-
-
-CLASSIFIER_SYSTEM = """\
-You're Cortex's intent classifier. Single job: route Zack's ask to either the
-research-agent path (Claude — multi-step) or the direct-adapter path (one
-bounded side-effect or state read).
-
-Output JSON ONLY: {"complex": true|false, "why": "≤15 words"}
-
-complex = true  WHEN the ask needs ANY of:
-  - reading/finding/searching multiple sources (emails, files, sessions, web)
-  - composition / drafting / summarising
-  - multiple side-effect actions in one ask
-  - keywords: find / look at / search / summarise / draft / check / 看 / 找 / 起草
-
-complex = false WHEN it's a SINGLE explicit step:
-  - bounded reminder: "remind me to X at 3pm" (title + time both given)
-  - bounded calendar: "add a 4pm meeting with Y tomorrow"
-  - bounded message: "send 'on my way' to Mike" (recipient + content both given)
-  - pure state query: "battery?", "what time?", "focus mode?", "current tab?"
-  - bounded file write: "write 'X' to /tmp/y.txt"
-
-A photo may be attached ("Note: photo attached."). It does NOT change this
-decision — classify on the TASK, not the photo: a bounded one-step ask is simple
-even with a photo ("add a reminder for the time in this photo", "what is this");
-a multi-step / compose / persist-to-twin ask is complex.
-
-When ambiguous, prefer complex=true — the agent path can degrade to a single
-action; the direct path can't escalate to research.
-
-JSON ONLY. No fence. No prose.
-"""
 
 
 async def classify_intent(event: Event) -> dict[str, Any]:

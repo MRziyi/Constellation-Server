@@ -24,6 +24,8 @@ from typing import Any
 
 import structlog
 
+from .prompts import WHISPER_ZH_PROMPT as ZH_PROMPT
+
 log = structlog.get_logger(__name__)
 
 
@@ -35,8 +37,6 @@ WHISPER_MODELS_DIR = Path(os.environ.get(
 
 # Supported model names (must have ggml-<name>.bin in WHISPER_MODELS_DIR).
 SUPPORTED_MODELS = ("tiny", "base", "small", "medium", "large")
-
-ZH_PROMPT = "请用简体中文输出"
 
 
 class WhisperError(Exception):
