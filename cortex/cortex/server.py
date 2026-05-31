@@ -734,6 +734,11 @@ class CortexServer:
         # event. Future keyed by req_id (server-minted); resolved with the
         # image b64 string (or None on timeout/empty payload).
         self._pending_image_requests: dict[str, asyncio.Future[str | None]] = {}
+        # When an `image_attached` header frame announces a binary upload
+        # (binary:true), we stash (req_id, mime) here so the NEXT binary WS
+        # frame can be paired with it. Single-glass + serialized capture means
+        # at most one is ever in flight.
+        self._pending_binary_image: tuple[str, str] | None = None
 
         # ── Unified glass OUTBOX (Zack 2026-05-30) ─────────────────────────
         # ALL outbound glass frames — agent progress, cards, insights, mic, … —
@@ -896,6 +901,12 @@ class CortexServer:
             self._pending_startup_card = None
         try:
             async for raw in ws:
+                # Binary frames carry raw image bytes (the glass→cortex photo
+                # upload), paired with a preceding `image_attached` header frame.
+                # Everything else is a JSON text event.
+                if isinstance(raw, (bytes, bytearray)):
+                    await self._handle_binary_image_frame(bytes(raw))
+                    continue
                 event_data = json.loads(raw)
                 event_data.pop("id", None)  # Cortex assigns ids on ingress
                 event = Event(**event_data, id=ids.event_id())
@@ -1605,6 +1616,15 @@ class CortexServer:
         if fut is None or fut.done():
             log.warning("image_attached.no_pending_or_done", req_id=req_id)
             return
+        # New transport: a header frame with binary:true announces that the raw
+        # JPEG bytes follow as the next binary WS frame. Stash the req_id and
+        # wait — _handle_binary_image_frame resolves the future. (Legacy
+        # base64-in-JSON below still works for glass builds that send `image`.)
+        if payload.get("binary"):
+            self._pending_binary_image = (req_id, payload.get("mime") or "image/jpeg")
+            log.info("image_attached.binary_header", req_id=req_id,
+                     mime=payload.get("mime"), bytes_len=payload.get("bytes_len"))
+            return
         # Empty string is treated as "tried but no usable image" — None signals
         # the same downstream (fallback to image-less dispatch).
         result: str | None = image_b64 if image_b64 else None
@@ -1614,6 +1634,28 @@ class CortexServer:
             req_id=req_id, has_image=bool(result),
             bytes_b64=len(result) if result else 0,
         )
+
+    async def _handle_binary_image_frame(self, data: bytes) -> None:
+        """A binary WS frame = the raw JPEG bytes for the upload announced by
+        the preceding `image_attached` header frame. Pair it with that req_id,
+        base64-encode (the Future's contract + the Claude content block both
+        want base64), and resolve. Cortex keeps this exact (1568px/q90) image
+        as Zack's stored copy — no on-server re-compress."""
+        pending = self._pending_binary_image
+        self._pending_binary_image = None
+        if pending is None:
+            log.warning("binary_image.no_header", bytes=len(data))
+            return
+        req_id, _mime = pending
+        fut = self._pending_image_requests.get(req_id)
+        if fut is None or fut.done():
+            log.warning("binary_image.no_pending_or_done", req_id=req_id)
+            return
+        import base64 as _b64
+        result: str | None = _b64.b64encode(data).decode("ascii") if data else None
+        fut.set_result(result)
+        log.info("binary_image.resolved", req_id=req_id,
+                 bytes=len(data), has_image=bool(result))
 
     async def _send_command(self, cmd: Command) -> None:
         """Unified path: send the existing Command to the Glass peer AND,
@@ -3474,5 +3516,9 @@ async def serve(
     from .tcc_check import run_and_surface as _tcc_run_and_surface
     asyncio.create_task(_tcc_run_and_surface(server))
     log.info("cortex.listening", host=host, port=port)
-    async with websockets.serve(server.handle_glass, host, port):
+    # max_size 8 MB: the default 1 MB rejects the binary image upload (1568px/q90
+    # photos run ~0.4–1 MB; base64-in-JSON fallback inflates +33%). Headroom for
+    # both transports without ever tripping "message too big" on a detailed scene.
+    async with websockets.serve(server.handle_glass, host, port,
+                                max_size=8 * 1024 * 1024):
         await asyncio.Future()  # run forever
