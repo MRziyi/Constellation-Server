@@ -2320,12 +2320,13 @@ class CortexServer:
 
         sid = (event.payload or {}).get("session_id")
 
-        # UC1: if a photo rode in with this turn (e.g. a sendPhoto shortcut or a
-        # "save this poster" memo), persist it under twin/ now and hand the agent
-        # the relative path so it can embed the image in a memo. (On-demand
-        # vision pulls happen later in the subtask loop and aren't for memos.)
+        # UC1: if a photo rode in with this turn, persist it under twin/ now (so
+        # the agent can embed it in a memo, and Zack keeps a copy) and hand the
+        # agent the relative path. The image itself rides INTO the agent as a
+        # content block (Claude is natively multimodal) — there is NO separate
+        # vision_describe/OCR pre-step. The agent SEES the photo and decides,
+        # from Zack's prompt, what to do with it (memo / read text / describe).
         photo_path: str | None = None
-        photo_summary: str | None = None
         if payload.get("image"):
             persisted = _persist_image_to_twin(
                 payload["image"], event.id.replace("evt_", "")[:8])
@@ -2337,35 +2338,12 @@ class CortexServer:
                     parent_event_id=event.id, stage="photo_saved", icon="🖼",
                     detail="photo saved to twin",
                 )
-                # UC1: analyse the photo NOW (CC can't see JPEGs) so the agent
-                # can paste a ready 简介 into the memo. detail by intent (C-64);
-                # the agent decides whether to use it.
-                try:
-                    await self._emit_progress_to_glass(
-                        parent_event_id=event.id, stage="vision", icon="👁",
-                        detail="analysing the photo…",
-                    )
-                    vrpc = await self._dispatch_to_tool({
-                        "tool": "vision_describe", "action": "describe",
-                        "args": {
-                            "_image_b64": payload["image"],
-                            "prompt": ask_text or "Describe this image.",
-                            "detail": _vision_detail_for(ask_text),
-                        },
-                        "context_pack": [], "result_format": "execute",
-                    })
-                    photo_summary = (vrpc.result or {}).get("description") or None
-                    log.info("photo.vision_summary",
-                             chars=len(photo_summary or ""))
-                except Exception as e:
-                    log.warning("photo.vision_failed", error=str(e))
 
         brief = build_agent_brief(
             ask_text=ask_text,
             now_iso=datetime.now(timezone.utc).astimezone().isoformat(),
             has_photo=bool(payload.get("image")),
             photo_path=photo_path,
-            photo_summary=photo_summary,
             twin_slices=twin_slices,
             output_schema=schema_hint,
             available_dirs=add_dirs,
@@ -2399,6 +2377,9 @@ class CortexServer:
                 self, event, brief=brief, schema_hint=schema_hint,
                 add_dirs=add_dirs, working_dir=working_dir,
                 permission_mode=permission_mode, timeout_s=timeout_s,
+                # UC1: the photo rides into the agent as a multimodal content
+                # block so Claude sees it directly (no vision_describe pre-step).
+                image_b64=(event.payload or {}).get("image"),
                 # UC2 / modify-on-final: continue a prior CC session when the
                 # caller supplied one (same payload key the tmux path uses).
                 resume_session_id=(event.payload or {}).get("resume_cc_session_id"),

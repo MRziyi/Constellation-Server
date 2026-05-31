@@ -69,7 +69,6 @@ def build_agent_brief(
     now_iso: str | None = None,
     has_photo: bool = False,
     photo_path: str | None = None,
-    photo_summary: str | None = None,
     twin_slices: dict[str, str] | None = None,
     output_schema: dict[str, Any] | str | None = None,
     available_dirs: list[str] | None = None,
@@ -108,16 +107,17 @@ def build_agent_brief(
     if now_iso:
         L.append(f"NOW: {now_iso}")
     if photo_path:
-        # UC1: the glasses photo is already on disk under twin/. Tell CC where +
-        # how to embed it, and hand it the vision 简介 (CC can't see JPEGs) so a
-        # memo can include the captured poster/whiteboard + a ready analysis.
-        L.append(f"PHOTO: a glasses photo is saved at twin/memos/{photo_path}")
-        if photo_summary:
-            L.append(f'  vision analysis (简介): "{photo_summary.strip()}"')
+        # UC1: the glasses photo is ATTACHED to this message as an image block —
+        # the agent sees it directly (it's Claude, natively multimodal). NO
+        # pre-digested OCR/简介: the agent reads the image itself and decides,
+        # from Zack's request, what to do (memo / read its text / describe /
+        # act on it). The on-disk copy is for embedding into a memo.
+        L.append("PHOTO: a glasses photo is ATTACHED to this message — look at it directly.")
+        L.append(f"  It's also saved on disk at twin/memos/{photo_path} (Zack's kept copy).")
         L.append(f"  → if Zack wants a memo, write it under twin/memos/<slug>.md with:")
-        L.append(f"    his note + the analysis above + the image embedded: ![]({photo_path})")
+        L.append(f"    his note + what YOU see in the photo + the image embedded: ![]({photo_path})")
     elif has_photo:
-        L.append("PHOTO: attached (glass camera)")
+        L.append("PHOTO: attached to this message (glass camera) — look at it directly.")
     L.append("")
 
     # 2. Output contract — hand-written, terse. (We DON'T dump JSON Schema —

@@ -229,10 +229,17 @@ class SdkAgentSession:
         permission_mode: str,
         timeout_s: float,
         resume_session_id: str | None = None,
+        image_b64: str | None = None,
+        image_media_type: str = "image/jpeg",
     ) -> None:
         self.server = server
         self.event = event
         self.brief = brief
+        # UC1: a glasses photo handed straight to Claude as an image content
+        # block on the opening turn (Claude is multimodal — no vision_describe
+        # pre-step). Empty string = capture failed → treated as no image.
+        self.image_b64 = image_b64 or None
+        self.image_media_type = image_media_type
         self.schema_hint = schema_hint
         self.add_dirs = add_dirs or []
         self.working_dir = working_dir or os.path.expanduser("~")
@@ -482,6 +489,36 @@ class SdkAgentSession:
 
     # ── entry point ────────────────────────────────────────────────────────
 
+    def _opening_message_with_image(self):
+        """Async-iterable opening turn carrying brief text + the photo as a
+        base64 image block. Matches the input-message envelope ClaudeSDKClient
+        wraps a string prompt in (see client.query()), so the CLI parses it the
+        same way — only with a multimodal content list instead of a string."""
+        brief, data, media = self.brief, self.image_b64, self.image_media_type
+
+        async def _gen():
+            yield {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": brief},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media,
+                                "data": data,
+                            },
+                        },
+                    ],
+                },
+                "parent_tool_use_id": None,
+                "session_id": "default",
+            }
+
+        return _gen()
+
     async def run(self) -> dict[str, Any]:
         from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
 
@@ -516,7 +553,15 @@ class SdkAgentSession:
         try:
             async def _drain() -> dict[str, Any] | None:
                 await client.connect()
-                await client.query(self.brief)
+                # Opening turn: if a photo came with this dispatch (and we're not
+                # resuming a prior session), send the brief + image as a single
+                # multimodal user message so Claude SEES the photo. Otherwise the
+                # plain string brief. ClaudeSDKClient.query() accepts either a
+                # str or an AsyncIterable of full input-message envelopes.
+                if self.image_b64 and not self.resume_session_id:
+                    await client.query(self._opening_message_with_image())
+                else:
+                    await client.query(self.brief)
                 async for msg in client.receive_response():
                     terminal = await self._handle_message(msg)
                     if terminal is not None:
