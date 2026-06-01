@@ -27,6 +27,8 @@ from .control_plane import ControlPlane
 from .prompts import (
     VISION_KEYWORD_PATTERN as _VISION_KEYWORD_PATTERN,
     VISION_DETAIL_PATTERN as _VISION_DETAIL_PATTERN,
+    GPT_OVERRIDE_PATTERN as _GPT_OVERRIDE_PATTERN,
+    CLAUDE_OVERRIDE_PATTERN as _CLAUDE_OVERRIDE_PATTERN,
     AUTO_RUN_PATTERNS as _AUTO_RUN_PATTERNS,
     PIN_INTENT_PATTERNS as _PIN_INTENT_PATTERNS,
     UNPIN_INTENT_PATTERNS as _UNPIN_INTENT_PATTERNS,
@@ -292,22 +294,37 @@ class ResumeFailed(Exception):
 
 
 def _looks_visual_intent(text: str) -> bool:
-    """True iff the text contains the fixed vision cue 「视觉」 (+ near-mishears /
-    pinyin / "vision", see _VISION_KEYWORD_PATTERN) — the deterministic opt-in
-    Zack controls. No LLM call, no broad heuristic: the cue is the only trigger.
-    On a hit, Cortex captures a frame and hands it (unchanged) to the planner or
-    the agent; the model reads the image at full fidelity (no detail/downsample
-    knob — that died with vision_describe)."""
+    """True iff the text carries the vision cue 「视觉」 (+ near-mishears / pinyin /
+    "vision", see _VISION_KEYWORD_PATTERN) — the deterministic opt-in Zack
+    controls. No LLM, no broad heuristic: 「视觉」 is the ONLY capture trigger.
+    「细节」 alone never fires (it's a common word); it only UPGRADES the tier when
+    paired as 「细节视觉」 (see _vision_tier_for). On a hit Cortex captures a frame and
+    hands it (unchanged) downstream; the model reads it at full fidelity."""
     return bool(text and _VISION_KEYWORD_PATTERN.search(text))
 
 
 def _vision_tier_for(text: str) -> str:
-    """When the vision cue fired, pick the CAPTURE tier (Zack 2026-05-31):
-    'detail' (high-res 2K, for reading fine text — poster/sign/document) when the
-    ask carries a detail qualifier (细节 / detail / 高清 / 2k); else 'standard'
-    (1080p scene glance). Deterministic regex, no LLM. Only the tier NAME goes to
-    the glasses (in the request_image frame); the glasses map name → px."""
+    """Pick the CAPTURE tier once the 「视觉」 cue fired (Zack 2026-06-01): a 「细节」
+    prefix → 「细节视觉」 (+ 高清 / 2k / mishears, see _VISION_DETAIL_PATTERN) →
+    'detail' (high-res 2K, for reading fine text — poster/sign/document); the bare
+    「视觉」 glance → 'standard' (1080p scene). Deterministic regex, no LLM. Only the
+    tier NAME goes to the glasses (in request_image); the glasses map name → px."""
     return "detail" if (text and _VISION_DETAIL_PATTERN.search(text)) else "standard"
+
+
+def _model_override_for(text: str) -> str | None:
+    """Deterministic model pin (Zack 2026-06-01): naming a model in the ask forces
+    its path, no LLM guess (mirrors the vision cue). 'claude'/'克劳德'/'cloud' →
+    the complex agent path; 'gpt'/'chatgpt'/'openai' → the simple router path.
+    Claude wins ties — the agent path can degrade to a single action, but the
+    router can't escalate to research. Returns 'claude' | 'gpt' | None."""
+    if not text:
+        return None
+    if _CLAUDE_OVERRIDE_PATTERN.search(text):
+        return "claude"
+    if _GPT_OVERRIDE_PATTERN.search(text):
+        return "gpt"
+    return None
 
 
 # Per-conversation permission mode (Zack 2026-05-30). The agent's CC permission
@@ -390,6 +407,31 @@ def _persist_image_to_twin(b64: str, tag: str) -> dict[str, str] | None:
         return None
     # Memos live in twin/memos/<name>.md, so a sibling assets/ ref is relative.
     return {"abs": abs_path, "rel_to_memos": f"assets/{fname}", "bytes": str(len(raw))}
+
+
+_TWIN_CAPTURES = os.path.expanduser("~/constellation/twin/captures")
+
+
+def _archive_capture(raw: bytes, req_id: str | None) -> str | None:
+    """Save EVERY glasses photo that reaches Cortex, used or not (Zack 2026-06-01):
+    the bytes already crossed the wire, so keep a copy — for later memo use,
+    debugging, or simply not losing a capture. Written to
+    twin/captures/<utc-timestamp>-<req_id>.jpg (req_id is unique per request, so no
+    same-second collisions). Best-effort: never raises into the receive loop.
+    Returns the absolute path or None. (Distinct from _persist_image_to_twin, which
+    only fires when an image is being EMBEDDED in a memo.)"""
+    if not raw:
+        return None
+    try:
+        os.makedirs(_TWIN_CAPTURES, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        fname = f"{ts}-{(req_id or 'noid')[:12]}.jpg"
+        abs_path = os.path.join(_TWIN_CAPTURES, fname)
+        with open(abs_path, "wb") as f:
+            f.write(raw)
+        return abs_path
+    except OSError:
+        return None
 
 
 # R-14.b / C-56: pin/unpin intent detection. Tiny regex on the user's
@@ -523,31 +565,18 @@ def _append_learning_signal(
         log.warning("learning_queue.append_failed", error=str(e))
 
 
-_APPROVE_FREE_TEXT_PREFIXES = (
-    "ok", "yes", "go ahead", "go", "proceed", "looks good", "lgtm",
-    "continue", "approve", "confirm",
-    "好的", "好", "可以", "继续", "确认", "确定", "没问题", "通过", "行",
-)
-_KILL_FREE_TEXT_PHRASES = (
-    "kill it", "kill this", "stop it", "stop this", "abort", "abandon this",
-    "cancel this", "never mind", "nevermind", "drop it", "scrap it",
-    "forget it", "don't do it", "do not do",
-    "停下", "停止", "掐断", "算了", "别做了", "取消这个", "终止", "中断", "撤销",
-)
-
-
 def _classify_user_decision(
     decision: str | None,
     feedback_text: str | None,
 ) -> tuple[str, str | None]:
     """Return ('approve' | 'modify' | 'kill', resolved_text_for_modify_or_None).
 
-    - Button click: `decision` is the button label. Map via the token sets.
-      A button-click "Modify" with empty feedback_text → ('modify', None);
-      caller must re-surface the card.
-    - Free text: `decision` may be a generic marker like "feedback" or "send"
-      while `feedback_text` carries the actual content. The free-text content
-      itself is checked for approve-like / kill-like phrases.
+    The ring maps every card gesture to a fixed canonical token before it reaches
+    us — TAP→"Approve", LONG→"modify", double-tap→"Kill" (see Glass StateMachine)
+    — so `decision` is always one of the three labels; a modify carries its
+    correction in `feedback_text`. The old free-text reply path (synonym lists +
+    spoken-content sniffing) died with the ring-only model (Zack 2026-06-01): no
+    spoken phrase ever becomes the `decision` field.
     """
     d = (decision or "").strip().lower()
     if d in _APPROVE_BUTTON_TOKENS:
@@ -555,33 +584,11 @@ def _classify_user_decision(
     if d in _KILL_BUTTON_TOKENS:
         return "kill", None
     if d in _MODIFY_BUTTON_TOKENS:
-        ftext = (feedback_text or "").strip()
-        return "modify", ftext or None
-
-    # No clear button match. Treat as free-text channel — content drives.
-    text = (feedback_text or decision or "").strip()
-    if not text:
-        # Empty signal in the free-text channel → modify-needs-text.
-        return "modify", None
-    tl = text.lower()
-    if tl in _APPROVE_BUTTON_TOKENS:
-        return "approve", None
-    if tl in _KILL_BUTTON_TOKENS:
-        return "kill", None
-    # Kill-phrase match (substring within short utterance).
-    if len(tl) <= 40 and any(phrase in tl for phrase in _KILL_FREE_TEXT_PHRASES):
-        return "kill", None
-    # Short utterances starting with an approve phrase (and nothing
-    # substantive after) → approve.
-    for prefix in _APPROVE_FREE_TEXT_PREFIXES:
-        if tl == prefix or tl.startswith(prefix + " ") or tl.startswith(prefix + ",") or tl.startswith(prefix + "."):
-            # If it's just the prefix + a short tail like "go ahead and send", treat as approve.
-            tail = tl[len(prefix):].strip(" ,.!。，！")
-            if not tail or tail in {"send", "send it", "send all", "and send", "and continue"}:
-                return "approve", None
-            # Substantive tail → fall through to modify with the full text.
-            break
-    return "modify", text
+        return "modify", (feedback_text or "").strip() or None
+    # Unknown token (the ring only ever emits the three above): never auto-approve
+    # or auto-kill on an unrecognized signal — treat as modify so the caller
+    # re-surfaces the card (the safe, non-destructive default).
+    return "modify", (feedback_text or "").strip() or None
 
 
 class CortexServer:
@@ -1224,7 +1231,7 @@ class CortexServer:
             }
             await self.emit_card(
                 cmd_id=review_cmd_id, title="STT review",
-                body_md="没听清 —— 长按重讲", options=["approve", "redo"],
+                body_md="没听清 —— 长按重讲", options=["approve", "modify"],
                 card_type="stt_review", source="Whisper", ttl_ms=120_000,
             )
             return
@@ -1234,8 +1241,8 @@ class CortexServer:
         # Claude Code answer/modify, or any send) without the wearer's explicit
         # approval. Whatever the intent (fresh / modify / answer), we FIRST
         # surface an "STT review" card showing the transcript and stop here. On
-        # approve → `_route_stt_approved` runs the original routing; on redo →
-        # `_redo_stt` re-opens the right mic. This is the ONLY exit from
+        # approve → `_route_stt_approved` runs the original routing; on modify →
+        # `_respeak_stt` re-opens the right mic. This is the ONLY exit from
         # audio_end now — no intent path bypasses the review.
         review_cmd_id = ids.command_id()
         self._pending_stt_review[review_cmd_id] = {
@@ -1249,7 +1256,7 @@ class CortexServer:
             cmd_id=review_cmd_id,
             title="STT review",
             body_md=transcript,
-            options=["approve", "redo"],
+            options=["approve", "modify"],
             card_type="stt_review",
             source="Whisper",
             ttl_ms=120_000,
@@ -1295,10 +1302,11 @@ class CortexServer:
             )
             await self._handle_user_invoke(synth)
 
-    async def _redo_stt(self, stt: dict[str, Any]) -> None:
-        """STT review REJECTED (重讲) → re-open the right mic to say it again,
-        preserving the original intent so the redo's transcript routes the same
-        way once re-approved."""
+    async def _respeak_stt(self, stt: dict[str, Any]) -> None:
+        """STT review → MODIFY (重讲): re-open the right mic to say it again,
+        preserving the original intent so the re-spoken transcript routes the same
+        way once re-approved. (The 'redo' token was purged 2026-06-01 — LONG is
+        uniformly 'modify' / give-input-again across every card.)"""
         intent = stt.get("intent", "fresh")
         orig = stt.get("orig_cmd_id")
         if intent == "modify" and orig:
@@ -1453,7 +1461,7 @@ class CortexServer:
             "options": resolved_options,
             # Piece 4: explicit card type so Glass renders + ring-maps cleanly
             # (notification=dismiss · checkpoint=approve/modify/reject · question=answer
-            #  · stt_review=approve/redo). Caller may override the derived type.
+            #  · stt_review=approve/modify). Caller may override the derived type.
             "card_type": card_type or _card_type_for(resolved_options),
             "source": source,
             "ttl_ms": ttl_ms,
@@ -1566,6 +1574,17 @@ class CortexServer:
         # Empty string is treated as "tried but no usable image" — None signals
         # the same downstream (fallback to image-less dispatch).
         result: str | None = image_b64 if image_b64 else None
+        # Archive EVERY incoming photo, used or not (Zack 2026-06-01) — legacy
+        # base64-in-JSON path (binary path archives in _handle_binary_image_frame).
+        if result:
+            import base64 as _b64
+            try:
+                archived = _archive_capture(_b64.b64decode(result), req_id)
+            except Exception:
+                archived = None
+            if archived:
+                log.info("capture.archived", req_id=req_id,
+                         file=os.path.basename(archived))
         fut.set_result(result)
         log.info(
             "image_attached.resolved",
@@ -1585,6 +1604,12 @@ class CortexServer:
             log.warning("binary_image.no_header", bytes=len(data))
             return
         req_id, _mime = pending
+        # Archive EVERY incoming photo to disk, used or not (Zack 2026-06-01) —
+        # before the pending-future check, so even an orphan frame is kept.
+        archived = _archive_capture(data, req_id)
+        if archived:
+            log.info("capture.archived", req_id=req_id,
+                     file=os.path.basename(archived), bytes=len(data))
         fut = self._pending_image_requests.get(req_id)
         if fut is None or fut.done():
             log.warning("binary_image.no_pending_or_done", req_id=req_id)
@@ -2625,11 +2650,33 @@ class CortexServer:
                     event_id=event.id,
                 )
 
+        # Deterministic model pin (Zack 2026-06-01): if the ask NAMES a model,
+        # honour it and SKIP the classifier — no LLM guess. 'claude' → the agent
+        # path; 'gpt' → the router path. (The vision capture above already ran if
+        # a vision cue was present — the model pin is orthogonal to it.)
+        _model_pin = _model_override_for(ask_text)
+        if _model_pin == "claude":
+            log.info("intent.model_override", forced="claude")
+            await self._emit_progress_to_glass(
+                parent_event_id=event.id,
+                stage="classified", icon="🧭",
+                detail="model: Claude (you named it) → agent", meta="Claude",
+            )
+            await self._dispatch_complex_agent(event)
+            return
+        if _model_pin == "gpt":
+            log.info("intent.model_override", forced="gpt")
+            await self._emit_progress_to_glass(
+                parent_event_id=event.id,
+                stage="classified", icon="🧭",
+                detail="model: GPT (you named it) → planner", meta="GPT-5.2",
+            )
+
         # Phase 5c — classify intent first; complex asks bypass the v0.5
         # Router entirely and go straight to the CC agent path. Simple
         # asks (single-step state queries or explicit one-action requests)
         # continue through the existing planner + executor-adapter dispatch.
-        if not self.use_stub_router:   # stub router (Phase 1) is for tests only
+        if _model_pin != "gpt" and not self.use_stub_router:   # stub router (Phase 1) is for tests only
             from .classifier import classify_intent
             await self._emit_progress_to_glass(
                 parent_event_id=event.id,
@@ -2895,7 +2942,7 @@ class CortexServer:
 
         # STT-review gate (Zack 2026-05-30): this cmd_id may be an "STT review"
         # card. approve → route the reviewed transcript per its original intent
-        # (the ONLY place raw STT moves downstream); redo/reject → re-open the
+        # (the ONLY place raw STT moves downstream); modify (LONG) → re-open the
         # mic to say it again. Drained before _pending_previews so a review card
         # never falls through to the generic preview handler.
         stt = self._pending_stt_review.pop(cmd_id, None)
@@ -2905,10 +2952,11 @@ class CortexServer:
                 # ONLY an explicit approve routes the transcript downstream.
                 log.info("stt_review.approved", cmd_id=cmd_id, intent=stt.get("intent"))
                 await self._route_stt_approved(stt)
-            elif d == "redo":
-                # 重讲 (LONG): re-open the right mic, preserving intent.
-                log.info("stt_review.redo", cmd_id=cmd_id, intent=stt.get("intent"))
-                await self._redo_stt(stt)
+            elif d == "modify":
+                # 重讲 (LONG): re-open the right mic, preserving intent. ('redo'
+                # token purged 2026-06-01 — LONG is uniformly 'modify'.)
+                log.info("stt_review.respeak", cmd_id=cmd_id, intent=stt.get("intent"))
+                await self._respeak_stt(stt)
             else:
                 # kill (double-tap) / reject / anything else → TERMINATE the flow.
                 # The transcript is dropped (NEVER routed) and the pending entry is

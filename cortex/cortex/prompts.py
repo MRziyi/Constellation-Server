@@ -57,29 +57,49 @@ SHORTCUT_PARSER_MODEL = os.environ.get(
 
 # ══════════════════════════════════════════════════════════════════ PATTERNS
 
-# ── Vision cue (deterministic opt-in) ──────────────────────────────────────
-# Zack 2026-05-31: vision is a DETERMINISTIC keyword opt-in. He knows when he
-# wants vision — saying the cue word 「视觉」 (or "vision") makes Cortex capture a
-# frame and hand it, UNCHANGED, to whichever path runs. Includes common STT
-# mishears (视角/试觉/世觉…) + pinyin + English so a slightly-misheard cue still
-# fires; the STT-review card is the backstop. No image→text tool, no broad
-# heuristic — this cue is the only trigger.
+# ── Vision cues (the cue 「视觉」 + a 「细节视觉」 detail upgrade) ────────────────
+# Zack 2026-06-01: vision is a DETERMINISTIC keyword opt-in — saying 「视觉」 (or
+# "vision") captures a frame and hands it UNCHANGED to whichever path runs. The
+# cue ALONE → 'standard' tier (1024px / q85 — fast, low-bandwidth scene glance).
+# Prefixing it → 「细节视觉」 → 'detail' tier (2048px / q90 — the legible-text sweet
+# spot for poster / sign / document, per the Claude+GPT vision docs). 「细节」 is a
+# common word, so it NEVER triggers a capture on its own — only the 「视觉」 cue
+# does; 「细节」 merely UPGRADES the tier when 「视觉」 also fired. Both patterns carry
+# STT mishears + pinyin + English so a slightly-misheard cue still works; the
+# STT-review card is the backstop. Cortex sends only the tier NAME in the
+# request_image frame; the glasses map name → (px, quality). No image→text tool,
+# no broad heuristic — 「视觉」 is the ONLY capture trigger.
 VISION_KEYWORD_PATTERN = re.compile(
-    r"(视觉|视角|视\s?觉|视\s?决|试觉|事觉|世觉|实觉|是觉|vision|visual|sh[ií]?\s?ju[eé])",
+    # [视視]/[觉覺] char classes so the cue fires whether Whisper (lang=auto) emits
+    # Simplified 视觉 OR Traditional 視覺 (a real 2026-06-01 miss: it output 視覺).
+    r"([视視]\s?[觉覺]|[视視]\s?角|[视視]\s?决|[试試]\s?[觉覺]|事觉|世觉|实觉|是觉|vision|visual|sh[ií]?\s?ju[eé])",
+    re.IGNORECASE,
+)
+# Detail-tier upgrade marker — consulted ONLY after the 「视觉」 cue already
+# captured (so a bare 「细节」 in ordinary speech can't fire a photo). Matches the
+# 「细节」 of 「细节视觉」 + its mishears, plus 高清 / 2k / English "detail".
+VISION_DETAIL_PATTERN = re.compile(
+    # [细細][节節] covers Simplified 细节 + Traditional 細節 (Whisper lang=auto may
+    # emit either); rest are STT mishears of 细节 + 高清 / 2k / English "detail".
+    r"([细細][节節]|细接|细结|系节|喜节|西街|习节|xi\s?jie|detail|高清|高分辨率|高解析|2k)",
     re.IGNORECASE,
 )
 
-# Vision DETAIL tier (Zack 2026-05-31): the cue above captures a frame; a detail
-# qualifier (细节 / detail / 高清 / 2k) selects the high-res 'detail' tier
-# (2048px / q90 — the legible-text sweet spot for poster / sign / document, per
-# the Claude+GPT vision docs), vs the 'standard' tier (1024px / q85 — a fast,
-# low-bandwidth scene glance). Cortex sends only the tier NAME in the
-# request_image frame; the glasses map name → (long-edge px, jpeg quality). Kept
-# lean (Zack: don't pile on keywords) — explicit words + a couple of synonyms.
-VISION_DETAIL_PATTERN = re.compile(
-    r"(细节|detail|高清|高分辨率|高解析|2k)",
-    re.IGNORECASE,
-)
+# ── Model override (deterministic model pin) ───────────────────────────────
+# Zack 2026-06-01: naming a model in the ask PINS its path — no LLM guess, same
+# spirit as the vision cue. "gpt"/"chatgpt"/"openai" → the simple router path
+# (GPT answers / acts directly); "claude"/"克劳德"/"cloud" → the complex agent
+# path. 'cloud' is the most common STT mishear of "Claude" (accepted trade-off:
+# "cloud storage" etc. may over-trigger the agent, which degrades gracefully).
+# Claude wins ties — the agent path can fall back to a single action, but the
+# router can't escalate to research.
+#
+# NOTE: substring match, NOT \b-anchored. CJK chars are \w in Python regex, so a
+# \b never forms between 用 and "gpt" in 「用gpt推理」 → \bgpt\b would never fire on
+# Chinese-embedded model names (real 2026-06-01 miss). The [pb] also catches the
+# common STT mishear "gbt"; \s? tolerates spelled-out "g p t" / "g b t".
+GPT_OVERRIDE_PATTERN = re.compile(r"(g\s?[pb]\s?t|open\s?ai)", re.IGNORECASE)
+CLAUDE_OVERRIDE_PATTERN = re.compile(r"(claude|克劳德|克劳|cloud)", re.IGNORECASE)
 
 # ── Permission mode (full-auto opt-in) ─────────────────────────────────────
 # Full-auto (bypassPermissions) is opt-in ONLY via the explicit phrase "自动模式"
@@ -106,25 +126,19 @@ UNPIN_INTENT_PATTERNS = [
     re.compile(r"^\s*(取消(钉住|保留)|不(钉|留)了|解除(钉住|保留))\s*(这个|此|它)?\s*[。.!！]?\s*$"),
 ]
 
-# ── Decision vocabulary (card buttons + free-text synonyms) ─────────────────
-# The 3-option contract every blocking card carries; and the tokens that map a
-# button label OR free-text reply onto one of the three terminal decisions.
+# ── Decision vocabulary (ring-emitted card tokens) ──────────────────────────
+# The 3-option contract every blocking card carries; and the canonical tokens
+# the RING emits for each terminal decision. The ring maps every gesture to a
+# fixed token before it reaches Cortex (TAP→"Approve", LONG→"modify",
+# double-tap→"Kill" — see Glass StateMachine), so these are the ONLY decision
+# strings that ever arrive. The old free-text synonym lists (send / lgtm / 没问题
+# / cancel / 算了 …) + spoken-reply content sniffing died with the ring-only
+# interaction model — no spoken phrase ever becomes the `decision` field, so any
+# token beyond these three was dead. (Zack 2026-06-01: prune the dead paths.)
 THREE_OPTIONS = ["Approve", "Modify", "Kill"]
-APPROVE_BUTTON_TOKENS = {
-    # English
-    "approve", "send", "send all", "continue", "ok", "yes", "go", "go ahead",
-    "proceed", "confirm", "looks good", "lgtm",
-    # 中文
-    "确认", "确定", "继续", "没问题", "好的", "好", "对", "可以", "行", "通过",
-}
-MODIFY_BUTTON_TOKENS = {
-    "modify", "feedback", "adjust", "edit", "fix", "change",
-    "修改", "改", "编辑",
-}
-KILL_BUTTON_TOKENS = {
-    "kill", "stop", "abort", "abandon", "cancel", "nevermind", "drop", "scrap",
-    "掐断", "停", "停下", "取消", "算了", "别做了", "终止", "中断", "撤销",
-}
+APPROVE_BUTTON_TOKENS = {"approve"}
+MODIFY_BUTTON_TOKENS = {"modify"}
+KILL_BUTTON_TOKENS = {"kill"}
 
 # ── UC2 session browse / pick ──────────────────────────────────────────────
 # "show me my sessions in <project>" (EN + ZH). Kept narrow so it doesn't shadow
