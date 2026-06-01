@@ -29,6 +29,10 @@ from .prompts import (
     VISION_DETAIL_PATTERN as _VISION_DETAIL_PATTERN,
     GPT_OVERRIDE_PATTERN as _GPT_OVERRIDE_PATTERN,
     CLAUDE_OVERRIDE_PATTERN as _CLAUDE_OVERRIDE_PATTERN,
+    AGENT_MODEL as _AGENT_MODEL,
+    AGENT_FALLBACK_MODEL as _AGENT_FALLBACK_MODEL,
+    AGENT_EFFORT_DEFAULT as _AGENT_EFFORT_DEFAULT,
+    agent_model_for_effort as _agent_model_for_effort,
     AUTO_RUN_PATTERNS as _AUTO_RUN_PATTERNS,
     PIN_INTENT_PATTERNS as _PIN_INTENT_PATTERNS,
     UNPIN_INTENT_PATTERNS as _UNPIN_INTENT_PATTERNS,
@@ -655,6 +659,10 @@ class CortexServer:
         # event. Future keyed by req_id (server-minted); resolved with the
         # image b64 string (or None on timeout/empty payload).
         self._pending_image_requests: dict[str, asyncio.Future[str | None]] = {}
+        # parent_event_id per in-flight req_id, so the binary-header handler can
+        # emit a white-box "receiving photo · NN KB" progress correlated to the turn
+        # (the transfer over BT-PAN is the slow phase — never leave it unlabelled).
+        self._image_request_parent: dict[str, str] = {}
         # When an `image_attached` header frame announces a binary upload
         # (binary:true), we stash (req_id, mime) here so the NEXT binary WS
         # frame can be paired with it. Single-glass + serialized capture means
@@ -678,6 +686,20 @@ class CortexServer:
         self._glass_outbox: asyncio.Queue[tuple[str, bool]] | None = None
         self._glass_sender_task: asyncio.Task[None] | None = None
         self._decision_gate: asyncio.Event | None = None
+        # 视觉抢拍 satellite channel (ungated decoupled capture card) + bookkeeping.
+        self._glass_satellite_outbox: asyncio.Queue | None = None
+        self._glass_satellite_sender_task: asyncio.Task[None] | None = None
+        self._ws_send_lock: asyncio.Lock | None = None
+        # Per fresh listening stream: the speculative capture fired during
+        # streaming {req_id, fut, tier}, so audio_end carries it to the stt dict.
+        self._stream_speculative: dict[str, dict[str, Any]] = {}
+        # req_id → tier for captures that own a satellite card (so the image
+        # handlers know to push satellite receiving/done frames, not main progress).
+        self._satellite_active: dict[str, str] = {}
+        # cc_session_id → {model, effort} chosen at first dispatch, so a RESUME
+        # (modify-on-final / continue / UC2 pick) restores the ORIGINAL session's
+        # config instead of re-deciding (Zack 2026-06-01).
+        self._session_agent_config: dict[str, dict[str, str]] = {}
         # Background tasks spawned off the glass receive loop (agent runs etc.)
         # so the loop never blocks and can always deliver a mid-run decision.
         self._bg_tasks: set[asyncio.Task[Any]] = set()
@@ -798,7 +820,19 @@ class CortexServer:
         self._decision_gate = asyncio.Event()
         self._decision_gate.set()  # open; cleared only while a decision card waits
         self._glass_seq = 0
+        # Single ws-write lock shared by both senders so frames never interleave
+        # at the socket (websockets forbids concurrent send).
+        self._ws_send_lock = asyncio.Lock()
         self._glass_sender_task = asyncio.create_task(self._glass_sender_loop(ws))
+        # 视觉抢拍 satellite channel (Zack 2026-06-01): a SECOND, ungated sender for
+        # the decoupled capture card. The main sender parks behind a decision card
+        # (C-71); the satellite must keep updating (capturing→receiving→done) WHILE
+        # the STT-review card is parked, so it gets its own queue + sender that
+        # never waits on _decision_gate. Independent status element, no ordering vs
+        # the main flow — the sanctioned exception to single-sender (like pong).
+        self._glass_satellite_outbox: asyncio.Queue = asyncio.Queue()
+        self._glass_satellite_sender_task = asyncio.create_task(
+            self._glass_satellite_sender_loop(ws))
         # P2.3 — surface any pending startup card (e.g. TCC denials caught
         # before Glass was online). One-shot; clear after delivery.
         pending_startup = getattr(self, "_pending_startup_card", None)
@@ -861,7 +895,11 @@ class CortexServer:
             if self._glass_sender_task is not None:
                 self._glass_sender_task.cancel()
                 self._glass_sender_task = None
+            if self._glass_satellite_sender_task is not None:
+                self._glass_satellite_sender_task.cancel()
+                self._glass_satellite_sender_task = None
             self._glass_outbox = None
+            self._glass_satellite_outbox = None
 
     async def _process_event(self, event: Event) -> None:
         if self.plane:
@@ -1146,6 +1184,29 @@ class CortexServer:
                 icon="🎤",
                 detail_runs=[{"text": text, "style": "dim"}],
             )
+            # 视觉抢拍 (streaming, Zack 2026-06-01): the instant the vision cue shows
+            # in a partial, fire the capture — don't wait for audio_end. Once per
+            # fresh stream. The decoupled satellite card shows its own progress; the
+            # photo is held un-processed and only reaches a model if the prompt is
+            # approved (C-69). Fresh streams only (modify/answer feed an existing flow).
+            if (
+                stream_id.startswith("fresh_")
+                and stream_id not in self._stream_speculative
+                and self._glass_conn and "card" in self._glass_accept
+                and _looks_visual_intent(text)
+            ):
+                tier = _vision_tier_for(text)
+                sent = await self._send_image_request(
+                    parent_event_id=stream_id, hint="scene in front", tier=tier)
+                if sent is not None:
+                    req_id, fut = sent
+                    self._stream_speculative[stream_id] = {"req_id": req_id, "fut": fut, "tier": tier}
+                    self._satellite_active[req_id] = tier
+                    await self._emit_satellite(
+                        stage="capturing",
+                        detail="capturing hi-res photo…" if tier == "detail" else "capturing photo…")
+                    log.info("vision.speculative_capture_streaming",
+                             stream_id=stream_id, req_id=req_id, tier=tier)
         except Exception as e:
             log.warning("partial.failed", stream_id=stream_id, error=str(e))
         finally:
@@ -1252,30 +1313,33 @@ class CortexServer:
             "session_id": session_id,
             "lang_hint": lang_hint,
         }
-        # 视觉抢拍 / speculative capture (Zack 2026-06-01): if the FINAL transcript
-        # carries the vision cue, start the photo NOW — ENQUEUED BEFORE the review
-        # card so the sender ships it before parking (C-71) — so it's ready by the
-        # time I approve (hides ~1.2s capture + ~2s transfer behind the review
-        # window). The image is held un-processed; it reaches a model ONLY on
-        # approve (stt-review-gate / C-69 intact). Non-approve cancels it; a frame
-        # that still lands is archived (C-82), never used. Fresh intent only —
-        # modify/answer feed an existing flow and don't take an upfront photo.
-        if (
-            intent == "fresh"
-            and self._glass_conn
-            and "card" in self._glass_accept
-            and _looks_visual_intent(transcript)
+        # 视觉抢拍 (Zack 2026-06-01): the capture was most likely ALREADY fired during
+        # streaming (_run_partial, the instant the cue was heard) — carry that here.
+        # Fallback: a very short utterance may end before any partial caught the cue
+        # → fire now. Either way the status lives on the DECOUPLED satellite card
+        # (not this card body); the image is held un-processed and reaches a model
+        # ONLY on approve (C-69). Non-approve cancels it; a frame that still lands is
+        # archived (C-82), never used. Fresh intent only.
+        spec = self._stream_speculative.pop(sid, None)
+        if spec is None and (
+            intent == "fresh" and self._glass_conn
+            and "card" in self._glass_accept and _looks_visual_intent(transcript)
         ):
-            spec = await self._send_image_request(
-                parent_event_id=cmd_id, hint="scene in front",
-                tier=_vision_tier_for(transcript),
-            )
-            if spec is not None:
-                self._pending_stt_review[review_cmd_id]["spec_req_id"] = spec[0]
-                self._pending_stt_review[review_cmd_id]["spec_image_fut"] = spec[1]
-                log.info("vision.speculative_capture_started",
-                         review_cmd_id=review_cmd_id, req_id=spec[0],
-                         tier=_vision_tier_for(transcript))
+            tier = _vision_tier_for(transcript)
+            sent = await self._send_image_request(
+                parent_event_id=sid, hint="scene in front", tier=tier)
+            if sent is not None:
+                spec = {"req_id": sent[0], "fut": sent[1], "tier": tier}
+                self._satellite_active[sent[0]] = tier
+                await self._emit_satellite(
+                    stage="capturing",
+                    detail="capturing hi-res photo…" if tier == "detail" else "capturing photo…")
+        if spec is not None:
+            self._pending_stt_review[review_cmd_id]["spec_req_id"] = spec["req_id"]
+            self._pending_stt_review[review_cmd_id]["spec_image_fut"] = spec["fut"]
+            self._pending_stt_review[review_cmd_id]["spec_tier"] = spec["tier"]
+            log.info("vision.speculative_capture_carried",
+                     review_cmd_id=review_cmd_id, req_id=spec["req_id"], tier=spec["tier"])
         await self.emit_card(
             cmd_id=review_cmd_id,
             title="STT review",
@@ -1319,22 +1383,31 @@ class CortexServer:
             )
             await self._handle_user_decision(synth)
         else:
-            payload: dict[str, Any] = {"text": transcript, "session_id": session_id}
-            # 视觉抢拍: if we pre-captured during the review window, await it (it has
-            # been in flight in parallel — usually already done) and hand it in so
-            # _handle_user_invoke skips the re-capture. If it timed out / came back
-            # empty, _handle_user_invoke falls back to a fresh capture.
-            fut = stt.get("spec_image_fut")
-            if fut is not None:
-                img = await self._await_image_request(stt.get("spec_req_id"), fut)
-                if img:
-                    payload["image"] = img
-                    log.info("vision.speculative_image_used", bytes_b64=len(img))
             synth = Event(
                 id=ids.event_id(), kind="user_invoke",
                 ts=datetime.now(timezone.utc),
-                payload=payload,
+                payload={"text": transcript, "session_id": session_id},
             )
+            # 视觉抢拍: if we pre-captured during the review window, surface a
+            # capturing progress (the decision gate is open now the card was
+            # approved, so this frame is allowed — covers the post-approve wait,
+            # which for hi-res can still be ~10s) then await the image and hand it
+            # in so _handle_user_invoke skips the re-capture. Timed-out/empty → it
+            # re-captures there.
+            fut = stt.get("spec_image_fut")
+            if fut is not None:
+                # Both-ready gate (Zack 2026-06-01): the prompt is approved; now wait
+                # for the photo. The DECOUPLED satellite card shows the live capture/
+                # transfer; the main HUD just says it's waiting on it. If no capture
+                # was fired (no fut) we skip straight to dispatch — image is optional.
+                await self._emit_progress_to_glass(
+                    parent_event_id=synth.id, stage="waiting_photo", icon="⏳",
+                    detail="waiting for photo…",
+                )
+                img = await self._await_image_request(stt.get("spec_req_id"), fut)
+                if img:
+                    synth.payload["image"] = img
+                    log.info("vision.speculative_image_used", bytes_b64=len(img))
             await self._handle_user_invoke(synth)
 
     async def _respeak_stt(self, stt: dict[str, Any]) -> None:
@@ -1407,12 +1480,12 @@ class CortexServer:
         ob.put_nowait((payload, blocks))
 
     async def _glass_sender_loop(self, ws: Any) -> None:
-        """The SOLE writer to the glass socket. Drains the outbox in FIFO order
-        so frames reach the eyewear exactly in enqueue order. After a decision
-        card (blocks=True) it PARKS on _decision_gate until the wearer's decision
-        clears it — so a permission/checkpoint card is never buried by the
-        progress that the jsonl tail emits right after it (replaces the old
-        'drop the progress' hack; nothing is discarded, it just waits)."""
+        """The sole writer of the MAIN flow to the glass socket. Drains the outbox
+        in FIFO order so frames reach the eyewear exactly in enqueue order. After a
+        decision card (blocks=True) it PARKS on _decision_gate until the wearer's
+        decision clears it — so a permission/checkpoint card is never buried by the
+        progress that follows it. (The satellite sender below also writes the
+        socket; the shared _ws_send_lock keeps the two from interleaving frames.)"""
         ob = self._glass_outbox
         gate = self._decision_gate
         if ob is None or gate is None:
@@ -1421,7 +1494,8 @@ class CortexServer:
             while True:
                 payload, blocks = await ob.get()
                 try:
-                    await ws.send(payload)
+                    async with self._ws_send_lock:
+                        await ws.send(payload)
                 except Exception as e:
                     log.warning("glass_send.failed", error=str(e))
                 if blocks:
@@ -1433,6 +1507,46 @@ class CortexServer:
                     log.info("glass_sender.resumed")
         except asyncio.CancelledError:
             pass
+
+    async def _glass_satellite_sender_loop(self, ws: Any) -> None:
+        """Second sender for the decoupled 视觉抢拍 satellite card (Zack 2026-06-01).
+        UNGATED: never waits on _decision_gate, so the capture card keeps updating
+        (capturing→receiving→done) even while the main STT-review card is parked.
+        Shares _ws_send_lock with the main sender so socket writes never interleave.
+        The satellite is an independent status element (no ordering vs the main
+        flow), so a separate queue is correct, not a C-71 violation."""
+        ob = self._glass_satellite_outbox
+        if ob is None:
+            return
+        try:
+            while True:
+                payload = await ob.get()
+                try:
+                    async with self._ws_send_lock:
+                        await ws.send(payload)
+                except Exception as e:
+                    log.warning("glass_satellite_send.failed", error=str(e))
+        except asyncio.CancelledError:
+            pass
+
+    async def _emit_satellite(self, stage: str, detail: str, *, icon: str = "📷") -> None:
+        """Push a satellite_card frame on the ungated channel — the decoupled
+        capture card below the main HUD. stage 'done' tells glass to dismiss it."""
+        if not self._glass_conn or "satellite_card" not in self._glass_accept:
+            return
+        ob = self._glass_satellite_outbox
+        if ob is None:
+            return
+        frame = {
+            "id": ids.command_id(),
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "kind": "satellite_card",
+            "stage": stage,                      # capturing | receiving | done
+            "detail_runs": [{"text": detail, "style": "normal"}],
+            "icon": icon,
+        }
+        ob.put_nowait(json.dumps(frame, ensure_ascii=False))
+        log.info("satellite_card.emit", stage=stage, detail=detail)
 
     async def _emit_glass_frame(self, kind: str, payload: dict[str, Any]) -> None:
         """Generic emit of a glass-shaped command frame. No-op if the current
@@ -1553,6 +1667,7 @@ class CortexServer:
         req_id = ids.command_id()
         fut: asyncio.Future[str | None] = asyncio.get_running_loop().create_future()
         self._pending_image_requests[req_id] = fut
+        self._image_request_parent[req_id] = parent_event_id
         payload: dict[str, Any] = {
             "req_id": req_id, "parent_event_id": parent_event_id, "tier": tier,
         }
@@ -1578,6 +1693,11 @@ class CortexServer:
         finally:
             if req_id is not None:
                 self._pending_image_requests.pop(req_id, None)
+                self._image_request_parent.pop(req_id, None)
+                # Still-active satellite here = the capture never landed (timeout)
+                # → dismiss it so the decoupled card doesn't hang.
+                if self._satellite_active.pop(req_id, None) is not None:
+                    await self._emit_satellite(stage="done", detail="photo unavailable", icon="✗")
 
     async def _request_image_from_glass(
         self, parent_event_id: str, hint: str | None = None,
@@ -1613,8 +1733,26 @@ class CortexServer:
         # base64-in-JSON below still works for glass builds that send `image`.)
         if payload.get("binary"):
             self._pending_binary_image = (req_id, payload.get("mime") or "image/jpeg")
+            bytes_len = payload.get("bytes_len")
             log.info("image_attached.binary_header", req_id=req_id,
-                     mime=payload.get("mime"), bytes_len=payload.get("bytes_len"))
+                     mime=payload.get("mime"), bytes_len=bytes_len)
+            # White-box (Zack 2026-06-01): the glasses finished capturing and are
+            # now streaming the JPEG over BT-PAN (~90 KB/s) — THIS is the slow phase
+            # (a hi-res photo is ~0.75 MB ≈ ~8 s). Say exactly that + the byte count.
+            try:
+                kb = int(bytes_len) // 1024 if bytes_len else 0
+            except (TypeError, ValueError):
+                kb = 0
+            detail = f"receiving photo · {kb} KB over Bluetooth" if kb else "receiving photo…"
+            if req_id in self._satellite_active:
+                # 视觉抢拍: the decoupled satellite card owns the capture status.
+                await self._emit_satellite(stage="receiving", detail=detail, icon="📥")
+            else:
+                # non-speculative in-line capture → main progress.
+                parent = self._image_request_parent.get(req_id)
+                if parent:
+                    await self._emit_progress_to_glass(
+                        parent_event_id=parent, stage="receiving_photo", icon="📥", detail=detail)
             return
         # Empty string is treated as "tried but no usable image" — None signals
         # the same downstream (fallback to image-less dispatch).
@@ -1655,6 +1793,10 @@ class CortexServer:
         if archived:
             log.info("capture.archived", req_id=req_id,
                      file=os.path.basename(archived), bytes=len(data))
+        # 视觉抢拍: transfer complete → dismiss the decoupled satellite card (fires
+        # even if the flow was killed and the future is gone — clears the card).
+        if self._satellite_active.pop(req_id, None) is not None:
+            await self._emit_satellite(stage="done", detail="photo ready", icon="✓")
         fut = self._pending_image_requests.get(req_id)
         if fut is None or fut.done():
             log.warning("binary_image.no_pending_or_done", req_id=req_id)
@@ -1985,6 +2127,11 @@ class CortexServer:
                 schema_hint=CANONICAL_ACTIONS_SCHEMA, add_dirs=add_dirs,
                 working_dir=working_dir, permission_mode=_permission_mode_for(instruction),
                 timeout_s=240.0, resume_session_id=cc_sid,
+                # RESUME: restore the ORIGINAL session's model+effort (None→the CLI
+                # restores from the session jsonl for a cross-process pick).
+                model=self._session_agent_config.get(cc_sid, {}).get("model"),
+                fallback_model=_AGENT_FALLBACK_MODEL,
+                effort=self._session_agent_config.get(cc_sid, {}).get("effort"),
             ).run()
             if not rpc_result or not rpc_result.get("ok", True):
                 await self._emit_info_card(
@@ -2160,6 +2307,11 @@ class CortexServer:
                 schema_hint=CANONICAL_ACTIONS_SCHEMA, add_dirs=add_dirs,
                 working_dir=working_dir, permission_mode=_permission_mode_for(modify_text),
                 timeout_s=timeout_s, resume_session_id=cc_session_id,
+                # RESUME: restore the ORIGINAL session's model+effort (None→the CLI
+                # restores from the session jsonl for a cross-process pick).
+                model=self._session_agent_config.get(cc_session_id, {}).get("model"),
+                fallback_model=_AGENT_FALLBACK_MODEL,
+                effort=self._session_agent_config.get(cc_session_id, {}).get("effort"),
             ).run()
             await self._send_agent_card_for_decision(
                 rpc_result or {}, original_event, working_dir, timeout_s)
@@ -2213,6 +2365,11 @@ class CortexServer:
                           os.path.expanduser("~/.claude/projects")],
                 working_dir=working_dir, permission_mode=_permission_mode_for(user_text),
                 timeout_s=timeout_s, resume_session_id=cc_session_id,
+                # RESUME: restore the ORIGINAL session's model+effort (None→the CLI
+                # restores from the session jsonl for a cross-process pick).
+                model=self._session_agent_config.get(cc_session_id, {}).get("model"),
+                fallback_model=_AGENT_FALLBACK_MODEL,
+                effort=self._session_agent_config.get(cc_session_id, {}).get("effort"),
             ).run()
             await self._send_agent_card_for_decision(
                 rpc_result or {}, original_event, working_dir, timeout_s)
@@ -2352,6 +2509,7 @@ class CortexServer:
         working_dir: str | None = None,
         timeout_s: float = 240.0,
         output_schema: dict[str, Any] | None = None,
+        effort: str | None = None,
     ) -> None:
         """The Phase 5 agent dispatch path — used by both /api/dev/agent_invoke
         and the classifier's complex branch in _handle_user_invoke.
@@ -2434,17 +2592,40 @@ class CortexServer:
                     brief_chars=len(brief), add_dirs=add_dirs,
                     timeout_s=timeout_s, via="sdk",
                 )
+            # dispatch decides model + effort TOGETHER from the task (Zack
+            # 2026-06-01): the classifier's effort picks both — shallow → Sonnet +
+            # low; deep ("research idea") → Opus + high. A RESUME instead RESTORES
+            # the original session's config — tracked in-process, or None so the
+            # CLI's --resume continues on the session's recorded model (jsonl).
+            _resume_sid = (event.payload or {}).get("resume_cc_session_id")
+            if _resume_sid:
+                _cfg = self._session_agent_config.get(_resume_sid, {})
+                _model = _cfg.get("model")    # None → CLI --resume restores it
+                _effort = _cfg.get("effort")
+            else:
+                _effort = effort or _AGENT_EFFORT_DEFAULT
+                _model = _agent_model_for_effort(_effort)
+            log.info("agent.model_effort", model=_model, effort=_effort,
+                     resumed=bool(_resume_sid))
             rpc_result = await SdkAgentSession(
                 self, event, brief=brief, schema_hint=schema_hint,
                 add_dirs=add_dirs, working_dir=working_dir,
                 permission_mode=permission_mode, timeout_s=timeout_s,
+                # Model + effort chosen above (a RESUME reuses the original
+                # session's config from _session_agent_config, not a fresh pick).
+                model=_model, fallback_model=_AGENT_FALLBACK_MODEL, effort=_effort,
                 # UC1: the photo rides into the agent as a multimodal content
                 # block so Claude sees it directly (no vision_describe pre-step).
                 image_b64=(event.payload or {}).get("image"),
                 # UC2 / modify-on-final: continue a prior CC session when the
                 # caller supplied one (same payload key the tmux path uses).
-                resume_session_id=(event.payload or {}).get("resume_cc_session_id"),
+                resume_session_id=_resume_sid,
             ).run()
+            # Remember the config under the (possibly new) cc_session_id so a later
+            # resume restores it.
+            _ccsid = (rpc_result or {}).get("session_id")
+            if _ccsid:
+                self._session_agent_config[_ccsid] = {"model": _model, "effort": _effort}
             if sid and rpc_result:
                 self.sessions.append(
                     sid, "agent_completed", event_id=event.id,
@@ -2679,7 +2860,7 @@ class CortexServer:
             await self._emit_progress_to_glass(
                 parent_event_id=event.id,
                 stage="capturing", icon="📷",
-                detail="capturing scene…" if tier == "standard" else "capturing scene (hi-res)…",
+                detail="capturing photo on glasses…" if tier == "standard" else "capturing photo on glasses (hi-res)…",
             )
             img = await self._request_image_from_glass(
                 parent_event_id=event.id,
@@ -2746,7 +2927,10 @@ class CortexServer:
                     # classifier (see top of _handle_user_invoke). By the time
                     # we reach here, event.payload.image is set if the user's
                     # text looked visual; nothing to do at this layer.
-                    await self._dispatch_complex_agent(event)
+                    # Effort (Zack 2026-06-01): the classifier judged the reasoning
+                    # depth — hand it to the agent so a mechanical multi-step errand
+                    # runs 'low' (no full extended-thinking budget).
+                    await self._dispatch_complex_agent(event, effort=decision.get("effort"))
                     return
                 log.info("intent.simple_via_router", why=decision.get("why"))
                 await self._emit_progress_to_glass(
@@ -3000,7 +3184,11 @@ class CortexServer:
                 _sf = stt.get("spec_image_fut")
                 if _sf is not None and not _sf.done():
                     _sf.cancel()
-                self._pending_image_requests.pop(stt.get("spec_req_id"), None)
+                _srq = stt.get("spec_req_id")
+                self._pending_image_requests.pop(_srq, None)
+                # 视觉抢拍: dismiss the decoupled satellite card too (capture dropped).
+                if self._satellite_active.pop(_srq, None) is not None:
+                    await self._emit_satellite(stage="done", detail="cancelled", icon="✗")
             if d == "approve":
                 # ONLY an explicit approve routes the transcript downstream.
                 log.info("stt_review.approved", cmd_id=cmd_id, intent=stt.get("intent"))
@@ -3356,13 +3544,34 @@ class CortexServer:
                     )
 
         self._write_receipt(plan, results, src_evt)
-        # Terminal frame — ActivityPill hides on stage="completed", and the
-        # chat gets a final "✓ done" row so the user sees execution succeeded.
-        await self._emit_progress_to_glass(
-            parent_event_id=parent_event_id,
-            stage="completed", icon="✓",
-            detail=f"done — {plan.get('primary_intent', 'action')}",
-        )
+        # Result card (Zack 2026-06-01): a PERSISTENT "✓ Done" card after execution
+        # so the turn doesn't just vanish to Idle — Zack sees WHAT happened and
+        # dismisses with OK. Reuses the approved preview body (that's exactly what
+        # got executed). Replaces the old transient stage="completed"→Idle.
+        hud = plan.get("hud_response") or {}
+        done_body = (hud.get("body_template") or hud.get("body") or "").strip()
+        if not done_body:
+            done_body = "\n".join(
+                f"· {str(st.get('tool','')).replace('applescript_','').replace('_',' ')} — {st.get('action','')}"
+                for st in plan.get("subtasks", [])
+            ) or "Done."
+        result_source = "Claude" if pending.get("from_agent") else (hud.get("source") or "Cortex")
+        try:
+            await self.emit_card(
+                cmd_id=ids.command_id(),
+                title="✓ Done",
+                body_md=done_body[:1500],
+                options=[],                 # notification — TAP = OK to dismiss
+                card_type="notification",
+                source=result_source,
+                ttl_ms=180_000,
+            )
+        except Exception as e:
+            log.warning("result_card.failed", error=str(e))
+            # Fall back to the transient completed frame so the turn still ends.
+            await self._emit_progress_to_glass(
+                parent_event_id=parent_event_id, stage="completed", icon="✓",
+                detail=f"done — {plan.get('primary_intent', 'action')}")
         if sid:
             self.sessions.append(sid, "turn_complete", primary_intent=plan.get("primary_intent"))
 

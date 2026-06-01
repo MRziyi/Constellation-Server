@@ -231,6 +231,9 @@ class SdkAgentSession:
         resume_session_id: str | None = None,
         image_b64: str | None = None,
         image_media_type: str = "image/jpeg",
+        model: str | None = None,
+        fallback_model: str | None = None,
+        effort: str | None = None,
     ) -> None:
         self.server = server
         self.event = event
@@ -245,6 +248,11 @@ class SdkAgentSession:
         self.working_dir = working_dir or os.path.expanduser("~")
         self.permission_mode = permission_mode
         self.timeout_s = timeout_s
+        # Latency knobs (Zack 2026-06-01): model (None=inherit CLI/Opus) +
+        # reasoning effort (low|medium|high|…) scaled to the task by the classifier.
+        self.model = model
+        self.fallback_model = fallback_model
+        self.effort = effort
         # Phase 2/3: when set, continue a prior CC session (modify-on-final +
         # UC2 archive resume) instead of starting fresh — full history restored.
         self.resume_session_id = resume_session_id
@@ -537,6 +545,10 @@ class SdkAgentSession:
             add_dirs=[str(d) for d in self.add_dirs],
             max_budget_usd=_MAX_BUDGET_USD,
             resume=self.resume_session_id,   # Phase 2/3: continue a prior session
+            # Latency: model + reasoning effort. None = inherit the CLI default.
+            model=self.model,
+            fallback_model=self.fallback_model,
+            effort=self.effort,
         )
         await self._progress("dispatching_agent", "🤖",
                              f"dispatching agent ({self.permission_mode})")

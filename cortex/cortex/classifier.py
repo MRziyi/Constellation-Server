@@ -61,15 +61,20 @@ async def classify_intent(event: Event) -> dict[str, Any]:
         )
         parsed = parse_json_response(raw)
         if isinstance(parsed, dict) and isinstance(parsed.get("complex"), bool):
+            effort = str(parsed.get("effort", "")).strip().lower()
+            if effort not in ("low", "medium", "high", "xhigh", "max"):
+                effort = "low"   # default: most agent tasks are mechanical
             log.info(
                 "classifier.decided",
                 complex=parsed["complex"],
                 why=str(parsed.get("why", ""))[:80],
+                effort=effort,
                 text_preview=text[:60],
             )
             return {
                 "complex": parsed["complex"],
                 "why": str(parsed.get("why", "")),
+                "effort": effort,
                 "raw": raw,
             }
         log.warning("classifier.invalid_shape", parsed=str(parsed)[:120])

@@ -54,6 +54,33 @@ SHORTCUT_PARSER_MODEL = os.environ.get(
     os.environ.get("CORTEX_ROUTER_MODEL", "gpt-5.2"),
 )
 
+# Complex-agent (Claude via the Agent SDK / `claude` CLI). Dispatch picks the
+# model + effort TOGETHER from the classifier's effort judgment (Zack 2026-06-01):
+# shallow reasoning → FAST model (Sonnet) + low effort; deep reasoning ("design a
+# research idea", hard debugging) → DEEP model (Opus) + high effort. Real-device
+# 2026-06-01: the old all-default path (Opus + full extended-thinking) ran ~90s
+# (28s first-token + 43s thinking) for a mechanical multi-step errand.
+AGENT_MODEL_FAST = os.environ.get("CORTEX_AGENT_MODEL_FAST", "claude-sonnet-4-6")
+AGENT_MODEL_DEEP = os.environ.get("CORTEX_AGENT_MODEL_DEEP", "claude-opus-4-8")
+# Hard override: force ONE model regardless of effort. Default None = let the
+# effort→model map (above) decide.
+AGENT_MODEL = os.environ.get("CORTEX_AGENT_MODEL") or None
+AGENT_FALLBACK_MODEL = os.environ.get("CORTEX_AGENT_FALLBACK_MODEL") or None
+# Fallback effort when the classifier didn't say. (Per-task value comes from the
+# classifier; resume restores the ORIGINAL session's effort, not this.)
+AGENT_EFFORT_DEFAULT = os.environ.get("CORTEX_AGENT_EFFORT", "low")
+# effort tiers that warrant the DEEP model.
+AGENT_DEEP_EFFORTS = {"high", "xhigh", "max"}
+
+
+def agent_model_for_effort(effort: str | None) -> str:
+    """Map the classifier's reasoning-effort to the agent model: deep efforts get
+    the DEEP model (Opus), everything else the FAST model (Sonnet). A hard
+    AGENT_MODEL override wins. dispatch decides model + effort together."""
+    if AGENT_MODEL:
+        return AGENT_MODEL
+    return AGENT_MODEL_DEEP if (effort or "").lower() in AGENT_DEEP_EFFORTS else AGENT_MODEL_FAST
+
 
 # ══════════════════════════════════════════════════════════════════ PATTERNS
 
@@ -191,7 +218,19 @@ You're Cortex's intent classifier. Single job: route Zack's ask to either the
 research-agent path (Claude — multi-step) or the direct-adapter path (one
 bounded side-effect or state read).
 
-Output JSON ONLY: {"complex": true|false, "why": "≤15 words"}
+Output JSON ONLY: {"complex": true|false, "why": "≤15 words", "effort": "low"|"medium"|"high"}
+
+`effort` = how much REASONING DEPTH the agent needs — NOT how many steps. Most
+asks are LOW even when multi-step. Pick the smallest that fits:
+  - low    — mechanical / bounded: read a photo & act on it, add a reminder or
+             event, draft a short message/email, look something up, save a memo.
+             (Default — almost everything the glasses do is here.)
+  - medium — needs real synthesis or judgment: summarise/compare a few sources,
+             multi-step with light reasoning, reconcile conflicting info.
+  - high   — hard reasoning: analyse/architect, research across many sources,
+             debug a tricky problem, weigh trade-offs.
+A long multi-STEP errand (read poster → add reminder → draft email) is still
+LOW effort — it's mechanical, just several bounded actions.
 
 complex = true  WHEN the ask needs ANY of:
   - reading/finding/searching multiple sources (emails, files, sessions, web)
