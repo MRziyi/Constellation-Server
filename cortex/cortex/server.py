@@ -1252,6 +1252,30 @@ class CortexServer:
             "session_id": session_id,
             "lang_hint": lang_hint,
         }
+        # 视觉抢拍 / speculative capture (Zack 2026-06-01): if the FINAL transcript
+        # carries the vision cue, start the photo NOW — ENQUEUED BEFORE the review
+        # card so the sender ships it before parking (C-71) — so it's ready by the
+        # time I approve (hides ~1.2s capture + ~2s transfer behind the review
+        # window). The image is held un-processed; it reaches a model ONLY on
+        # approve (stt-review-gate / C-69 intact). Non-approve cancels it; a frame
+        # that still lands is archived (C-82), never used. Fresh intent only —
+        # modify/answer feed an existing flow and don't take an upfront photo.
+        if (
+            intent == "fresh"
+            and self._glass_conn
+            and "card" in self._glass_accept
+            and _looks_visual_intent(transcript)
+        ):
+            spec = await self._send_image_request(
+                parent_event_id=cmd_id, hint="scene in front",
+                tier=_vision_tier_for(transcript),
+            )
+            if spec is not None:
+                self._pending_stt_review[review_cmd_id]["spec_req_id"] = spec[0]
+                self._pending_stt_review[review_cmd_id]["spec_image_fut"] = spec[1]
+                log.info("vision.speculative_capture_started",
+                         review_cmd_id=review_cmd_id, req_id=spec[0],
+                         tier=_vision_tier_for(transcript))
         await self.emit_card(
             cmd_id=review_cmd_id,
             title="STT review",
@@ -1295,10 +1319,21 @@ class CortexServer:
             )
             await self._handle_user_decision(synth)
         else:
+            payload: dict[str, Any] = {"text": transcript, "session_id": session_id}
+            # 视觉抢拍: if we pre-captured during the review window, await it (it has
+            # been in flight in parallel — usually already done) and hand it in so
+            # _handle_user_invoke skips the re-capture. If it timed out / came back
+            # empty, _handle_user_invoke falls back to a fresh capture.
+            fut = stt.get("spec_image_fut")
+            if fut is not None:
+                img = await self._await_image_request(stt.get("spec_req_id"), fut)
+                if img:
+                    payload["image"] = img
+                    log.info("vision.speculative_image_used", bytes_b64=len(img))
             synth = Event(
                 id=ids.event_id(), kind="user_invoke",
                 ts=datetime.now(timezone.utc),
-                payload={"text": transcript, "session_id": session_id},
+                payload=payload,
             )
             await self._handle_user_invoke(synth)
 
@@ -1502,52 +1537,62 @@ class CortexServer:
 
     # ── R-13 / C-55: server-pull-on-demand vision ─────────────────────────
 
-    async def _request_image_from_glass(
-        self, parent_event_id: str, hint: str | None = None,
-        tier: str = "standard",    # 'standard' (1080p) | 'detail' (2K) — the
-        # glasses map the tier name → (long-edge px, jpeg quality).
-        timeout_s: float = 18.0,   # CameraGate warmup+capture measured ~10.6–11.4s
-        # on-device (2026-05-30); 10s clipped valid frames. 18s gives margin.
-    ) -> str | None:
-        """Ask the current glass peer to capture a photo and send it back.
-        Returns the b64-encoded JPEG string on success, or None on timeout /
-        peer-not-glass / peer-missing-capability.
+    async def _send_image_request(
+        self, parent_event_id: str, hint: str | None = None, tier: str = "standard",
+    ) -> tuple[str, "asyncio.Future[str | None]"] | None:
+        """Enqueue ONE `request_image` frame + register its pending future; return
+        (req_id, future), or None if the peer isn't a capture-capable glass.
 
-        Used at the top of `_handle_user_invoke` when the 「视觉」 vision cue fired
-        but the originating event had no image attached.
-        Glass-side handler: `StateMachine.dispatch` `"request_image"` →
-        CameraGate.captureViaGate → `wss.sendEvent(ImageAttached(req_id, b64))`.
-        """
-        # Only meaningful for glass peers that advertised "card" support
-        # (we co-opt the same capability gate — a console peer wouldn't have
-        # a camera anyway).
+        Split from the await half so 视觉抢拍 / speculative capture (Zack
+        2026-06-01) can enqueue the request BEFORE the STT-review card — the sender
+        parks after a decision card (C-71), so anything queued AFTER it would wait,
+        which would defeat the overlap. Enqueueing first means the photo is in
+        flight while I read the review card."""
         if not self._glass_conn or "card" not in self._glass_accept:
             return None
         req_id = ids.command_id()
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future[str | None] = loop.create_future()
+        fut: asyncio.Future[str | None] = asyncio.get_running_loop().create_future()
         self._pending_image_requests[req_id] = fut
         payload: dict[str, Any] = {
-            "req_id": req_id,
-            "parent_event_id": parent_event_id,
-            "tier": tier,
+            "req_id": req_id, "parent_event_id": parent_event_id, "tier": tier,
         }
         if hint:
             payload["hint"] = hint
         await self._emit_glass_frame("request_image", payload)
         log.info("request_image.sent", req_id=req_id, parent=parent_event_id, hint=hint, tier=tier)
+        return req_id, fut
+
+    async def _await_image_request(
+        self, req_id: str | None, fut: "asyncio.Future[str | None]",
+        timeout_s: float = 18.0,   # CameraGate warmup+capture measured ~10.6–11.4s
+        # cold (2026-05-30); warm ~3-5s. 18s gives margin. Speculative awaits start
+        # mid-review so the wait is usually already satisfied.
+    ) -> str | None:
+        """Await the captured frame for a req_id from [_send_image_request], then
+        clear the registry. Returns the b64 JPEG, or None on timeout / empty."""
         try:
             return await asyncio.wait_for(fut, timeout=timeout_s)
         except asyncio.TimeoutError:
-            log.warning(
-                "request_image.timeout",
-                req_id=req_id, parent=parent_event_id, timeout_s=timeout_s,
-            )
+            log.warning("request_image.timeout", req_id=req_id, timeout_s=timeout_s)
             return None
         finally:
-            # Always clear from registry — even on success, the future was
-            # set by _handle_image_attached and we're done with this req_id.
-            self._pending_image_requests.pop(req_id, None)
+            if req_id is not None:
+                self._pending_image_requests.pop(req_id, None)
+
+    async def _request_image_from_glass(
+        self, parent_event_id: str, hint: str | None = None,
+        tier: str = "standard", timeout_s: float = 18.0,
+    ) -> str | None:
+        """Ask the current glass peer to capture a photo and send it back (send +
+        await, composed). Returns the b64 JPEG, or None on timeout / peer-not-glass.
+        Used at the top of `_handle_user_invoke` when the 「视觉」 cue fired but the
+        event had no image; the speculative path uses the two halves directly.
+        Glass-side: `StateMachine` `request_image` → CameraGate → ImageAttached."""
+        sent = await self._send_image_request(parent_event_id, hint, tier)
+        if sent is None:
+            return None
+        req_id, fut = sent
+        return await self._await_image_request(req_id, fut, timeout_s)
 
     async def _handle_image_attached(self, event: Event) -> None:
         """Glass → Cortex `image_attached` arrives. Resolve the matching
@@ -2948,6 +2993,14 @@ class CortexServer:
         stt = self._pending_stt_review.pop(cmd_id, None)
         if stt:
             d = (decision or "").strip().lower()
+            # 视觉抢拍 cleanup: any non-approve outcome (modify/kill) drops the
+            # speculative capture for THIS transcript — the future is cancelled and
+            # dropped; a frame that still lands is archived (C-82), never used.
+            if d != "approve":
+                _sf = stt.get("spec_image_fut")
+                if _sf is not None and not _sf.done():
+                    _sf.cancel()
+                self._pending_image_requests.pop(stt.get("spec_req_id"), None)
             if d == "approve":
                 # ONLY an explicit approve routes the transcript downstream.
                 log.info("stt_review.approved", cmd_id=cmd_id, intent=stt.get("intent"))
