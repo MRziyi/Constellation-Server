@@ -56,11 +56,18 @@ CANONICAL_ACTIONS_SCHEMA: dict[str, Any] = {
 # Inlined verbatim — terse per-type field shapes. Critical fields only.
 _ACTION_APPENDIX = """\
 email          {type:"email",          to OR reply_to_message_id, subject (skip on reply), body, account?='iCloud'|'QQ'|'Google'|'UIUC'}
-reminder       {type:"reminder",       title, due_iso?, list?, notes?}
+reminder       {type:"reminder",       title (the task ONLY — NO date/time in it), due_iso (ISO 8601 + TZ; extract any time HERE so it becomes a real due-date), list?, notes?}
 calendar_event {type:"calendar_event", title, start_iso, end_iso, location?, notes?, calendar?}
 imessage       {type:"imessage",       to=phone_or_email, body}
 fs_write       {type:"fs_write",       path, content}     # only under ~/constellation/, ~/Code/Projects/, /tmp/
-shortcut       {type:"shortcut",       name, input?}"""
+shortcut       {type:"shortcut",       name, input?}
+
+TIME RULE (the #1 mistake — do NOT repeat it): every date/time the ask mentions OR that
+you read off a photo MUST go in the structured *_iso field (due_iso / start_iso / end_iso),
+ISO 8601 + TZ, resolving "tomorrow"/"3pm"/"明天下午" against NOW. NEVER leave the time as
+text in title/body — then it is NOT a real reminder/event attribute (it won't fire, won't
+show on the timeline). title = the WHAT; *_iso = the WHEN. A reminder with a time but no
+due_iso is WRONG."""
 
 
 def build_agent_brief(
