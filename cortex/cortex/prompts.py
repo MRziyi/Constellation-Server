@@ -45,10 +45,15 @@ CLASSIFIER_MODEL = os.environ.get("CORTEX_CLASSIFIER_MODEL", "openai/gpt-oss-120
 # (Zack 2026-06-02 — caught after moving the classifier + router to Groq).
 def short_model_label(m: str) -> str:
     ml = (m or "").lower()
-    if any(x in ml for x in ("gpt-oss", "meta-llama", "llama-4", "llama-3",
-                             "moonshotai/", "groq/")):
-        return "Groq"
-    return (m or "").replace("openai/", "")
+    if "gpt-oss" in ml:
+        return "GPT-OSS"           # OpenAI's open model (we run it on Groq)
+    if "llama" in ml:
+        return "Llama"             # Groq Llama-4-Scout (router)
+    if "claude" in ml:
+        return "Claude"
+    if "moonshot" in ml or "kimi" in ml:
+        return "Kimi"
+    return (m or "").replace("openai/", "")   # e.g. gpt-5.2 → "gpt-5.2"
 
 
 CLASSIFIER_LABEL = short_model_label(CLASSIFIER_MODEL)
@@ -143,19 +148,20 @@ VISION_DETAIL_PATTERN = re.compile(
 )
 
 # ── Model override (deterministic model pin) ───────────────────────────────
-# Zack 2026-06-01: naming a model in the ask PINS its path — no LLM guess, same
-# spirit as the vision cue. "gpt"/"chatgpt"/"openai" → the simple router path
-# (GPT answers / acts directly); "claude"/"克劳德"/"cloud" → the complex agent
-# path. 'cloud' is the most common STT mishear of "Claude" (accepted trade-off:
-# "cloud storage" etc. may over-trigger the agent, which degrades gracefully).
-# Claude wins ties — the agent path can fall back to a single action, but the
-# router can't escalate to research.
+# Zack 2026-06-01/06-02: naming a model in the ask PINS its path — no LLM guess,
+# same spirit as the vision cue. The SIMPLE/router path now runs on Groq
+# Llama-4-Scout (was GPT-5.2), so it accepts "llama"/"groq"/"scout" AND the
+# legacy "gpt"/"chatgpt"/"openai" (kept for muscle memory). "claude"/"克劳德"/
+# "cloud" → the complex agent path. 'cloud' is the common STT mishear of "Claude"
+# (accepted trade-off). Claude wins ties — the agent can fall back to a single
+# action, but the router can't escalate to research.
 #
 # NOTE: substring match, NOT \b-anchored. CJK chars are \w in Python regex, so a
 # \b never forms between 用 and "gpt" in 「用gpt推理」 → \bgpt\b would never fire on
 # Chinese-embedded model names (real 2026-06-01 miss). The [pb] also catches the
 # common STT mishear "gbt"; \s? tolerates spelled-out "g p t" / "g b t".
-GPT_OVERRIDE_PATTERN = re.compile(r"(g\s?[pb]\s?t|open\s?ai)", re.IGNORECASE)
+# (The match still returns the internal 'gpt' = router-path id; see server.)
+GPT_OVERRIDE_PATTERN = re.compile(r"(g\s?[pb]\s?t|open\s?ai|llama|groq|scout)", re.IGNORECASE)
 CLAUDE_OVERRIDE_PATTERN = re.compile(r"(claude|克劳德|克劳|cloud)", re.IGNORECASE)
 
 # ── Permission mode (full-auto opt-in) ─────────────────────────────────────

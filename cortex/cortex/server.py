@@ -325,11 +325,14 @@ def _vision_tier_for(text: str) -> str:
 
 
 def _model_override_for(text: str) -> str | None:
-    """Deterministic model pin (Zack 2026-06-01): naming a model in the ask forces
-    its path, no LLM guess (mirrors the vision cue). 'claude'/'克劳德'/'cloud' →
-    the complex agent path; 'gpt'/'chatgpt'/'openai' → the simple router path.
+    """Deterministic model pin (Zack 2026-06-01/06-02): naming a model in the ask
+    forces its path, no LLM guess (mirrors the vision cue). 'claude'/'克劳德'/'cloud'
+    → the complex agent path; 'llama'/'groq'/'scout' (or legacy 'gpt'/'chatgpt'/
+    'openai') → the simple/fast router path, which now runs on Groq Llama-4-Scout.
     Claude wins ties — the agent path can degrade to a single action, but the
-    router can't escalate to research. Returns 'claude' | 'gpt' | None."""
+    router can't escalate to research. Returns 'claude' | 'gpt' | None
+    ('gpt' is the internal id for the router/fast path, regardless of which
+    fast-path keyword was spoken)."""
     if not text:
         return None
     if _CLAUDE_OVERRIDE_PATTERN.search(text):
@@ -3173,7 +3176,7 @@ class CortexServer:
             await self._emit_progress_to_glass(
                 parent_event_id=event.id,
                 stage="classified", icon="🧭",
-                detail="model: GPT (you named it) → planner", meta=_ROUTER_LABEL,
+                detail="model: fast path (you named it) → planner", meta=_ROUTER_LABEL,
             )
 
         # Phase 5c — classify intent first; complex asks bypass the v0.5
@@ -3299,7 +3302,7 @@ class CortexServer:
             detail=f"preparing {hud_kind}",
         )
         cmd = self._build_command(plan, subtask_results,
-                                 "GPT Vision" if (event.payload or {}).get("image") else "GPT")
+                                 f"{_ROUTER_LABEL} Vision" if (event.payload or {}).get("image") else _ROUTER_LABEL)
         sid = (event.payload or {}).get("session_id")
         self._pending_previews[cmd.id] = {
             "event": event,  # full event kept so we can re-route on Modify feedback
@@ -3352,7 +3355,7 @@ class CortexServer:
 
     def _build_command(
         self, plan: dict[str, Any], results: list[dict[str, Any]],
-        source: str = "GPT",
+        source: str = _ROUTER_LABEL,
     ) -> Command:
         hud = plan["hud_response"]
         body = self._interpolate(hud["body_template"], results, plan=plan)
@@ -3761,7 +3764,7 @@ class CortexServer:
             detail=f"preparing {hud_kind}",
         )
         cmd = self._build_command(next_plan, subtask_results,
-                                 "GPT Vision" if (original_event.payload or {}).get("image") else "GPT")
+                                 f"{_ROUTER_LABEL} Vision" if (original_event.payload or {}).get("image") else _ROUTER_LABEL)
         sid = (original_event.payload or {}).get("session_id")
         self._pending_previews[cmd.id] = {
             "event": original_event,
