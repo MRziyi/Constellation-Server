@@ -116,7 +116,8 @@ def _is_retryable(exc: Exception) -> bool:
 # pay GPT-5.2's ~3s latency. Detection is by model name (a Groq-only substring),
 # so callers don't have to thread a provider through.
 GROQ_BASE_URL = os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
-_GROQ_MODEL_MARKERS = ("gpt-oss", "llama-3.3", "llama-3.1", "moonshotai/", "groq/")
+_GROQ_MODEL_MARKERS = ("gpt-oss", "meta-llama", "llama-4", "llama-3.3", "llama-3.1",
+                       "moonshotai/", "groq/")
 
 
 def _resolve_endpoint(model: str) -> tuple[str | None, str]:

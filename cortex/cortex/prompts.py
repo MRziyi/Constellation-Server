@@ -39,8 +39,28 @@ import re
 # by llm_cache._resolve_endpoint. Needs GROQ_API_KEY in tool-agent/.env.
 CLASSIFIER_MODEL = os.environ.get("CORTEX_CLASSIFIER_MODEL", "openai/gpt-oss-120b")
 
-# Two-pass planner (selector + planner) on the simple path.
-ROUTER_MODEL = "gpt-5.2"
+
+# Short HUD model tag (white-box: the meta line must say WHO ran a phase, not a
+# stale "GPT-5.2"). Auto-derived so it self-corrects when a model changes
+# (Zack 2026-06-02 — caught after moving the classifier + router to Groq).
+def short_model_label(m: str) -> str:
+    ml = (m or "").lower()
+    if any(x in ml for x in ("gpt-oss", "meta-llama", "llama-4", "llama-3",
+                             "moonshotai/", "groq/")):
+        return "Groq"
+    return (m or "").replace("openai/", "")
+
+
+CLASSIFIER_LABEL = short_model_label(CLASSIFIER_MODEL)
+
+# Two-pass planner (selector + planner) on the simple path. Moved to Groq's
+# vision-capable Llama-4-Scout (Zack 2026-06-02): the planner gets the photo as a
+# multimodal block, so it MUST be vision-capable (gpt-oss is text-only) — and
+# Groq cuts the gpt-5.2 router's ~12s inference to ~1-2s. Routed to Groq by
+# llm_cache._resolve_endpoint; env CORTEX_ROUTER_MODEL overrides.
+ROUTER_MODEL = os.environ.get(
+    "CORTEX_ROUTER_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+ROUTER_LABEL = short_model_label(ROUTER_MODEL)
 
 # Voice-addressable session router (which session does this turn belong to).
 SESSION_ROUTER_MODEL = os.environ.get(

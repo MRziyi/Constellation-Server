@@ -69,9 +69,10 @@ def _load_env() -> Path | None:
 )
 @click.option(
     "--router-model",
-    default="gpt-5.2",
+    default="meta-llama/llama-4-scout-17b-16e-instruct",
     envvar="CORTEX_ROUTER_MODEL",
-    help="OpenAI model id for the Router. Override via CORTEX_ROUTER_MODEL env var.",
+    help="Router/planner model id (Groq Llama-4-Scout — vision-capable, fast). "
+         "Override via CORTEX_ROUTER_MODEL env var.",
 )
 @click.option(
     "--use-stub-router",

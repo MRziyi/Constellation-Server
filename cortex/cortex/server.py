@@ -33,6 +33,8 @@ from .prompts import (
     AGENT_FALLBACK_MODEL as _AGENT_FALLBACK_MODEL,
     AGENT_EFFORT_DEFAULT as _AGENT_EFFORT_DEFAULT,
     agent_model_for_effort as _agent_model_for_effort,
+    CLASSIFIER_LABEL as _CLASSIFIER_LABEL,
+    ROUTER_LABEL as _ROUTER_LABEL,
     AUTO_RUN_PATTERNS as _AUTO_RUN_PATTERNS,
     PIN_INTENT_PATTERNS as _PIN_INTENT_PATTERNS,
     UNPIN_INTENT_PATTERNS as _UNPIN_INTENT_PATTERNS,
@@ -656,7 +658,7 @@ class CortexServer:
         self,
         twin: Twin,
         tool_agent_url: str = "ws://localhost:8889",
-        router_model: str = "gpt-5.2",
+        router_model: str = "meta-llama/llama-4-scout-17b-16e-instruct",
         use_stub_router: bool = True,
         plane: ControlPlane | None = None,
     ):
@@ -3171,7 +3173,7 @@ class CortexServer:
             await self._emit_progress_to_glass(
                 parent_event_id=event.id,
                 stage="classified", icon="🧭",
-                detail="model: GPT (you named it) → planner", meta="GPT-5.2",
+                detail="model: GPT (you named it) → planner", meta=_ROUTER_LABEL,
             )
 
         # Phase 5c — classify intent first; complex asks bypass the v0.5
@@ -3183,7 +3185,7 @@ class CortexServer:
             await self._emit_progress_to_glass(
                 parent_event_id=event.id,
                 stage="classifying", icon="🧭",
-                detail="classifying intent", meta="GPT-5.2",
+                detail="classifying intent", meta=_CLASSIFIER_LABEL,
             )
             try:
                 decision = await classify_intent(event)
@@ -3197,7 +3199,7 @@ class CortexServer:
                     await self._emit_progress_to_glass(
                         parent_event_id=event.id,
                         stage="classified", icon="🧭",
-                        detail=f"intent: complex → agent — {why}", meta="GPT-5.2",
+                        detail=f"intent: complex → agent — {why}", meta=_CLASSIFIER_LABEL,
                     )
                     # R-13 / C-55: vision upfront-pull happened before
                     # classifier (see top of _handle_user_invoke). By the time
@@ -3212,7 +3214,7 @@ class CortexServer:
                 await self._emit_progress_to_glass(
                     parent_event_id=event.id,
                     stage="classified", icon="🧭",
-                    detail=f"intent: simple → planner — {why}", meta="GPT-5.2",
+                    detail=f"intent: simple → planner — {why}", meta=_CLASSIFIER_LABEL,
                 )
             except Exception as e:
                 log.warning("classifier.errored_falling_through", error=str(e))
@@ -3221,7 +3223,7 @@ class CortexServer:
         await self._emit_progress_to_glass(
             parent_event_id=event.id,
             stage="planning", icon="🧠",
-            detail="planning dispatch (router)", meta="GPT-5.2",
+            detail="planning dispatch (router)", meta=_ROUTER_LABEL,
         )
         plan = await self._route(event)
         log.info("plan.generated", primary_intent=plan["primary_intent"])
