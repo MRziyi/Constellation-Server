@@ -661,7 +661,7 @@ class CortexServer:
         self,
         twin: Twin,
         tool_agent_url: str = "ws://localhost:8889",
-        router_model: str = "meta-llama/llama-4-scout-17b-16e-instruct",
+        router_model: str = "gpt-5.2",
         use_stub_router: bool = True,
         plane: ControlPlane | None = None,
     ):

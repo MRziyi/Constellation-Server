@@ -58,13 +58,12 @@ def short_model_label(m: str) -> str:
 
 CLASSIFIER_LABEL = short_model_label(CLASSIFIER_MODEL)
 
-# Two-pass planner (selector + planner) on the simple path. Moved to Groq's
-# vision-capable Llama-4-Scout (Zack 2026-06-02): the planner gets the photo as a
-# multimodal block, so it MUST be vision-capable (gpt-oss is text-only) — and
-# Groq cuts the gpt-5.2 router's ~12s inference to ~1-2s. Routed to Groq by
-# llm_cache._resolve_endpoint; env CORTEX_ROUTER_MODEL overrides.
-ROUTER_MODEL = os.environ.get(
-    "CORTEX_ROUTER_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")
+# Two-pass planner (selector + planner) on the simple path. Tried Groq Llama-4-
+# Scout for speed (Zack 2026-06-02: router 12.6s→~1.2s) but it was too weak as a
+# planner — REVERTED to gpt-5.2: quality over the simple-path latency. gpt-5.2 is
+# multimodal (the planner reads attached photos). env CORTEX_ROUTER_MODEL
+# overrides (e.g. point it back at a Groq model to trade quality for speed).
+ROUTER_MODEL = os.environ.get("CORTEX_ROUTER_MODEL", "gpt-5.2")
 ROUTER_LABEL = short_model_label(ROUTER_MODEL)
 
 # Voice-addressable session router (which session does this turn belong to).
@@ -149,8 +148,8 @@ VISION_DETAIL_PATTERN = re.compile(
 
 # ── Model override (deterministic path pin) ────────────────────────────────
 # Zack 2026-06-02: pin a path by TIER, not by model name. The primary triggers
-# are now 「简单模型」 → the simple/fast path (whatever it runs — Groq Llama today,
-# something else tomorrow) and 「复杂模型」 → the complex Claude-agent line. These
+# are now 「简单模型」 → the simple/fast path (whatever model it runs — gpt-5.2
+# today, anything tomorrow) and 「复杂模型」 → the complex Claude-agent line. These
 # are robust common Chinese words (Whisper transcribes them reliably), so the
 # wearer no longer has to say a brittle model name and dodge STT typos like
 # "gbt"/"cloud". The legacy model-name triggers still work for muscle memory:
