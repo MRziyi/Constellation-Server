@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from typing import Any
 
 import structlog
@@ -378,6 +379,14 @@ class SdkAgentSession:
             SystemMessage, TextBlock, ThinkingBlock, ToolUseBlock, ToolResultBlock,
         )
 
+        # NOTE (Zack 2026-06-02): token-level StreamEvent streaming was tried and
+        # REVERTED — char-by-char updates of growing text relayout the HUD card
+        # every ~350ms, which over BT-PAN + single-sender + Compose relayout reads
+        # as jank ("会卡"). White-box is preserved by (a) the honest phase labels
+        # in _drain (no frozen "dispatching" window) and (b) the block-level
+        # 💬/🔧/✓ updates below (chunked, not char-by-char). StreamEvent partials
+        # are now ignored here (only timed in _drain for diagnostics).
+
         if isinstance(msg, SystemMessage):
             sid = (msg.data or {}).get("session_id") if isinstance(msg.data, dict) else None
             if sid:
@@ -561,6 +570,10 @@ class SdkAgentSession:
         # 2026-05-30). The client also keeps the session alive for
         # interrupt()=kill and multi-turn modify (Phase 2); receive_response()
         # ends right after the ResultMessage, so there's no early-close race.
+        # Latency instrumentation (Zack 2026-06-02): split the agent phase into
+        # connect(spawn) / query / first-token / generation so we optimize the real
+        # dominant piece instead of guessing. Logged as sdk_agent.timing.
+        _t0 = time.monotonic()
         client = ClaudeSDKClient(options=opts)
         self._client = client
         # Register so a kill decision can interrupt this in-flight turn.
@@ -571,6 +584,8 @@ class SdkAgentSession:
         try:
             async def _drain() -> dict[str, Any] | None:
                 await client.connect()
+                log.info("sdk_agent.timing", phase="connected",
+                         ms=int((time.monotonic() - _t0) * 1000))
                 # Opening turn: if a photo came with this dispatch (and we're not
                 # resuming a prior session), send the brief + image as a single
                 # multimodal user message so Claude SEES the photo. Otherwise the
@@ -580,9 +595,38 @@ class SdkAgentSession:
                     await client.query(self._opening_message_with_image())
                 else:
                     await client.query(self.brief)
+                log.info("sdk_agent.timing", phase="query_sent",
+                         ms=int((time.monotonic() - _t0) * 1000),
+                         has_image=bool(self.image_b64),
+                         img_kb=(len(self.image_b64) * 3 // 4 // 1024) if self.image_b64 else 0)
+                # White-box (Zack 2026-06-02): the ~10s of session-init + reading
+                # the photo + first token was a FROZEN "🤖 dispatching agent". Name
+                # what Claude is actually doing so no window is a black box; the
+                # streamed tokens (StreamEvent handler) take over the moment Claude
+                # emits its first content.
+                if self.image_b64 and not self.resume_session_id:
+                    await self._progress("agent_reading_photo", "📷",
+                                         "Claude is reading the photo…")
+                else:
+                    await self._progress("agent_first_token", "💭",
+                                         "Claude is thinking…")
+                _seen_types: set[str] = set()
+                _n = 0
                 async for msg in client.receive_response():
+                    _n += 1
+                    _tn = type(msg).__name__
+                    # Log the first arrival of each message TYPE (+ running count)
+                    # so the stream cadence is visible without per-delta spam:
+                    # gap to the first msg = connect→first-token; gaps between
+                    # types localize where the ~20s actually sits.
+                    if _tn not in _seen_types:
+                        _seen_types.add(_tn)
+                        log.info("sdk_agent.timing", phase="msg", type=_tn,
+                                 ms=int((time.monotonic() - _t0) * 1000), n=_n)
                     terminal = await self._handle_message(msg)
                     if terminal is not None:
+                        log.info("sdk_agent.timing", phase="terminal",
+                                 ms=int((time.monotonic() - _t0) * 1000), n_msgs=_n)
                         return terminal
                 return None
 

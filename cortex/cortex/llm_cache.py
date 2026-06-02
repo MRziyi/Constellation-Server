@@ -108,6 +108,35 @@ def _is_retryable(exc: Exception) -> bool:
     return any(s in name or s in msg for s in transient_signals)
 
 
+# ── endpoint routing (OpenAI vs Groq, both OpenAI-compatible) ────────────────
+
+# Groq serves an OpenAI-compatible API; we use it for the small fast models
+# (e.g. the classifier on `openai/gpt-oss-120b`) so a trivial classify doesn't
+# pay GPT-5.2's ~3s latency. Detection is by model name (a Groq-only substring),
+# so callers don't have to thread a provider through.
+GROQ_BASE_URL = os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+_GROQ_MODEL_MARKERS = ("gpt-oss", "llama-3.3", "llama-3.1", "moonshotai/", "groq/")
+
+
+def _resolve_endpoint(model: str) -> tuple[str | None, str]:
+    """Map a model name → (base_url, api_key). Groq-hosted models route to Groq's
+    OpenAI-compatible endpoint with GROQ_API_KEY; everything else to OpenAI
+    (base_url None = the SDK default). Raises if the needed key is unset."""
+    m = model.lower()
+    if any(mk in m for mk in _GROQ_MODEL_MARKERS):
+        key = os.environ.get("GROQ_API_KEY")
+        if not key:
+            raise ValueError(
+                f"GROQ_API_KEY not set (required for Groq model '{model}'); "
+                f"add it to tool-agent/.env"
+            )
+        return GROQ_BASE_URL, key
+    key = os.environ.get("OPENAI_API_KEY")
+    if not key:
+        raise ValueError("OPENAI_API_KEY not set")
+    return None, key
+
+
 # ── main entry ──────────────────────────────────────────────────────────────
 
 async def cached_chat_create(
@@ -162,10 +191,9 @@ async def cached_chat_create(
 
     # 2. live call with retry
     if provider == "openai":
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if not api_key:
-            raise ValueError("OPENAI_API_KEY not set")
-        client = AsyncOpenAI(api_key=api_key)
+        base_url, api_key = _resolve_endpoint(model)
+        client = AsyncOpenAI(api_key=api_key, base_url=base_url) if base_url \
+            else AsyncOpenAI(api_key=api_key)
     else:
         raise ValueError(f"unsupported provider '{provider}' (extend cached_chat_create when needed)")
 

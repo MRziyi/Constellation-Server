@@ -32,11 +32,12 @@ import re
 # Every LLM step defaults to gpt-5.2 with an env override chain. Cortex's OpenAI
 # key is configured for it; set the env vars to point a step elsewhere.
 
-# Intent classifier (simple vs complex). Falls back to the router model.
-CLASSIFIER_MODEL = os.environ.get(
-    "CORTEX_CLASSIFIER_MODEL",
-    os.environ.get("CORTEX_ROUTER_MODEL", "gpt-5.2"),
-)
+# Intent classifier (simple vs complex). Its own FAST model, independent of the
+# router (Zack 2026-06-02): classifying {complex, effort} is trivial, so GPT-5.2's
+# ~3s on the post-approve critical path was wasteful. Default = Groq's
+# `openai/gpt-oss-120b` (sub-second on Groq's LPUs); routed to Groq automatically
+# by llm_cache._resolve_endpoint. Needs GROQ_API_KEY in tool-agent/.env.
+CLASSIFIER_MODEL = os.environ.get("CORTEX_CLASSIFIER_MODEL", "openai/gpt-oss-120b")
 
 # Two-pass planner (selector + planner) on the simple path.
 ROUTER_MODEL = "gpt-5.2"
