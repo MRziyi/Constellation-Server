@@ -818,12 +818,18 @@ class CortexServer:
         # OR to cortex.main pre-warm call). `small` for finalised utterances;
         # `tiny` for Level-2 streaming partials (faster, less accurate).
         from .whisper_pipeline import WhisperPipeline
-        self._whisper = WhisperPipeline(model="small")
+        # Persistent whisper-server ports (Zack 2026-06-02 latency pass): the final
+        # `small` pass paid ~1.5s of model-load on every audio_end (the
+        # stop-talking→STT-card critical path); a resident server skips it. Distinct
+        # ports per model → partial + final never contend. Env-overridable.
+        _ws_final = int(os.environ.get("WHISPER_SERVER_PORT_SMALL", "8772"))
+        _ws_partial = int(os.environ.get("WHISPER_SERVER_PORT_BASE", "8771"))
+        self._whisper = WhisperPipeline(model="small", server_port=_ws_final)
         # `base` for partials — ~2-3× faster than `small`, accuracy on short
         # in-flight audio is "good enough" for a streaming preview. Switch to
         # `tiny` if base proves too slow; download with:
         #   bash whisper.cpp/models/download-ggml-model.sh tiny
-        self._whisper_partial = WhisperPipeline(model="base")
+        self._whisper_partial = WhisperPipeline(model="base", server_port=_ws_partial)
         # Per-stream guard: while a partial transcription is in flight, skip
         # new partial triggers for that stream so we don't pile up subprocess
         # invocations.
