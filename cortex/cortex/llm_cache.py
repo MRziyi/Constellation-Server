@@ -37,6 +37,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+import httpx
 import structlog
 from diskcache import Cache
 from json_repair import repair_json
@@ -137,6 +138,44 @@ def _resolve_endpoint(model: str) -> tuple[str | None, str]:
     return None, key
 
 
+# ── persistent (warm) clients ────────────────────────────────────────────────
+# Reuse ONE AsyncOpenAI per endpoint so the TLS/HTTP keep-alive connection stays
+# warm across calls. A fresh client per call (the old code) paid a cold TLS
+# handshake to the provider EVERY time — that was most of the classifier's
+# cold-vs-warm gap (~2.4s cold vs ~1.0s warm on Groq). Server perf isn't a
+# concern (Zack 2026-06-02), so a long keepalive keeps the socket hot between
+# sparse turns. Reset on key change (so a rotated GROQ_API_KEY is picked up).
+_CLIENTS: dict[str, tuple[str, AsyncOpenAI]] = {}
+
+
+def _client_for(base_url: str | None, api_key: str) -> AsyncOpenAI:
+    cache_key = base_url or "openai"
+    cached = _CLIENTS.get(cache_key)
+    if cached is not None and cached[0] == api_key:
+        return cached[1]
+    http_client = httpx.AsyncClient(
+        limits=httpx.Limits(max_keepalive_connections=4, keepalive_expiry=600.0),
+        timeout=httpx.Timeout(60.0, connect=10.0),
+    )
+    client = (AsyncOpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
+              if base_url else AsyncOpenAI(api_key=api_key, http_client=http_client))
+    _CLIENTS[cache_key] = (api_key, client)
+    return client
+
+
+async def prewarm_model(model: str) -> None:
+    """Open the endpoint's TLS/keep-alive connection at startup so the FIRST real
+    call isn't cold. Best-effort, no inference (just lists models). Called from
+    cortex.main alongside the whisper/face prewarms."""
+    try:
+        base_url, api_key = _resolve_endpoint(model)
+        client = _client_for(base_url, api_key)
+        await client.models.list()
+        log.info("llm.prewarm.done", model=model, endpoint=base_url or "openai")
+    except Exception as e:
+        log.warning("llm.prewarm.failed", model=model, error=str(e))
+
+
 # ── main entry ──────────────────────────────────────────────────────────────
 
 async def cached_chat_create(
@@ -192,8 +231,7 @@ async def cached_chat_create(
     # 2. live call with retry
     if provider == "openai":
         base_url, api_key = _resolve_endpoint(model)
-        client = AsyncOpenAI(api_key=api_key, base_url=base_url) if base_url \
-            else AsyncOpenAI(api_key=api_key)
+        client = _client_for(base_url, api_key)   # persistent, warm keep-alive
     else:
         raise ValueError(f"unsupported provider '{provider}' (extend cached_chat_create when needed)")
 

@@ -181,6 +181,17 @@ def cli(
         except Exception as e:
             log.warning("face.prewarm.failed", error=str(e))
 
+    async def _prewarm_llm() -> None:
+        """Open the classifier endpoint's TLS/keep-alive connection at startup so
+        the first classify isn't cold (Zack 2026-06-02: Groq's ~2.4s cold-connect
+        vs ~1.0s warm was a fresh-socket-per-call penalty). Best-effort."""
+        try:
+            from cortex.llm_cache import prewarm_model
+            from cortex.prompts import CLASSIFIER_MODEL
+            await prewarm_model(CLASSIFIER_MODEL)
+        except Exception as e:
+            log.warning("llm.prewarm.skipped", error=str(e))
+
     async def main() -> None:
         await asyncio.gather(
             serve(
@@ -195,6 +206,7 @@ def cli(
             serve_http(host=http_bind, port=http_port, plane=plane),
             _prewarm_whisper(),
             _prewarm_face(),
+            _prewarm_llm(),
         )
 
     asyncio.run(main())
