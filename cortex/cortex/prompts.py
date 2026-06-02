@@ -271,26 +271,38 @@ asks are LOW even when multi-step. Pick the smallest that fits:
 A long multi-STEP errand (read poster → add reminder → draft email) is still
 LOW effort — it's mechanical, just several bounded actions.
 
-complex = true  WHEN the ask needs ANY of:
-  - reading/finding/searching multiple sources (emails, files, sessions, web)
-  - composition / drafting / summarising
-  - multiple side-effect actions in one ask
-  - keywords: find / look at / search / summarise / draft / check / 看 / 找 / 起草
+DEFAULT TO SIMPLE (complex=false). Almost everything Zack does on the glasses is
+a bounded everyday task and belongs on the SIMPLE path — INCLUDING reading info
+off a photo and acting on it. Only escalate to complex=true when the ask GENUINELY
+needs the deep agent (the list below). When unsure → complex=false.
 
-complex = false WHEN it's a SINGLE explicit step:
-  - bounded reminder: "remind me to X at 3pm" (title + time both given)
-  - bounded calendar: "add a 4pm meeting with Y tomorrow"
-  - bounded message: "send 'on my way' to Mike" (recipient + content both given)
-  - pure state query: "battery?", "what time?", "focus mode?", "current tab?"
-  - bounded file write: "write 'X' to /tmp/y.txt"
+complex = false (SIMPLE) — the common case, route here by default:
+  - ONE bounded action: reminder / calendar event / message / shortcut / open app
+    ("remind me to X at 3pm", "add a 4pm meeting with Y tomorrow",
+     "send 'on my way' to Mike", "set a timer")
+  - a state read: "battery?", "what time?", "focus mode?", "current tab?"
+  - READING info off an attached photo and doing ONE bounded action with it —
+    EVEN if several fields must be read off the image:
+      · "拿这张海报上的活动信息加个 reminder / 加到日历"  (read the event's
+         title/time/place → add the reminder / calendar entry)
+      · "add a reminder for the time on this"  ·  "记下这牌子上的电话发给 Mike"
+    The simple path SEES the photo, reads what it needs, and plans the one action.
+    This is the COMMON vision case — keep it SIMPLE.
 
-A photo may be attached ("Note: photo attached."). It does NOT change this
-decision — classify on the TASK, not the photo: a bounded one-step ask is simple
-even with a photo ("add a reminder for the time in this photo", "what is this");
-a multi-step / compose / persist-to-twin ask is complex.
+complex = true (COMPLEX) — ONLY when it genuinely needs the deep Claude agent:
+  - research / search across MULTIPLE sources (emails + files + sessions + web)
+  - real composition: drafting a substantial message/email/document, or
+    summarising / organising several things into prose
+  - persisting to the Twin: writing a memo / journal / note that becomes Zack's
+    own record (a Reminders/Calendar entry is NOT this — that's a bounded action)
+  - genuinely multi-step work needing mid-task judgment or chained reasoning
+  - hard reasoning: analyse / architect / debug / weigh trade-offs
+  - open-ended "describe / explain / what's going on here" about a photo (vision
+    understanding, vs. just reading a value off it)
 
-When ambiguous, prefer complex=true — the agent path can degrade to a single
-action; the direct path can't escalate to research.
+A photo ("Note: photo attached.") does NOT push toward complex — classify on the
+TASK. Reading a photo to FILL ONE action is SIMPLE; only compose / multi-source /
+persist-to-Twin / open-ended-understanding is complex. When in doubt, SIMPLE.
 
 JSON ONLY. No fence. No prose.
 """
