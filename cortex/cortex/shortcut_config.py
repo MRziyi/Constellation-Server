@@ -92,6 +92,14 @@ async def parse_shortcut_config(text: str) -> dict[str, Any] | None:
             log.warning("shortcut_config.empty_prompt", slot=slot)
             return None
         send_photo = bool(parsed.get("send_photo", False))
+        # People-Recall (Zack 2026-06-01): a slot can carry a face MODE.
+        # face_recall = recognize who's in front; enroll_person = remember a new
+        # person. Both always take a photo. Anything else → "task" (normal).
+        mode = str(parsed.get("mode") or "task").strip()
+        if mode not in ("task", "face_recall", "enroll_person"):
+            mode = "task"
+        if mode in ("face_recall", "enroll_person"):
+            send_photo = True
         label = str(parsed.get("label") or "").strip()[:40] or prompt[:24]
         # Capture TIER (Zack 2026-05-31): when a photo-bearing slot fires, the
         # glasses capture at this tier. Deterministic — infer from the wording
@@ -105,6 +113,7 @@ async def parse_shortcut_config(text: str) -> dict[str, Any] | None:
             "send_photo": send_photo,
             "label": label,
             "tier": tier,
+            "mode": mode,
         }
         log.info("shortcut_config.parsed", **result)
         return result

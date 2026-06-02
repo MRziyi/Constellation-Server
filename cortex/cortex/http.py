@@ -295,6 +295,9 @@ def make_app(plane: ControlPlane) -> web.Application:
             payload["image"] = image
         if session_id:
             payload["session_id"] = session_id
+        mode = body.get("mode")  # People-Recall: face_recall | enroll_person
+        if mode:
+            payload["mode"] = mode
         event = Event(
             id=ids.event_id(),
             kind="user_invoke",
@@ -409,6 +412,62 @@ def make_app(plane: ControlPlane) -> web.Application:
             "bytes_b64": len(img) if img else 0,
             "elapsed_s": round(loop.time() - t0, 2),
         })
+
+    async def dev_face_recall(request: web.Request) -> web.Response:
+        """People-Recall: run a deterministic face match directly (no glass, no
+        LLM) and return the result synchronously. POST {image: <base64 jpeg>}.
+        Used to verify the engine + gallery wiring offline. The real glass path
+        goes through /api/test/invoke with mode=face_recall."""
+        if plane.server is None:
+            return _err("server not bound", 503)
+        fi = getattr(plane.server, "face_index", None)
+        if fi is None or not fi.available():
+            return _err("face index unavailable (deps not installed?)", 503)
+        body = await request.json()
+        img_b64 = body.get("image")
+        if not img_b64:
+            return _err("image (base64 jpeg) required")
+        import base64 as _b64
+        try:
+            img = _b64.b64decode(img_b64)
+        except Exception as e:
+            return _err(f"bad base64: {e}")
+        entry, score = await asyncio.get_event_loop().run_in_executor(
+            None, fi.match, img)
+        return _json({
+            "ok": True,
+            "match": entry,            # None if no match / no face
+            "score": round(float(score), 4),
+            "no_face": score < 0,
+            "gallery_size": len(fi._entries),
+        })
+
+    async def dev_face_enroll(request: web.Request) -> web.Response:
+        """People-Recall dev: enroll a face directly into the gallery (skips the
+        voice/STT bio). POST {image, name, recall?, slug?}. For seeding a test
+        gallery offline; the real path is the enroll shortcut + spoken bio."""
+        if plane.server is None:
+            return _err("server not bound", 503)
+        fi = getattr(plane.server, "face_index", None)
+        if fi is None or not fi.available():
+            return _err("face index unavailable", 503)
+        body = await request.json()
+        img_b64 = body.get("image")
+        name = (body.get("name") or "").strip()
+        if not img_b64 or not name:
+            return _err("image + name required")
+        from .enroll_parser import slugify
+        slug = (body.get("slug") or slugify(name)).strip()
+        recall = (body.get("recall") or name).strip()
+        import base64 as _b64
+        img = _b64.b64decode(img_b64)
+        entry = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: fi.enroll(
+                img, slug=slug, name=name, recall=recall,
+                profile_relpath=f"people/encounters/{slug}.md"))
+        if entry is None:
+            return _err("no face detected in image", 422)
+        return _json({"ok": True, "entry": entry, "gallery_size": len(fi._entries)})
 
     async def dev_insight_tick(request: web.Request) -> web.Response:
         """Force one tick of the Insight Engine, bypassing cron schedule
@@ -669,6 +728,8 @@ def make_app(plane: ControlPlane) -> web.Application:
     app.router.add_post("/api/dev/agent_invoke", dev_agent_invoke)
     app.router.add_post("/api/dev/distill_now", dev_distill_now)
     app.router.add_post("/api/dev/capture_image", dev_capture_image)
+    app.router.add_post("/api/dev/face_recall", dev_face_recall)
+    app.router.add_post("/api/dev/face_enroll", dev_face_enroll)
     app.router.add_post("/api/dev/insight_tick", dev_insight_tick)
     app.router.add_get("/api/trace/stream", trace_stream)
 

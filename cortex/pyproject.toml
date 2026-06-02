@@ -15,6 +15,12 @@ dependencies = [
     "diskcache>=5.6",      # persistent LLM response cache
     "json-repair>=0.30",   # tolerant JSON parsing from LLM outputs
     "claude-agent-sdk>=0.2.87",  # P1 — in-process single-source CC agent (behind USE_SDK_AGENT)
+    # People-Recall (Zack 2026-06-01) — on-device face recognition (in-process,
+    # CoreML EP on Apple Silicon). insightface = SCRFD detect + ArcFace embed.
+    "insightface>=0.7",
+    "onnxruntime>=1.20",   # CoreMLExecutionProvider on macOS arm64
+    "opencv-python>=4.9",
+    "numpy>=1.26",
 ]
 
 [project.scripts]

@@ -24,7 +24,6 @@ from typing import Any
 
 import structlog
 
-from .prompts import WHISPER_ZH_PROMPT as ZH_PROMPT
 
 log = structlog.get_logger(__name__)
 
@@ -86,12 +85,11 @@ class WhisperPipeline:
                 "-nt", "-np",            # no timestamps, no progress
                 "-f", str(wav_path),
             ]
-            if lang == "zh":
-                args += ["-l", "zh", "--prompt", ZH_PROMPT]
-            elif lang in ("en", "auto"):
-                args += ["-l", lang]
-            else:
-                args += ["-l", lang]
+            # NEVER force/bias a language (Zack 2026-06-01: spoke English, got
+            # Chinese — a forced/biased language is wrong). Always `-l auto` so
+            # whisper detects what was actually spoken. (`lang` is kept in the
+            # signature for callers but no longer pins the decoder.)
+            args += ["-l", "auto"]
 
             log.info("whisper.transcribe.start",
                      bytes=len(pcm_bytes), lang=lang, model=self.model)

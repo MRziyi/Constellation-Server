@@ -54,6 +54,15 @@ SHORTCUT_PARSER_MODEL = os.environ.get(
     os.environ.get("CORTEX_ROUTER_MODEL", "gpt-5.2"),
 )
 
+# People-Recall enroll-bio parser (Zack 2026-06-01): turns a freeform spoken
+# bio ("this is Jackie, CHI'26, MIT Media Lab, XR storytelling for K12") into a
+# structured person record. Same cheap model as the classifier — this is a
+# one-shot structuring call, not an agent.
+ENROLL_PARSER_MODEL = os.environ.get(
+    "CORTEX_CLASSIFIER_MODEL",
+    os.environ.get("CORTEX_ROUTER_MODEL", "gpt-5.2"),
+)
+
 # Complex-agent (Claude via the Agent SDK / `claude` CLI). Dispatch picks the
 # model + effort TOGETHER from the classifier's effort judgment (Zack 2026-06-01):
 # shallow reasoning → FAST model (Sonnet) + low effort; deep reasoning ("design a
@@ -397,7 +406,7 @@ edits a slot — extract what it should become. The slot, when later fired,
 sends a PRESET PROMPT to the assistant (optionally with a photo attached).
 
 Output JSON ONLY:
-{"slot": 1|2|3, "prompt": "<the preset prompt to send when fired>", "send_photo": true|false, "label": "<≤4-word name>"}
+{"slot": 1|2|3, "prompt": "<the preset prompt to send when fired>", "send_photo": true|false, "label": "<≤4-word name>", "mode": "task"|"face_recall"|"enroll_person"}
 
 Rules:
 - `slot`: the slot number the user named (1, 2, or 3).
@@ -408,7 +417,38 @@ Rules:
   user says to send/attach a photo, OR when the prompt inherently needs to see
   the scene (what's in front, read this, identify this). Else false.
 - `label`: a short human name for the slot (≤4 words), derived from the prompt.
+- `mode`: the People-Recall behaviour for this slot.
+  - "face_recall": the slot RECOGNIZES the person in front of you ("who is
+    this", "recognize people", "认人", "这是谁") — a local face match.
+  - "enroll_person": the slot REMEMBERS a new person you just met ("remember
+    this person", "记住这个人/这位") — captures their face + you say who they are.
+  - "task" (default): anything else (the normal preset-prompt behaviour).
+  For "face_recall"/"enroll_person", a photo is always taken (send_photo=true).
 - Preserve the user's language for `prompt` + `label` (Chinese in → Chinese out).
+
+JSON ONLY. No fence. No prose.
+"""
+
+
+# People-Recall: structure a spoken bio into a person record for the Digital
+# Twin. `recall` is the one-line reminder rendered on the recall card when this
+# person is later recognized — make it dense + glanceable (event · org · work).
+ENROLL_PARSER_SYSTEM = """\
+You turn the user's spoken note about a person they just met into a structured
+record for their contacts. The user said something like: "this is Jackie, we met
+at CHI 26, he's from MIT Media Lab, doing XR storytelling for K12 education."
+
+Output JSON ONLY:
+{"name": "<full name>", "aliases": ["<other names they go by>"], "org": "<company/lab/school or ''>", "role": "<title/role or ''>", "met_at": "<event/place/when they met, e.g. 'CHI 2026' or ''>", "research": "<what they work on / are known for, or ''>", "recall": "<≤12-word dense one-line reminder>", "notes": "<any extra detail worth keeping, or ''>"}
+
+Rules:
+- `name`: the person's name. If unsure, use your best guess from the audio.
+- `recall`: a tight, glanceable reminder the user will read when they see this
+  person again — pack the most jog-the-memory facts: where/when met · org ·
+  what they do. E.g. "CHI'26 · MIT Media Lab · XR storytelling for K12".
+- Leave a field as "" (or [] for aliases) when the user didn't say it. Never
+  invent facts not in the utterance.
+- Preserve the user's language for free-text fields.
 
 JSON ONLY. No fence. No prose.
 """

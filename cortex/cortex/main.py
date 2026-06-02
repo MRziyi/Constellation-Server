@@ -166,6 +166,21 @@ def cli(
             except Exception as e:
                 log.warning("whisper.prewarm_partial.failed", error=str(e))
 
+    async def _prewarm_face() -> None:
+        """People-Recall (Zack 2026-06-01): preload the InsightFace model so the
+        first recall doesn't pay the multi-second model-load tax. Off the event
+        loop (CPU/model load is blocking); non-fatal if deps/model are missing."""
+        await asyncio.sleep(3.0)  # after serve() binds; let whisper warm first
+        srv = plane.server
+        fi = getattr(srv, "face_index", None) if srv else None
+        if fi is None or not fi.available():
+            log.info("face.prewarm.skipped")
+            return
+        try:
+            await asyncio.to_thread(fi.warm)
+        except Exception as e:
+            log.warning("face.prewarm.failed", error=str(e))
+
     async def main() -> None:
         await asyncio.gather(
             serve(
@@ -179,6 +194,7 @@ def cli(
             ),
             serve_http(host=http_bind, port=http_port, plane=plane),
             _prewarm_whisper(),
+            _prewarm_face(),
         )
 
     asyncio.run(main())

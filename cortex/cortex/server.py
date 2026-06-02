@@ -238,11 +238,17 @@ def _render_actions_preview(actions: list[dict[str, Any]], summary: str | None =
         icon = _ACTION_ICONS.get(t, "·")
         if t == "email":
             who = a.get("to") or "(reply)"
+            if isinstance(who, list):
+                who = ", ".join(str(x) for x in who)
             subj = a.get("subject") or "(no subject)"
-            body_snip = (a.get("body") or "")[:140].replace("\n", " ⏎ ")
+            # FULL body — no truncation (Zack 2026-06-02). The send-confirmation
+            # must show the WHOLE email (To/Subject/Body); the glass card
+            # scrolls to fit. The old [:140]+`…` hid the body behind an ellipsis.
+            body_full = (a.get("body") or "").strip() or "(empty)"
             lines.append(f"**{i}. {icon} email → {who}**")
-            lines.append(f"   *{subj}*")
-            lines.append(f"   {body_snip}{'…' if len(a.get('body') or '') > 140 else ''}")
+            lines.append(f"   **Subject:** {subj}")
+            lines.append("   **Body:**")
+            lines.append(body_full)
         elif t == "reminder":
             title = a.get("title", "?")
             due = a.get("due_iso", "no time")
@@ -380,6 +386,54 @@ def _card_type_for(options: list[str]) -> str:
     if low == ["answer"]:
         return "question"
     return "checkpoint"
+
+
+# Full glass capability set — the fallback when a (re)connect arrives with no
+# `?accept=` query, so frames are never silently dropped to a bare reconnect.
+_DEFAULT_GLASS_ACCEPT = frozenset({
+    "card", "hud_state", "insight", "mic_open", "mic_close",
+    "request_image", "satellite_card", "shortcut_config",
+})
+
+
+def _render_person_md(rec: dict[str, Any], transcript: str) -> str:
+    """People-Recall: render a structured person record into a Twin markdown
+    file (same frontmatter+body shape as people/core/*.md). Keeps the verbatim
+    spoken note as provenance; `recall` is the one-line the recall card shows."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    aliases = ", ".join(rec.get("aliases") or [])
+    fm = [
+        "---",
+        f"aliases: [{aliases}]" if aliases else "aliases: []",
+        f"relation: met at {rec['met_at']}" if rec.get("met_at") else "relation: encounter",
+    ]
+    if rec.get("org"):
+        fm.append(f"org: {rec['org']}")
+    if rec.get("met_at"):
+        fm.append(f"met_at: {rec['met_at']}")
+    fm += [
+        f"recall: {rec['recall']}",
+        f"face: ../_faces/{rec['slug']}.jpg",
+        "source: face-enroll",
+        f"enrolled: {today}",
+        "---",
+        "",
+        f"# {rec['name']}",
+        "",
+    ]
+    body: list[str] = []
+    if rec.get("role") or rec.get("org"):
+        body.append("## Basic")
+        line = " · ".join(x for x in (rec.get("role"), rec.get("org")) if x)
+        body += [f"- {line}", ""]
+    if rec.get("met_at"):
+        body += ["## How we met", rec["met_at"], ""]
+    if rec.get("research"):
+        body += ["## Research", rec["research"], ""]
+    if rec.get("notes"):
+        body += ["## Notes", rec["notes"], ""]
+    body += [f"> Spoken note (verbatim): \"{transcript.strip()}\"", ""]
+    return "\n".join(fm + body)
 
 
 _TWIN_MEMO_ASSETS = os.path.expanduser("~/constellation/twin/memos/assets")
@@ -741,6 +795,15 @@ class CortexServer:
         from .distiller import Distiller
         self.distiller = Distiller(self)
 
+        # People-Recall (Zack 2026-06-01): on-device face-recognition gallery.
+        # In-process + deterministic so RECALL (the latency-critical hot path)
+        # is a local face match — no LLM, no IPC, bypasses the classifier. Source
+        # of truth = people/encounters/*.md; the engine keeps a derived embedding
+        # index under people/_faces/. Constructed cheap (reads the index json);
+        # the model is warmed by a startup task (main._prewarm_face).
+        from .face_index import FaceIndex
+        self.face_index = FaceIndex(twin.root / "people")
+
         # Parse confirm-policies once at construction; reload on Twin write later (Phase 7).
         self._confirm_policies = _parse_confirm_policies(twin.root)
 
@@ -811,7 +874,18 @@ class CortexServer:
                 accept_kinds = {k.strip() for k in accept_param.split(",") if k.strip()}
         except Exception as e:
             log.warning("glass.capabilities_parse_failed", error=str(e))
-        log.info("glass.connected", remote=ws.remote_address, accept=sorted(accept_kinds))
+        # Resilience (Zack 2026-06-01): a BT-PAN reconnect sometimes lands WITHOUT
+        # the `?accept=` query (empty set) — and an empty accept made `_emit_glass_frame`
+        # SILENTLY DROP every card/hud_state/etc., stranding the wearer (e.g. stuck on
+        # "Transcribing…" when a review card was dropped). The only real WSS client is
+        # the glass, so an empty accept = a reconnect that lost its query → default to
+        # the full glass capability set rather than dropping its frames.
+        defaulted = False
+        if not accept_kinds:
+            accept_kinds = set(_DEFAULT_GLASS_ACCEPT)
+            defaulted = True
+        log.info("glass.connected", remote=ws.remote_address,
+                 accept=sorted(accept_kinds), defaulted=defaulted)
         self._glass_conn = ws
         self._glass_accept = accept_kinds
         # Spin up the single ordered sender for THIS connection — the only
@@ -854,6 +928,24 @@ class CortexServer:
             except Exception as e:
                 log.warning("startup_card.send_failed", error=str(e))
             self._pending_startup_card = None
+        # Recover a decision card lost to a mid-flight drop (Zack 2026-06-01): a
+        # BT-PAN drop right after a review card was emitted strands the wearer on
+        # the local "Transcribing…" loading screen forever (the real card went to a
+        # dead socket). On (re)connect, re-emit the most-recent pending STT-review so
+        # the loading screen gets replaced by the real, actionable card.
+        if self._pending_stt_review:
+            try:
+                review_cmd_id, stt = next(reversed(self._pending_stt_review.items()))
+                tx = (stt.get("transcript") or "").strip()
+                await self.emit_card(
+                    cmd_id=review_cmd_id, title="STT review",
+                    body_md=tx or "没听清 —— 长按重讲",
+                    options=["approve", "modify"],
+                    card_type="stt_review", source="Whisper", ttl_ms=120_000,
+                )
+                log.info("stt_review.redelivered", review_cmd_id=review_cmd_id, n_chars=len(tx))
+            except Exception as e:
+                log.warning("stt_review.redeliver_failed", error=str(e))
         try:
             async for raw in ws:
                 # Binary frames carry raw image bytes (the glass→cortex photo
@@ -1189,22 +1281,27 @@ class CortexServer:
             # fresh stream. The decoupled satellite card shows its own progress; the
             # photo is held un-processed and only reaches a model if the prompt is
             # approved (C-69). Fresh streams only (modify/answer feed an existing flow).
+            # `enroll_` streams (People-Recall): ALWAYS capture the person's face —
+            # the enroll shortcut reuses this voice flow, and the face is the point,
+            # so fire regardless of the words (no vision-cue keyword needed).
+            is_enroll = stream_id.startswith("enroll_")
             if (
-                stream_id.startswith("fresh_")
+                (is_enroll or (stream_id.startswith("fresh_") and _looks_visual_intent(text)))
                 and stream_id not in self._stream_speculative
                 and self._glass_conn and "card" in self._glass_accept
-                and _looks_visual_intent(text)
             ):
-                tier = _vision_tier_for(text)
+                tier = "standard" if is_enroll else _vision_tier_for(text)
                 sent = await self._send_image_request(
-                    parent_event_id=stream_id, hint="scene in front", tier=tier)
+                    parent_event_id=stream_id,
+                    hint="face to remember" if is_enroll else "scene in front", tier=tier)
                 if sent is not None:
                     req_id, fut = sent
                     self._stream_speculative[stream_id] = {"req_id": req_id, "fut": fut, "tier": tier}
                     self._satellite_active[req_id] = tier
                     await self._emit_satellite(
                         stage="capturing",
-                        detail="capturing hi-res photo…" if tier == "detail" else "capturing photo…")
+                        detail="capturing face…" if is_enroll else (
+                            "capturing hi-res photo…" if tier == "detail" else "capturing photo…"))
                     log.info("vision.speculative_capture_streaming",
                              stream_id=stream_id, req_id=req_id, tier=tier)
         except Exception as e:
@@ -1250,6 +1347,11 @@ class CortexServer:
             intent, cmd_id = "modify", cmd_id or sid[len("modify_"):]
         elif sid.startswith("answer_"):
             intent, cmd_id = "answer", cmd_id or sid[len("answer_"):]
+        elif sid.startswith("enroll_"):
+            # People-Recall enroll bio: the mic was opened FOR a pending face
+            # enrollment (_handle_enroll_start). The captured face is stashed in
+            # _pending_enroll[sid]; the bio still passes the STT-review gate.
+            intent = "enroll"
 
         # Bridge: announce we're transcribing (Glass keeps HUD in THINKING
         # while we crunch). Reuses the existing progress channel.
@@ -1314,26 +1416,28 @@ class CortexServer:
             "lang_hint": lang_hint,
         }
         # 视觉抢拍 (Zack 2026-06-01): the capture was most likely ALREADY fired during
-        # streaming (_run_partial, the instant the cue was heard) — carry that here.
-        # Fallback: a very short utterance may end before any partial caught the cue
-        # → fire now. Either way the status lives on the DECOUPLED satellite card
-        # (not this card body); the image is held un-processed and reaches a model
-        # ONLY on approve (C-69). Non-approve cancels it; a frame that still lands is
-        # archived (C-82), never used. Fresh intent only.
+        # streaming (_run_partial, the instant the cue was heard — or unconditionally
+        # for an enroll stream) — carry that here. Fallback: a very short utterance may
+        # end before any partial fired → fire now. Either way the status lives on the
+        # DECOUPLED satellite card (not this card body); the image is held un-processed
+        # and reaches a model/match ONLY on approve (C-69). Non-approve cancels it; a
+        # frame that still lands is archived (C-82), never used.
         spec = self._stream_speculative.pop(sid, None)
-        if spec is None and (
-            intent == "fresh" and self._glass_conn
-            and "card" in self._glass_accept and _looks_visual_intent(transcript)
+        if spec is None and self._glass_conn and "card" in self._glass_accept and (
+            intent == "enroll"
+            or (intent == "fresh" and _looks_visual_intent(transcript))
         ):
-            tier = _vision_tier_for(transcript)
+            tier = "standard" if intent == "enroll" else _vision_tier_for(transcript)
             sent = await self._send_image_request(
-                parent_event_id=sid, hint="scene in front", tier=tier)
+                parent_event_id=sid,
+                hint="face to remember" if intent == "enroll" else "scene in front", tier=tier)
             if sent is not None:
                 spec = {"req_id": sent[0], "fut": sent[1], "tier": tier}
                 self._satellite_active[sent[0]] = tier
                 await self._emit_satellite(
                     stage="capturing",
-                    detail="capturing hi-res photo…" if tier == "detail" else "capturing photo…")
+                    detail="capturing face…" if intent == "enroll" else (
+                        "capturing hi-res photo…" if tier == "detail" else "capturing photo…"))
         if spec is not None:
             self._pending_stt_review[review_cmd_id]["spec_req_id"] = spec["req_id"]
             self._pending_stt_review[review_cmd_id]["spec_image_fut"] = spec["fut"]
@@ -1382,6 +1486,26 @@ class CortexServer:
                          "feedback_text": transcript},
             )
             await self._handle_user_decision(synth)
+        elif intent == "enroll":
+            # People-Recall: the bio is approved → await the face captured in
+            # parallel (spec future — same mechanism as the fresh+vision flow) →
+            # write the record + embed. C-69 holds: the photo only reaches the
+            # store on approve; a non-approve cancels it (archived, never used).
+            img = None
+            fut = stt.get("spec_image_fut")
+            if fut is not None:
+                await self._emit_progress_to_glass(
+                    parent_event_id=ids.event_id(), stage="waiting_photo", icon="⏳",
+                    detail="waiting for the photo…")
+                img = await self._await_image_request(stt.get("spec_req_id"), fut)
+            if not img:
+                log.warning("enroll.approved_no_face")
+                await self._emit_info_card(
+                    event_id=ids.event_id(), title="Couldn't save",
+                    body="Didn't catch a photo of their face — try the remember shortcut again.",
+                    ttl_ms=8_000)
+                return
+            await self._handle_enroll_person(transcript, img)
         else:
             synth = Event(
                 id=ids.event_id(), kind="user_invoke",
@@ -1421,6 +1545,10 @@ class CortexServer:
             await self.emit_mic_open(stream_id=f"modify_{orig}", ttl_ms=30_000)
         elif intent == "answer" and orig:
             await self.emit_mic_open(stream_id=f"answer_{orig}", ttl_ms=30_000)
+        elif intent == "enroll":
+            # Re-open a fresh enroll mic; _run_partial re-captures the face for it.
+            await self.emit_mic_open(
+                stream_id=f"enroll_{ids.event_id()[4:]}", ttl_ms=30_000)
         else:
             await self.emit_mic_open(stream_id=f"fresh_{ids.event_id()[4:]}", ttl_ms=30_000)
 
@@ -1987,11 +2115,12 @@ class CortexServer:
             "send_photo": cfg["send_photo"],
             "label": cfg["label"],
             "tier": cfg["tier"],   # capture tier for photo-bearing fires
+            "mode": cfg["mode"],   # People-Recall: task | face_recall | enroll_person
         })
         log.info(
             "shortcut_config.emitted",
             slot=cfg["slot"], send_photo=cfg["send_photo"], label=cfg["label"],
-            tier=cfg["tier"],
+            tier=cfg["tier"], mode=cfg["mode"],
         )
         photo = "📷 + " if cfg["send_photo"] else ""
         await self._emit_info_card(
@@ -2000,6 +2129,134 @@ class CortexServer:
             body=f"{photo}\"{cfg['prompt']}\"",
             ttl_ms=6_000,
         )
+
+    # ── People-Recall (Zack 2026-06-01) ──────────────────────────────────────
+    async def _handle_face_recall(self, event: Event) -> None:
+        """RECALL: deterministic local match → an info card with the blurb stored
+        at enroll time. NO LLM in the hot path (C-77 biometric retrieval, not
+        image→text; C-69 not tripped — a private local lookup). WHITE-BOX (C-87):
+        EVERY stage drives the MAIN HUD progress instantly — capturing → receiving
+        → matching — so the wearer always sees what it's doing, never a dead screen.
+        """
+        # Instant white-box the MOMENT the request lands — BEFORE the camera/match
+        # round-trip (C-87). Main HUD, not just the satellite sub-card.
+        await self._emit_progress_to_glass(
+            parent_event_id=event.id, stage="recognizing", icon="🔍",
+            detail="recognizing — looking for a face…", meta="Face recall")
+        if not self.face_index.available():
+            await self._emit_info_card(
+                event_id=event.id, title="Face recall offline",
+                body="The on-device face model isn't ready yet.", ttl_ms=6_000)
+            return
+        payload = event.payload or {}
+        img_b64 = payload.get("image")
+        if not img_b64:
+            # Server-pull the face. Main HUD says it's capturing; the satellite
+            # sub-card shows the live KB transfer (reuses the vision-flow machinery).
+            await self._emit_progress_to_glass(
+                parent_event_id=event.id, stage="capturing", icon="📷",
+                detail="capturing the photo on your glasses…", meta="Face recall")
+            sent = await self._send_image_request(
+                parent_event_id=event.id, hint="face to recognize", tier="standard")
+            if sent is not None:
+                req_id, fut = sent
+                self._satellite_active[req_id] = "standard"
+                await self._emit_satellite(stage="capturing", detail="capturing face…")
+                img_b64 = await self._await_image_request(req_id, fut)
+        if not img_b64:
+            await self._emit_info_card(
+                event_id=event.id, title="No photo",
+                body="Couldn't grab a photo to recognize. Try again.", ttl_ms=6_000)
+            return
+        # Photo in hand → matching. White-box on the main HUD; dismiss the capture
+        # satellite (the photo's here now).
+        await self._emit_progress_to_glass(
+            parent_event_id=event.id, stage="matching", icon="🧠",
+            detail="matching against people you know…", meta="Face recall")
+        await self._emit_satellite(stage="done", detail="", icon="🧠")
+        try:
+            import base64 as _b64
+            img_bytes = _b64.b64decode(img_b64)
+            entry, score = await asyncio.to_thread(self.face_index.match, img_bytes)
+        except Exception as e:
+            log.warning("face_recall.failed", error=str(e), exc_info=True)
+            await self._emit_satellite(stage="done", detail="", icon="🧠")
+            await self._emit_info_card(
+                event_id=event.id, title="Recall error",
+                body="Something went wrong matching that face.", ttl_ms=6_000)
+            return
+        await self._emit_satellite(stage="done", detail="", icon="🧠")
+        if entry is None:
+            if score < 0:  # sentinel: no face detected in the frame at all
+                await self._emit_info_card(
+                    event_id=event.id, title="No face found",
+                    body="Point the camera at their face and try again.", ttl_ms=6_000)
+            else:
+                await self._emit_info_card(
+                    event_id=event.id, title="No match",
+                    body="I don't have them yet. Use the *remember* shortcut to add them.",
+                    ttl_ms=8_000)
+            log.info("face_recall.miss", best_score=round(score, 3))
+            return
+        name = entry.get("name") or "Someone"
+        recall = entry.get("recall") or ""
+        # Show the match confidence as a % (Zack 2026-06-01): cosine sim → percent.
+        pct = max(0, min(100, round(score * 100)))
+        body = f"{recall}\n\n🎯 {pct}% match" if recall else f"🎯 {pct}% match"
+        await self._emit_info_card(
+            event_id=event.id, title=name, body=body,
+            source="Cortex", ttl_ms=20_000)
+        log.info("face_recall.hit", name=name, score=round(score, 3), pct=pct)
+
+    async def _handle_enroll_person(self, transcript: str, image_b64: str) -> None:
+        """ENROLL step 2 (STT-approved): structure the bio → person record +
+        embed the face. One light LLM call does prose→fields + the recall blurb;
+        the embedding is deterministic. Writes people/encounters/<slug>.md and
+        appends the face index. Source label is Cortex (deterministic local)."""
+        from .enroll_parser import parse_person
+        rec = await parse_person(transcript)
+        if rec is None:
+            await self._emit_info_card(
+                event_id=ids.event_id(), title="Couldn't save",
+                body="I didn't catch their details. Try the remember shortcut again.",
+                ttl_ms=8_000)
+            return
+        if not self.face_index.available():
+            await self._emit_info_card(
+                event_id=ids.event_id(), title="Face model offline",
+                body=f"Saved nothing — the on-device face model isn't ready.", ttl_ms=8_000)
+            return
+        slug = rec["slug"]
+        profile_rel = f"people/encounters/{slug}.md"
+        md = _render_person_md(rec, transcript)
+        try:
+            self.twin.write_new(profile_rel, md)
+        except FileExistsError:
+            self.twin.overwrite_if_no_conflict(profile_rel, md)
+        try:
+            import base64 as _b64
+            img_bytes = _b64.b64decode(image_b64)
+            entry = await asyncio.to_thread(
+                self.face_index.enroll, img_bytes,
+                slug=slug, name=rec["name"], recall=rec["recall"],
+                profile_relpath=profile_rel,
+                meta={"org": rec.get("org", ""), "met_at": rec.get("met_at", "")},
+            )
+        except Exception as e:
+            log.warning("enroll.embed_failed", slug=slug, error=str(e), exc_info=True)
+            entry = None
+        if entry is None:
+            await self._emit_info_card(
+                event_id=ids.event_id(), title="No face saved",
+                body=f"Saved {rec['name']}'s notes, but couldn't read their face — "
+                     f"re-add with a clear, front-on photo.", ttl_ms=9_000)
+            return
+        self.twin.changelog_append(
+            f"enrolled person {rec['name']}", src="face-enroll", details=[rec["recall"]])
+        await self._emit_info_card(
+            event_id=ids.event_id(), title=f"✓ Remembered {rec['name']}",
+            body=rec["recall"], source="Cortex", ttl_ms=12_000)
+        log.info("enroll.done", slug=slug, name=rec["name"])
 
     async def _handle_session_browse(
         self, event: Event, ask_text: str, sid: str | None,
@@ -2649,6 +2906,19 @@ class CortexServer:
         payload = event.payload or {}
         ask_text = (payload.get("text") or "").strip()
         existing_sid = (payload.get("session_id") or "").strip() or None
+
+        # People-Recall (Zack 2026-06-01): the RECALL shortcut fires mode=face_recall
+        # with NO upfront image — a deterministic LOCAL face match. The server pulls
+        # the photo itself (satellite progress) so feedback is instant. Bypasses the
+        # whole voice/classifier pipeline (no LLM; no STT gate — nothing is sent as
+        # Zack, it's a private lookup shown back to him). ENROLL is NOT here: it
+        # reuses the normal voice turn (an `enroll_` mic stream) so the mic opens
+        # instantly and the face is captured in parallel — see _run_partial +
+        # _route_stt_approved (intent == "enroll").
+        mode = (payload.get("mode") or "").strip()
+        if mode == "face_recall":
+            await self._handle_face_recall(event)
+            return
 
         # R-14.b / C-56: voice pin/unpin commands. Whole-utterance regex
         # ("pin this" / "unpin" / "钉住" / "保留" / etc.) — if the entire
@@ -3509,6 +3779,54 @@ class CortexServer:
             self._pending_previews.pop(cmd.id, None)
             self._write_receipt(next_plan, subtask_results, src_evt)
 
+    async def _confirm_email_send(
+        self, args: dict[str, Any], parent_event_id: str,
+    ) -> dict[str, Any]:
+        """Rule-based EMAIL send-step gate (Zack 2026-06-02).
+
+        Right before an email is actually handed to the Mail adapter, surface
+        the FULL To / Subject / Body and PARK until the wearer decides:
+          approve → send it · modify → revise & re-confirm · kill → don't send.
+
+        Reuses the SDK decision primitive (`_sdk_pending` + `resolve_sdk_decision`),
+        so the modify→mic→STT-review loop works for free and the decision routes
+        through the existing `_handle_user_decision`. Safe to await:
+        `_execute_remaining` runs inside a backgrounded `_process_event` task
+        (server.py glass loop uses `_spawn_bg`), so parking here never blocks the
+        glass receive loop — same property that makes `can_use_tool` safe.
+
+        Returns {"action": "approve"|"modify"|"reject"|..., "feedback_text": str|None}.
+        """
+        to = args.get("to") or "(reply to current message)"
+        if isinstance(to, list):
+            to = ", ".join(str(x) for x in to)
+        subj = args.get("subject") or "(no subject)"
+        body = (args.get("body") or "").strip() or "(empty)"
+        cmd_id = ids.command_id()
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._sdk_pending[cmd_id] = {
+            "fut": fut, "kind": "permission", "event_id": parent_event_id,
+        }
+        card_body = f"**To:** {to}\n\n**Subject:** {subj}\n\n**Body:**\n{body}"
+        await self.emit_card(
+            cmd_id=cmd_id, title="✉️ Send this email?", body_md=card_body[:4000],
+            options=["approve", "modify", "reject"], card_type="checkpoint",
+            source="Cortex", ttl_ms=600_000,
+        )
+        log.info("mail_send.gate_open", cmd_id=cmd_id, to=str(to)[:80],
+                 subj=str(subj)[:80], body_len=len(body))
+        try:
+            res = await fut
+        except asyncio.CancelledError:
+            self._sdk_pending.pop(cmd_id, None)
+            raise
+        action = (res or {}).get("action") or "reject"
+        fb = (res or {}).get("feedback_text")
+        log.info("mail_send.gate_decided", cmd_id=cmd_id, action=action,
+                 has_feedback=bool(fb))
+        return {"action": action, "feedback_text": fb}
+
     async def _execute_remaining(self, pending: dict[str, Any], src_evt: str) -> None:
         """Run the `execute` subtasks after user SEND. Write receipt + CHANGELOG.
 
@@ -3522,8 +3840,53 @@ class CortexServer:
         results = list(pending["subtask_results"])
         parent_event_id = (pending.get("event").id if pending.get("event") else None) or src_evt
         sid = pending.get("session_id")
+
+        # ── Rule-based EMAIL send-step gate (Zack 2026-06-02) ──────────────
+        # Mail is the one side effect we ALWAYS re-confirm at the moment of
+        # send: show the full To/Subject/Body and let Zack approve / kill /
+        # modify. Done BEFORE any subtask executes so a modify can cleanly
+        # revise without a half-done turn. Covers BOTH the agent actions[] path
+        # and the simple router plan, since both execute here.
+        for i, st in enumerate(plan["subtasks"]):
+            if not (st.get("result_format") == "execute"
+                    and st.get("tool") == "applescript_mail"
+                    and st.get("action") == "send"):
+                continue
+            mail_args = self._interpolate_args(st.get("args", {}), results, plan=plan)
+            dec = await self._confirm_email_send(mail_args, parent_event_id)
+            act = dec.get("action")
+            if act == "approve":
+                continue
+            if act == "modify" and dec.get("feedback_text") and pending.get("event"):
+                # Revise instead of sending — reuse the exact modify routing
+                # _handle_user_decision uses: resume the agent (agent path) or
+                # re-plan with feedback (simple path). Nothing has executed yet,
+                # so this is a clean hand-off; we then return.
+                fb = dec["feedback_text"]
+                try:
+                    if pending.get("agent_result"):
+                        await self._resume_agent_with_modify(pending, fb, pending["event"])
+                    else:
+                        await self._replan_with_feedback(
+                            pending["event"], plan, fb, src_evt=parent_event_id)
+                    return
+                except ResumeFailed:
+                    await self._replan_with_feedback(
+                        pending["event"], plan, fb, src_evt=parent_event_id)
+                    return
+                except Exception as e:
+                    log.warning("mail_send.modify_failed", error=str(e), exc_info=True)
+                    st["_skip_send"] = True
+                    continue
+            # kill / reject / modify-without-text → do NOT send this email.
+            st["_skip_send"] = True
+            log.info("mail_send.killed_at_gate", tool=st.get("tool"))
+
         for i, st in enumerate(plan["subtasks"]):
             if st["result_format"] == "execute":
+                if st.get("_skip_send"):
+                    results[i] = {"skipped": "killed at send gate"}
+                    continue
                 # Emit per-subtask progress so the HUD shows "executing X.Y"
                 # instead of staying on the pre-card "preparing preview".
                 await self._emit_progress_to_glass(
