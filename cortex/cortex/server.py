@@ -325,14 +325,14 @@ def _vision_tier_for(text: str) -> str:
 
 
 def _model_override_for(text: str) -> str | None:
-    """Deterministic model pin (Zack 2026-06-01/06-02): naming a model in the ask
-    forces its path, no LLM guess (mirrors the vision cue). 'claude'/'克劳德'/'cloud'
-    → the complex agent path; 'llama'/'groq'/'scout' (or legacy 'gpt'/'chatgpt'/
-    'openai') → the simple/fast router path, which now runs on Groq Llama-4-Scout.
-    Claude wins ties — the agent path can degrade to a single action, but the
-    router can't escalate to research. Returns 'claude' | 'gpt' | None
-    ('gpt' is the internal id for the router/fast path, regardless of which
-    fast-path keyword was spoken)."""
+    """Deterministic path pin by TIER (Zack 2026-06-02): say 「简单模型」 to force the
+    simple/fast path or 「复杂模型」 to force the complex Claude-agent line — robust
+    Chinese phrases, no brittle model-name + STT-typo dance. Legacy model-name
+    triggers still work: 'gpt'/'chatgpt'/'openai'/'llama'/'groq'/'scout' → simple;
+    'claude'/'克劳德'/'cloud' → complex. Claude wins ties — the agent path can
+    degrade to a single action, but the router can't escalate to research. Returns
+    'claude' | 'gpt' | None ('gpt' = the internal id for the simple/router path,
+    regardless of which trigger was spoken)."""
     if not text:
         return None
     if _CLAUDE_OVERRIDE_PATTERN.search(text):

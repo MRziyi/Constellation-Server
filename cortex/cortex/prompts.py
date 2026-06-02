@@ -147,22 +147,26 @@ VISION_DETAIL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# ── Model override (deterministic model pin) ───────────────────────────────
-# Zack 2026-06-01/06-02: naming a model in the ask PINS its path — no LLM guess,
-# same spirit as the vision cue. The SIMPLE/router path now runs on Groq
-# Llama-4-Scout (was GPT-5.2), so it accepts "llama"/"groq"/"scout" AND the
-# legacy "gpt"/"chatgpt"/"openai" (kept for muscle memory). "claude"/"克劳德"/
-# "cloud" → the complex agent path. 'cloud' is the common STT mishear of "Claude"
-# (accepted trade-off). Claude wins ties — the agent can fall back to a single
+# ── Model override (deterministic path pin) ────────────────────────────────
+# Zack 2026-06-02: pin a path by TIER, not by model name. The primary triggers
+# are now 「简单模型」 → the simple/fast path (whatever it runs — Groq Llama today,
+# something else tomorrow) and 「复杂模型」 → the complex Claude-agent line. These
+# are robust common Chinese words (Whisper transcribes them reliably), so the
+# wearer no longer has to say a brittle model name and dodge STT typos like
+# "gbt"/"cloud". The legacy model-name triggers still work for muscle memory:
+# "gpt"/"chatgpt"/"openai"/"llama"/"groq"/"scout" → simple path; "claude"/"克劳德"/
+# "cloud" → complex path. Claude wins ties — the agent can fall back to a single
 # action, but the router can't escalate to research.
 #
-# NOTE: substring match, NOT \b-anchored. CJK chars are \w in Python regex, so a
-# \b never forms between 用 and "gpt" in 「用gpt推理」 → \bgpt\b would never fire on
-# Chinese-embedded model names (real 2026-06-01 miss). The [pb] also catches the
-# common STT mishear "gbt"; \s? tolerates spelled-out "g p t" / "g b t".
-# (The match still returns the internal 'gpt' = router-path id; see server.)
-GPT_OVERRIDE_PATTERN = re.compile(r"(g\s?[pb]\s?t|open\s?ai|llama|groq|scout)", re.IGNORECASE)
-CLAUDE_OVERRIDE_PATTERN = re.compile(r"(claude|克劳德|克劳|cloud)", re.IGNORECASE)
+# NOTE: substring match, NOT \b-anchored (CJK chars are \w → a \b never forms
+# between 用 and "gpt" in 「用gpt推理」, a real 2026-06-01 miss). 「简单/复杂」 REQUIRE a
+# following 「模型/模形」 so ordinary speech ("这很简单" / "问题很复杂") can't pin a path.
+# [pb] catches the "gbt" mishear; \s? tolerates spelled-out "g p t".
+# (A match still returns the internal 'gpt' = router-path id; see server.)
+GPT_OVERRIDE_PATTERN = re.compile(
+    r"(简单\s*模[型形]|simple\s?model|g\s?[pb]\s?t|open\s?ai|llama|groq|scout)", re.IGNORECASE)
+CLAUDE_OVERRIDE_PATTERN = re.compile(
+    r"(复杂\s*模[型形]|complex\s?model|claude|克劳德|克劳|cloud)", re.IGNORECASE)
 
 # ── Permission mode (full-auto opt-in) ─────────────────────────────────────
 # Full-auto (bypassPermissions) is opt-in ONLY via the explicit phrase "自动模式"
