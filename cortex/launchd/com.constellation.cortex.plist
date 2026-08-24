@@ -10,7 +10,7 @@
         <string>-m</string>
         <string>cortex.main</string>
         <string>--host</string>
-        <string><mac-host></string>
+        <string>__CORTEX_HOST__</string>
     </array>
     <key>WorkingDirectory</key>
     <string>__CORTEX_DIR__</string>

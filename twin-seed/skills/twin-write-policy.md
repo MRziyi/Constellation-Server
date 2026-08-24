@@ -96,7 +96,7 @@ you must:
 2. Hand-restore by `vim`.
 
 If this proves painful, v1.5 may add `_system/snapshots/{date}/{path}` to keep N days of
-pre-mutation snapshots. Per [DATA-MODEL §12](../../DATA-MODEL.md), this is a "need-driven"
+pre-mutation snapshots. Per [DATA-MODEL §12](https://github.com/MRziyi/Constellation/blob/main/docs/server/DATA-MODEL.md), this is a "need-driven"
 feature, not v1.
 
 ## You can edit this

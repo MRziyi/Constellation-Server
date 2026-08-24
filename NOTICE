@@ -1,0 +1,9 @@
+Constellation Server
+Copyright 2026 Zack Zhang
+
+This product includes software developed by the Constellation project.
+
+Third-party components used at runtime — including whisper.cpp, InsightFace,
+onnxruntime, the OpenAI and Anthropic Python SDKs, the Claude Agent SDK, and
+the other packages listed in each component's pyproject.toml — remain the
+property of their respective owners and are governed by their own licenses.

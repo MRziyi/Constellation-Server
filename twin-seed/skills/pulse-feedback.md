@@ -55,4 +55,4 @@ your reactions.
 
 ---
 
-*See [DESIGN.md §2 P6 Surprising Insight](../../DESIGN.md) for the principle this file refines.*
+*See [DESIGN.md §2 P6 Surprising Insight](https://github.com/MRziyi/Constellation/blob/main/docs/constitution/DESIGN.md) for the principle this file refines.*

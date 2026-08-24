@@ -5,7 +5,7 @@ This is the **seed copy** of your Digital Twin. On first run, copy this entire d
 
 ```bash
 mkdir -p ~/constellation
-cp -r ~/Code/Projects/Constellation/twin-seed ~/constellation/twin
+cp -r ~/Code/Projects/Constellation-Server/twin-seed ~/constellation/twin
 ```
 
 After the copy, Cortex Agent will take over: it will read, append, and edit files here as you
@@ -20,18 +20,18 @@ silently overwrite your edits.
 | [`CHANGELOG.md`](CHANGELOG.md) | Append-only log of every Cortex modification to this Twin | Cortex |
 | [`skills/`](skills/) | Prescriptive how-to docs ("how AI should act as me") | You (seed) + Cortex (implicit learning) |
 | [`people/`](people/) | Relationship archives (core/ + encounters.md) | Cortex (mostly), you can edit |
-| [`projects/`](projects/) | Active project docs | You + Cortex |
-| [`commitments/`](commitments/) | Things you've said you'd do (P6 scans) | Cortex (from conversation extraction) |
-| [`interests/`](interests/) | Long-running topics (P6 scans) | Cortex |
-| [`conversations/{date}/`](conversations/) | Meeting / conversation transcripts | Cortex |
-| [`receipts/{date}.md`](receipts/) | Daily action log | Cortex |
-| [`memories/faces/`](memories/) | Face recognition embeddings | Tool Agent (`local_face_recognition`) |
+| `projects/` | Active project docs | You + Cortex |
+| `commitments/` | Things you've said you'd do (P6 scans) | Cortex (from conversation extraction) |
+| `interests/` | Long-running topics (P6 scans) | Cortex |
+| `conversations/{date}/` | Meeting / conversation transcripts | Cortex |
+| `receipts/{date}.md` | Daily action log | Cortex |
+| `memories/faces/` | Face recognition embeddings | Tool Agent (`local_face_recognition`) |
 | [`_system/`](_system/) | Cortex's meta-tools: schema, TOC, pending review queue | Cortex |
 
 ## How to use
 
 **You don't actively maintain this.** Constellation does — via the Implicit Learning Loop
-(see [DATA-MODEL.md §9](../DATA-MODEL.md)). When you give feedback during a task, when you
+(see [DATA-MODEL.md §9](https://github.com/MRziyi/Constellation/blob/main/docs/server/DATA-MODEL.md)). When you give feedback during a task, when you
 override a Cortex suggestion, when you repeat a pattern — Cortex extracts a learning
 candidate and (eventually, after your approval where confidence is low) writes here.
 
@@ -50,7 +50,7 @@ The first time you use Voice Invoke, Cortex starts populating these from your in
 
 ## Reference
 
-See [DATA-MODEL.md](../DATA-MODEL.md) for full schema, write protocol, and the Implicit Learning Loop.
+See [DATA-MODEL.md](https://github.com/MRziyi/Constellation/blob/main/docs/server/DATA-MODEL.md) for full schema, write protocol, and the Implicit Learning Loop.
 
 ---
 

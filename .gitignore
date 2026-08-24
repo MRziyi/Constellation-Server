@@ -5,14 +5,17 @@ __pycache__/
 *.egg-info/
 *.egg
 .venv/
+venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 
-# Local env (secrets — never commit)
+# Secrets — never commit. Use .env.example as the template.
 .env
 .env.local
 .env.*.local
+*.pem
+*.key
 
 # Logs
 logs/
@@ -20,11 +23,15 @@ logs/
 
 # macOS
 .DS_Store
+**/.DS_Store
 
-# IDE
+# IDE / editor
 .vscode/
 .idea/
 *.swp
 
-# Twin runtime (lives in ~/constellation/twin, not in repo)
-# twin-seed/ IS committed (it's the seed); user's live twin is not
+# Agent tooling (local, per-machine)
+.claude/
+
+# The live Digital Twin lives at ~/constellation/twin, never in the repo.
+# twin-seed/ IS committed — it is the seed, and ships with placeholder content.

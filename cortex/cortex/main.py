@@ -36,7 +36,7 @@ def _load_env() -> Path | None:
     Search order (first existing wins; later ones do NOT override):
       1. <repo_root>/.env
       2. <repo_root>/cortex/.env
-      3. <repo_root>/tool-agent/.env   (current location of Zack's OPENAI_API_KEY)
+      3. <repo_root>/tool-agent/.env
     """
     repo_root = Path(__file__).resolve().parents[2]
     candidates = [

@@ -8,7 +8,7 @@ share: none
 # Twin Meta-Schema
 
 This is the **meta-schema** — Cortex reads this file before writing to the Twin to remember how
-every entity type is structured. It mirrors [DATA-MODEL.md](../../DATA-MODEL.md) §4–§8 but lives
+every entity type is structured. It mirrors [DATA-MODEL.md](https://github.com/MRziyi/Constellation/blob/main/docs/server/DATA-MODEL.md) §4–§8 but lives
 *inside* the Twin so Cortex always has the schema in arm's reach.
 
 ## Universal frontmatter (every file)
@@ -99,7 +99,7 @@ date: <yyyy-mm-dd>
 ```
 
 The body has `## HH:MM:SS — {action} [rcpt_id]` sections per receipt. See
-[DATA-MODEL §8.1](../../DATA-MODEL.md) for full example.
+[DATA-MODEL §8.1](https://github.com/MRziyi/Constellation/blob/main/docs/server/DATA-MODEL.md) for full example.
 
 ### `conversation` (in `conversations/{yyyy-mm-dd}/{HH-MM}-{slug}.md`)
 

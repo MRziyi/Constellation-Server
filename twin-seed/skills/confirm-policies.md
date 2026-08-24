@@ -96,4 +96,4 @@ Default is conservative: show preview unless explicitly downgraded.
 
 ---
 
-*See [DESIGN.md §2 P3 Preview Before, Receipt After](../../DESIGN.md) for the principle this file enforces.*
+*See [DESIGN.md §2 P3 Preview Before, Receipt After](https://github.com/MRziyi/Constellation/blob/main/docs/constitution/DESIGN.md) for the principle this file enforces.*

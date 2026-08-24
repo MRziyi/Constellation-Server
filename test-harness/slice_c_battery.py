@@ -11,7 +11,7 @@ Flows (each one prompt → one receipt entry):
   4. safari_state.current_tab   "what page am I on in Safari"
   5. imessage list_recent   "what are my last few iMessages" (may fail soft on FDA)
   6. mail.find_messages    "find recent emails involving Constellation" (search test, no send)
-  7. mail.compose with explicit account   "use my QQ email to send a one-line 'ping' to you@example.com"
+  7. mail.compose with explicit account   "use my QQ email to send a one-line 'ping' to $TEST_RECIPIENT"
      — only runs with --send-for-real flag; otherwise dry_run path.
 
 By default the mail flow stays in dry-run. Pass --send-for-real to actually send.
@@ -20,6 +20,7 @@ By default the mail flow stays in dry-run. Pass --send-for-real to actually send
 from __future__ import annotations
 
 import asyncio
+import os
 import json
 import sys
 from datetime import datetime, timezone
@@ -30,6 +31,8 @@ import websockets
 
 CORTEX_URL = "ws://127.0.0.1:8888"
 TWIN_ROOT = Path.home() / "constellation" / "twin"
+# Mailbox the mail.compose flows address. Set to something you own.
+RECIPIENT = os.environ.get("TEST_RECIPIENT", "")
 
 BASE_FLOWS = [
     ("1. system_status",
@@ -48,7 +51,7 @@ BASE_FLOWS = [
 
 REAL_SEND_FLOW = (
     "7. mail.compose with QQ account",
-    "use my QQ email account to send a one-line 'ping from constellation slice c' to you@example.com",
+    f"use my QQ email account to send a one-line 'ping from constellation slice c' to {RECIPIENT}",
 )
 
 
@@ -109,7 +112,7 @@ async def run(send_for_real: bool) -> int:
         # Still test mail.compose path safely with dry_run wording.
         flows.append((
             "7. mail.compose dry-run with QQ account",
-            "draft an email FROM my QQ account TO you@example.com with subject 'slice C ping' and "
+            f"draft an email FROM my QQ account TO {RECIPIENT} with subject 'slice C ping' and "
             "body 'one-line ping from slice C'. Save to drafts only, do not send.",
         ))
 

@@ -79,9 +79,12 @@ for module in cortex tool-agent; do
     plist_dst="${LAUNCHAGENTS}/${plist_basename}"
 
     # Template substitution
+    # Host Cortex binds for the Glass WSS listener. Default is loopback; set
+    # CORTEX_HOST to the LAN / Tailscale address the glasses can reach.
     module_dir="${REPO_ROOT}/${module}"
     sed "s|__CORTEX_DIR__|${REPO_ROOT}/cortex|g;
-         s|__TOOL_AGENT_DIR__|${REPO_ROOT}/tool-agent|g" \
+         s|__TOOL_AGENT_DIR__|${REPO_ROOT}/tool-agent|g;
+         s|__CORTEX_HOST__|${CORTEX_HOST:-127.0.0.1}|g" \
         "${plist_name}" > "${plist_dst}"
 
     echo "→ Installed ${plist_dst}"

@@ -3,13 +3,14 @@
 
 Two-step safety:
   STEP 1 (always runs): dry_run send → message lands in Mail Drafts, no actual send.
-  STEP 2 (only with --send-for-real): real send to you@example.com (Zack's test recipient).
+  STEP 2 (only with --send-for-real): real send to $TEST_RECIPIENT.
 
 Usage:
   python test-harness/mail_flow.py                 # dry-run only
   python test-harness/mail_flow.py --send-for-real # actually send the email
 
 Prereqs:
+  - TEST_RECIPIENT env var set to a mailbox you own (the test sends to it)
   - cortex + tool-agent running with applescript_mail enabled
   - Mail.app TCC permission for the cortex python binary
   - Mail.app default account configured (sender will be whichever)
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,7 +30,7 @@ import websockets
 
 CORTEX_URL = "ws://127.0.0.1:8888"
 TWIN_ROOT = Path.home() / "constellation" / "twin"
-RECIPIENT = "you@example.com"
+RECIPIENT = os.environ.get("TEST_RECIPIENT", "")
 
 DRY_INVOKE = (
     f"draft an email to {RECIPIENT} with subject 'Constellation dry-run' and a one-line body "
@@ -100,15 +102,18 @@ async def run(send_for_real: bool) -> int:
         return rc
 
     if not send_for_real:
-        print("\nDry-run complete. Verify a draft to you@example.com appears in Mail.app Drafts.")
+        print("\nDry-run complete. Verify a draft to " + RECIPIENT + " appears in Mail.app Drafts.")
         print("To actually send, re-run with --send-for-real.")
         return 0
 
     print("\n--- Pausing 2 s before the real send ---")
     await asyncio.sleep(2.0)
-    return await _run_flow(SEND_INVOKE, "STEP 2 (REAL SEND to you@example.com)")
+    return await _run_flow(SEND_INVOKE, f"STEP 2 (REAL SEND to {RECIPIENT})")
 
 
 if __name__ == "__main__":
+    if not RECIPIENT:
+        sys.exit("Set TEST_RECIPIENT to a mailbox you own, e.g.\n"
+                 "  TEST_RECIPIENT=me@example.com python test-harness/mail_flow.py")
     send_for_real = "--send-for-real" in sys.argv
     sys.exit(asyncio.run(run(send_for_real)))
