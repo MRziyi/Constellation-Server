@@ -494,6 +494,65 @@ def make_app(plane: ControlPlane) -> web.Application:
         return _json({"ok": True, "queued": True, "n_providers": len(engine._providers),
                       "enabled": engine.enabled})
 
+    # ── inbound email → HUD push (Zack 2026-06-05) ──
+    async def mail_inbound(request: web.Request) -> web.Response:
+        """A VIP emailed Zack → his Mac's Mail.app rule POSTs the message here →
+        push a HUD card he can LONG-press to dictate a reply. See
+        docs/server/MAIL-INBOUND-RULE.md for the Mail rule that calls this.
+
+        POST {message_id, sender_name?, sender_email, subject?, body?,
+              account?, force?}. v1 pushes only when glasses are connected and
+        the sender is on ~/constellation/twin/_system/mail_vips.txt (force=true
+        bypasses both, for testing)."""
+        if plane.server is None:
+            return _err("server not bound", 503)
+        body = await request.json()
+        message_id = (body.get("message_id") or "").strip()
+        sender_email = (body.get("sender_email") or "").strip()
+        if not message_id or not sender_email:
+            return _err("message_id and sender_email required")
+        res = await plane.server.handle_inbound_email(
+            message_id=message_id,
+            sender_name=body.get("sender_name"),
+            sender_email=sender_email,
+            subject=body.get("subject"),
+            body=body.get("body"),
+            account=body.get("account"),
+            force=bool(body.get("force")),
+        )
+        return _json(res)
+
+    async def dev_email_reply(request: web.Request) -> web.Response:
+        """Dev: exercise the FULL inbound-email reply path WITHOUT glass/voice.
+        Pushes the email card (force=true) then simulates the wearer's approved
+        spoken reply, so the email context is injected and dispatched through the
+        normal classifier/agent pipeline. POST {message_id, sender_email,
+        sender_name?, subject?, body?, account?, transcript}. Returns the card
+        cmd_id; the agent runs in the background (watch /api/trace/stream)."""
+        if plane.server is None:
+            return _err("server not bound", 503)
+        body = await request.json()
+        transcript = (body.get("transcript") or "").strip()
+        message_id = (body.get("message_id") or "").strip()
+        if not transcript or not message_id:
+            return _err("message_id and transcript required")
+        res = await plane.server.handle_inbound_email(
+            message_id=message_id,
+            sender_name=body.get("sender_name"),
+            sender_email=body.get("sender_email") or "dev@example.com",
+            subject=body.get("subject"),
+            body=body.get("body"),
+            account=body.get("account"),
+            force=True,
+        )
+        cmd_id = res.get("cmd_id")
+        if not cmd_id:
+            return _err(f"card not pushed: {res}", 500)
+        stt = {"transcript": transcript, "intent": "email_reply",
+               "orig_cmd_id": cmd_id, "session_id": None}
+        asyncio.create_task(plane.server._route_stt_approved(stt))
+        return _json({"ok": True, "cmd_id": cmd_id})
+
     # ── SSE trace stream ──
     async def trace_stream(request: web.Request) -> web.StreamResponse:
         resp = web.StreamResponse(
@@ -731,6 +790,8 @@ def make_app(plane: ControlPlane) -> web.Application:
     app.router.add_post("/api/dev/face_recall", dev_face_recall)
     app.router.add_post("/api/dev/face_enroll", dev_face_enroll)
     app.router.add_post("/api/dev/insight_tick", dev_insight_tick)
+    app.router.add_post("/api/mail/inbound", mail_inbound)
+    app.router.add_post("/api/dev/email_reply", dev_email_reply)
     app.router.add_get("/api/trace/stream", trace_stream)
 
     return app

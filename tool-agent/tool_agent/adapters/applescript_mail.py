@@ -39,8 +39,11 @@ FIELD_SEP = "\x1f"
 RECORD_SEP = "\x1e"
 
 
-def _esc(s: str) -> str:
-    return s.replace("\\", "\\\\").replace('"', '\\"')
+def _esc(s: Any) -> str:
+    # Coerce first: a plan/LLM occasionally emits a non-string field (e.g. a
+    # numeric body) and a bare .replace() then crashes with
+    # "'int' object has no attribute 'replace'", failing the whole send.
+    return str(s).replace("\\", "\\\\").replace('"', '\\"')
 
 
 async def _run_osascript(script: str) -> tuple[int, str, str]:

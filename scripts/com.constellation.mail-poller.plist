@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Constellation inbound-mail poller (Zack 2026-06-06).
+  Install as a GUI (Aqua) LaunchAgent so it has Mail's Automation/TCC:
+    cp scripts/com.constellation.mail-poller.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.constellation.mail-poller.plist
+    launchctl kickstart -k gui/$(id -u)/com.constellation.mail-poller   # first run primes
+  Stop / remove:
+    launchctl bootout gui/$(id -u)/com.constellation.mail-poller
+  The FIRST run (no seen-file) primes silently (adopts the current inbox as the
+  baseline) so installing it never pushes a backlog. Subsequent ticks push only
+  genuinely-new mail; cortex applies the VIP + connected gates.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.constellation.mail-poller</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>~/Code/Projects/Constellation-Server/scripts/mail_inbound_poller.py</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>45</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CONSTELLATION_CORTEX_HTTP</key>
+    <string>http://<mac-host>:8890</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/tmp/constellation-mail-poller.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/constellation-mail-poller.err.log</string>
+</dict>
+</plist>

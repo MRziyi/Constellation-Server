@@ -150,6 +150,18 @@ def _default_icon_for_stage(stage: str) -> str:
 # adapters; the preview card iterates them as rows; SEND fires them all
 # in order via the existing _execute_remaining path.
 
+# Max inbound-email reply contexts held at once (drop oldest past this). A
+# notification card's TAP/double dismiss is glass-local (no server signal), so
+# stale entries are reaped by this cap rather than an explicit dismiss.
+_EMAIL_REPLY_CAP = 20
+
+# Max chars for an agent result/checkpoint card body. The glass card SCROLLS, so
+# a multi-section answer (e.g. a conference plan: blocks + picks) must NOT be
+# chopped mid-sentence (Zack 2026-06-06: a long plan's tail was lost at the old
+# 1500 cap — "suggested flow Room 128" was the cut, not the real end). Generous
+# but bounded for frame sanity; we log when it actually clips so it's never silent.
+_AGENT_CARD_BODY_MAX = 8000
+
 _ACTION_ICONS: dict[str, str] = {
     "email":          "✉",
     "reminder":       "🔔",
@@ -705,6 +717,15 @@ class CortexServer:
         # {transcript, intent, orig_cmd_id, session_id, lang_hint}. Iron rule:
         # raw STT never reaches a downstream without an explicit approve.
         self._pending_stt_review: dict[str, dict[str, Any]] = {}
+        # Inbound-email reply context (Zack 2026-06-05). When a VIP email is
+        # pushed to the HUD (handle_inbound_email), its {message_id, sender,
+        # subject, body, account} is held here keyed by the card's cmd_id. A
+        # LONG-press on that card opens a mic tagged emailreply_<cmd_id>; once the
+        # spoken reply passes STT review, _route_stt_approved pops this and
+        # prepends the email as context to a normal user_invoke (so the agent
+        # knows the body + Message-ID and threads the reply). Bounded; oldest
+        # entries are dropped past _EMAIL_REPLY_CAP.
+        self._pending_email_replies: dict[str, dict[str, Any]] = {}
         # P1 — outstanding Agent-SDK permission/question cards keyed by cmd_id;
         # each holds the can_use_tool future that _handle_user_decision resolves
         # (see claude_sdk_agent). Empty unless USE_SDK_AGENT is on.
@@ -712,6 +733,11 @@ class CortexServer:
         # P2 — in-flight SDK agent runs keyed by event.id, so a kill decision
         # can interrupt the running turn (SdkAgentSession.interrupt()).
         self._sdk_active: dict[str, Any] = {}
+        # Event ids the wearer INTERRUPTED mid-run (1st tap+down while Thinking).
+        # _dispatch_complex_agent checks this after run() returns and surfaces an
+        # "⏸ Interrupted" checkpoint card (continue / steer / kill) instead of the
+        # now-moot result — the run is paused, not yet terminated.
+        self._interrupted_events: set[str] = set()
         # R-13 / C-55: server-pull-on-demand vision. When router selects a
         # vision-aware tool but `event.payload.image` is None, Cortex emits
         # `request_image` to glass and awaits a matching `image_attached`
@@ -1358,6 +1384,11 @@ class CortexServer:
             intent, cmd_id = "modify", cmd_id or sid[len("modify_"):]
         elif sid.startswith("answer_"):
             intent, cmd_id = "answer", cmd_id or sid[len("answer_"):]
+        elif sid.startswith("emailreply_"):
+            # LONG-press on an inbound-email card opened this mic. The spoken
+            # reply still passes STT review; on approve it routes to a fresh
+            # invoke with the email injected as context (_route_stt_approved).
+            intent, cmd_id = "email_reply", cmd_id or sid[len("emailreply_"):]
         elif sid.startswith("enroll_"):
             # People-Recall enroll bio: the mic was opened FOR a pending face
             # enrollment (_handle_enroll_start). The captured face is stashed in
@@ -1497,6 +1528,27 @@ class CortexServer:
                          "feedback_text": transcript},
             )
             await self._handle_user_decision(synth)
+        elif intent == "email_reply" and orig:
+            # Inbound-email reply (Zack 2026-06-05): the wearer LONG-pressed the
+            # email card and spoke an instruction. Prepend the email (body +
+            # Message-ID) as context, then run the NORMAL pipeline as a fresh
+            # invoke — classifier decides simple (just reply) vs complex (e.g.
+            # "look in my memo for the poster, then reply"); either way the agent
+            # sees the email and threads via reply_to_message_id.
+            email_ctx = self._pending_email_replies.pop(orig, None)
+            text = transcript
+            if email_ctx:
+                from .mail_inbound import context_block
+                text = context_block(email_ctx, transcript)
+            else:
+                log.warning("email_reply.context_missing", orig=orig)
+            synth = Event(
+                id=ids.event_id(), kind="user_invoke",
+                ts=datetime.now(timezone.utc),
+                payload={"text": text, "session_id": session_id},
+            )
+            log.info("email_reply.dispatched", orig=orig, has_ctx=bool(email_ctx))
+            await self._handle_user_invoke(synth)
         elif intent == "enroll":
             # People-Recall: the bio is approved → await the face captured in
             # parallel (spec future — same mechanism as the fresh+vision flow) →
@@ -1734,6 +1786,7 @@ class CortexServer:
         ttl_ms: int = 30_000,
         echo: str | None = None,
         card_type: str | None = None,
+        continuable: bool = False,
     ) -> None:
         from .markdown_runs import to_runs
         # `options is None` means "no caller preference — use the canonical
@@ -1753,6 +1806,9 @@ class CortexServer:
             "card_type": card_type or _card_type_for(resolved_options),
             "source": source,
             "ttl_ms": ttl_ms,
+            # Long-press CONTINUES the conversation on this card (resume the
+            # session) rather than dismissing — set by FINAL agent cards (C-86b).
+            "continuable": continuable,
         }
         # "Quote + body" layout (Zack 2026-05-30): when we know what triggered
         # this card — the wearer's own words, or the upstream tool's ask — pass
@@ -1992,6 +2048,7 @@ class CortexServer:
                 source=cmd.payload.get("source") or "Cortex",
                 ttl_ms=cmd.ttl_ms,
                 echo=echo_text,
+                continuable=bool(cmd.payload.get("continuable")),
             )
             # NB: the mic is NOT opened here. Under ring-exclusive control the
             # mic opens only when the wearer explicitly asks to Modify (ring
@@ -2103,6 +2160,70 @@ class CortexServer:
             source=source,
             ttl_ms=ttl_ms,
         )
+
+    def _load_mail_vips(self) -> set[str]:
+        """VIP sender allowlist for inbound-email push (read each call — the file
+        is tiny and inbound emails are rare, so edits take effect with no
+        restart). Missing/empty file → empty set → nothing triggers (fail-closed)."""
+        from .mail_inbound import load_vip_senders
+        return load_vip_senders()
+
+    async def handle_inbound_email(
+        self, *, message_id: str, sender_name: str | None,
+        sender_email: str | None, subject: str | None, body: str | None,
+        account: str | None = None, force: bool = False,
+    ) -> dict[str, Any]:
+        """A VIP emailed Zack → push a HUD card showing the message. The wearer
+        LONG-presses to dictate a reply (routed back here with the email as
+        context). Server-pushed, unsolicited — reuses the unified outbox, so if a
+        decision card is currently parked this queues behind it (no preempt).
+
+        v1 (Zack 2026-06-05): only when glasses are connected, only VIP senders.
+        `force=True` bypasses both gates (dev/testing without glass or allowlist).
+        Returns {ok, cmd_id} on push, or {ok:False, reason} when skipped."""
+        from .mail_inbound import card_body, card_title, is_vip
+        if not force:
+            if self._glass_conn is None:
+                return {"ok": False, "reason": "no_glass"}
+            if not is_vip(sender_email, self._load_mail_vips()):
+                log.info("mail_inbound.skipped_not_vip", sender=sender_email)
+                return {"ok": False, "reason": "not_vip"}
+            # Respect [[hud-transparency-no-preempt]]: if a decision card is
+            # currently parked (gate cleared), don't bury it with an email card.
+            if self._decision_gate is not None and not self._decision_gate.is_set():
+                log.info("mail_inbound.deferred_decision_pending", sender=sender_email)
+                return {"ok": False, "reason": "decision_pending"}
+
+        ctx = {
+            "message_id": (message_id or "").strip(),
+            "sender_name": (sender_name or "").strip(),
+            "sender_email": (sender_email or "").strip(),
+            "subject": (subject or "").strip(),
+            "body": body or "",
+            "account": (account or "").strip(),
+        }
+        cmd_id = ids.command_id()
+        # Bound the registry (oldest-out) — TAP/double dismiss is glass-local.
+        while len(self._pending_email_replies) >= _EMAIL_REPLY_CAP:
+            self._pending_email_replies.pop(next(iter(self._pending_email_replies)))
+        self._pending_email_replies[cmd_id] = ctx
+
+        # Notification card (options=[], so it does NOT park the sender) +
+        # continuable=True → glass maps LONG-press to "modify", which we turn into
+        # a reply mic (see _handle_user_decision). TAP/double dismiss locally.
+        await self.emit_card(
+            cmd_id=cmd_id,
+            title=card_title(ctx),
+            body_md=card_body(ctx),
+            options=[],
+            card_type="notification",
+            source="Mail",
+            continuable=True,
+            ttl_ms=600_000,
+        )
+        log.info("mail_inbound.card_pushed", cmd_id=cmd_id,
+                 sender=ctx["sender_email"], subject=ctx["subject"][:60])
+        return {"ok": True, "cmd_id": cmd_id}
 
     async def _handle_shortcut_config(self, event: Event, ask_text: str) -> None:
         """Voice-driven shortcut-slot edit. Parses "set shortcut N to …" into a
@@ -2643,6 +2764,52 @@ class CortexServer:
                 rpc_result or {}, original_event, working_dir, timeout_s)
             return
 
+    async def _send_interrupted_card(
+        self, rpc_result: dict, event: Event, working_dir: str | None, timeout_s: float,
+    ) -> None:
+        """Surface an INTERRUPTED run as a checkpoint card (Zack 2026-06-02).
+
+        The wearer's 1st tap+down paused the agent (interrupt — session kept, not
+        terminated). From this card:
+          tap-up (approve)    → continue (resume the session, carry on)
+          long-press (modify) → speak a tweak → resume with that correction
+          tap-down (kill)     → really kill it (terminal)
+        All three are handled by the EXISTING checkpoint machinery: approve/modify
+        → _resume_agent_phase (resume via session_id); kill → the kind=="kill"
+        branch (drop + 'killed at your request')."""
+        from .schema import Command
+        cmd = Command(
+            id=ids.command_id(), ts=datetime.now(timezone.utc),
+            kind="preview_action",
+            payload={
+                "title": "⏸ Interrupted",
+                "body": "Paused mid-task. Continue it, long-press to tell me what "
+                        "to tweak, or kill it.",
+                "icon": "⏸",
+                "options": list(_THREE_OPTIONS),
+                "source": "Claude",
+            },
+            requires_confirm=True, ttl_ms=600_000,
+        )
+        sid = (event.payload or {}).get("session_id")
+        self._pending_previews[cmd.id] = {
+            "event": event,
+            "session_id": sid,
+            "plan": {
+                "primary_intent": "agent_interrupted",
+                "subtasks": [], "reasoning": "interrupted mid-run",
+                "hud_response": cmd.payload,
+            },
+            "subtask_results": [],
+            "from_agent": True, "is_checkpoint": True,
+            "agent_result": rpc_result,
+            "agent_working_dir": working_dir,
+            "agent_timeout_s": timeout_s,
+        }
+        log.info("run.interrupted_card", cmd_id=cmd.id,
+                 cc_session=(rpc_result or {}).get("session_id"))
+        await self._send_command(cmd)
+
     async def _send_agent_card_for_decision(
         self, rpc_result: dict, event: Event, working_dir: str | None, timeout_s: float,
     ) -> None:
@@ -2667,7 +2834,7 @@ class CortexServer:
                 kind="preview_action",
                 payload={
                     "title": f"Phase pause — {summary[:60]}",
-                    "body": "\n".join(lines)[:2000],
+                    "body": "\n".join(lines)[:_AGENT_CARD_BODY_MAX],
                     "icon": "⏸",
                     "options": list(_THREE_OPTIONS),
                     "source": agent_source,
@@ -2727,15 +2894,25 @@ class CortexServer:
                 else:
                     body_md = "（这次没有产生结果)"
                     title = "没有结果"
-            body_md = body_md[:1500]
+            if len(body_md) > _AGENT_CARD_BODY_MAX:
+                log.warning("agent_card.body_clipped", full_len=len(body_md),
+                            cap=_AGENT_CARD_BODY_MAX)
+            body_md = body_md[:_AGENT_CARD_BODY_MAX]
 
         cmd = Command(
             id=ids.command_id(), ts=datetime.now(timezone.utc),
             kind="preview_action",
             payload={
-                "title": title, "body": body_md[:2000], "icon": "✦",
+                "title": title, "body": body_md[:_AGENT_CARD_BODY_MAX], "icon": "✦",
                 "options": (list(_THREE_OPTIONS) if subtasks else []),
                 "source": agent_source,
+                # Continuable (Zack 2026-06-02): long-press on this FINAL card keeps
+                # the conversation going — resume THIS session with a spoken follow-
+                # up (more questions / new tasks) instead of just dismissing. The
+                # pending below carries from_agent_final + agent_result, so the
+                # existing modify-on-final resume handles it. An answer card (no
+                # actions) is otherwise a dead-end notification; this revives it.
+                "continuable": True,
             },
             requires_confirm=bool(subtasks), ttl_ms=300_000,
         )
@@ -2804,6 +2981,11 @@ class CortexServer:
             os.path.expanduser("~/Code/Projects"),
             os.path.expanduser("~/.claude/projects"),
         ]
+        # Run the agent IN the twin (Zack 2026-06-02): relative paths land in the
+        # knowledge base, it auto-discovers twin/.claude/skills, and memos/people/
+        # projects are right there to read + write. Code repos stay reachable via
+        # --add-dir. A caller-supplied working_dir still wins.
+        working_dir = working_dir or os.path.expanduser("~/constellation/twin")
 
         sid = (event.payload or {}).get("session_id")
 
@@ -2889,6 +3071,18 @@ class CortexServer:
                 # caller supplied one (same payload key the tmux path uses).
                 resume_session_id=_resume_sid,
             ).run()
+            # INTERRUPTED MID-RUN (1st tap+down): the wearer paused this flow. Its
+            # result is moot — instead of a card, surface an "⏸ Interrupted"
+            # checkpoint so they can continue / steer (long-press) / kill (2nd
+            # tap+down). The session is kept; the checkpoint resume machinery picks
+            # it up from there (Zack 2026-06-02).
+            if event.id in self._interrupted_events:
+                self._interrupted_events.discard(event.id)
+                log.info("agent.interrupted_mid_run", event_id=event.id,
+                         cc_session=(rpc_result or {}).get("session_id"))
+                await self._send_interrupted_card(
+                    rpc_result or {}, event, working_dir, timeout_s)
+                return
             # Remember the config under the (possibly new) cc_session_id so a later
             # resume restores it.
             _ccsid = (rpc_result or {}).get("session_id")
@@ -3413,6 +3607,30 @@ class CortexServer:
 
         return pattern.sub(replace, template)
 
+    async def _interrupt_active_runs(self) -> int:
+        """Interrupt every in-flight SDK agent run (the wearer's 1st tap+down
+        while a flow is running). interrupt() stops the CURRENT turn but KEEPS
+        the session (resumable) — it pauses, not terminates. Marks each event so
+        _dispatch_complex_agent surfaces an "⏸ Interrupted" checkpoint card
+        (continue / steer / kill). The run's own `finally` pops _sdk_active.
+        Returns how many runs were interrupted."""
+        active = list(self._sdk_active.items())
+        for ev_id, session in active:
+            self._interrupted_events.add(ev_id)
+            # White-box (C-71, Zack 2026-06-02): show the teardown so there's no
+            # blank gap between the gesture and the Interrupted card.
+            await self._emit_progress_to_glass(
+                parent_event_id=ev_id, stage="interrupting", icon="⏸",
+                detail="interrupting…", meta="Cortex",
+            )
+            try:
+                await session.interrupt()
+            except Exception as e:
+                log.warning("run.interrupt_failed", event_id=ev_id, error=str(e))
+        if active:
+            log.info("run.interrupted", n=len(active), events=[e for e, _ in active])
+        return len(active)
+
     async def _handle_user_decision(self, event: Event) -> None:
         decision = event.payload.get("decision")
         cmd_id = event.payload.get("in_reply_to")
@@ -3432,6 +3650,18 @@ class CortexServer:
         if self._sdk_pending and cmd_id in self._sdk_pending:
             from .claude_sdk_agent import resolve_sdk_decision
             if await resolve_sdk_decision(self, cmd_id, decision, feedback_text):
+                return
+
+        # KILL DURING A RUN (Zack 2026-06-02): the wearer's global tap+down while
+        # the agent is actively working (Thinking — no card parked, so the kill
+        # carries no resolvable cmd_id). Interrupt the in-flight SDK run so the
+        # flow ends as a KILL, not run-to-completion (the two-terminal-states
+        # rule). A kill AT a card was already handled above (permission) or falls
+        # through to the preview/checkpoint handlers below (those runs have
+        # finished, so _sdk_active is empty and this no-ops).
+        _d = (decision or "").strip().lower()
+        if _d in ("kill", "reject") and self._sdk_active:
+            if await self._interrupt_active_runs():
                 return
 
         # R-14.c: drain session-route confirmation cards FIRST. The cmd_id
@@ -3488,6 +3718,21 @@ class CortexServer:
                 # approve=routed or kill=terminated; no dismiss, no dangling.)
                 log.info("stt_review.killed", cmd_id=cmd_id,
                          decision=d, intent=stt.get("intent"))
+            return
+
+        # Inbound-email reply card (Zack 2026-06-05). A notification card whose
+        # cmd_id we're tracking in _pending_email_replies. LONG (modify) opens a
+        # mic tagged emailreply_<cmd_id> so the spoken reply routes back to THIS
+        # email as context (via _route_stt_approved); the context entry is kept
+        # until that approve consumes it. Any other outcome drops the context.
+        if cmd_id in self._pending_email_replies:
+            d = (decision or "").strip().lower()
+            if d == "modify":
+                await self.emit_mic_open(stream_id=f"emailreply_{cmd_id}", ttl_ms=30_000)
+                log.info("email_reply.mic_opened", cmd_id=cmd_id)
+                return
+            self._pending_email_replies.pop(cmd_id, None)
+            log.info("email_reply.dismissed", cmd_id=cmd_id, decision=d)
             return
 
         # Peek (don't pop yet) — we may need to re-register if Modify lacks text.

@@ -295,6 +295,14 @@ complex = true (COMPLEX) — ONLY when it genuinely needs the deep Claude agent:
     summarising / organising several things into prose
   - persisting to the Twin: writing a memo / journal / note that becomes Zack's
     own record (a Reminders/Calendar entry is NOT this — that's a bounded action)
+  - follow-ups: recording a commitment he made to someone ("note that … I'll
+    follow up with her next week") OR listing what he owes people ("what did I
+    tell people I'd follow up on?") — both read/write the Twin's follow-ups.md
+    (it's a record, NOT a plain reminder), so route here
+  - conference planning: finding relevant talks/posters or planning his time at a
+    conference ("other sessions like this I'd care about?", "plan my next hour",
+    "anything good on AR at CHI?") — reads + reasons over the Twin's
+    conferences/<slug>/program.json, so route here
   - genuinely multi-step work needing mid-task judgment or chained reasoning
   - hard reasoning: analyse / architect / debug / weigh trade-offs
   - open-ended "describe / explain / what's going on here" about a photo (vision

@@ -373,8 +373,11 @@ AVAILABLE_TOOLS: dict[str, dict[str, str]] = {
         "description": (
             "Mail.app SEND only (composition / reading is agent territory). "
             "COMPOSE → send(to, subject, body, account?='iCloud'|'Google'|'QQ'|'UIUC' — only "
-            "if Zack named one). REPLY → send(reply_to_current=true, body); do NOT pass "
-            "account (Mail auto-uses receiving account). Preview-always."
+            "if Zack named one). REPLY → if the task gives a Message-ID (e.g. an "
+            "[INBOUND EMAIL] block with `Message-ID: <…>`), send(reply_to_message_id='<…>', "
+            "body) so it threads to THAT exact message; otherwise send(reply_to_current=true, "
+            "body). On a reply do NOT pass to/subject/account (Mail auto-threads + uses the "
+            "receiving account). Preview-always."
         ),
     },
     "fs": {
